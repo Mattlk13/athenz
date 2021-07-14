@@ -4,30 +4,50 @@
 package main
 
 import (
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
-	"github.com/yahoo/athenz/clients/go/zts"
-	"github.com/yahoo/athenz/libs/go/athenzutils"
+	"github.com/AthenZ/athenz/clients/go/zts"
+	"github.com/AthenZ/athenz/libs/go/athenzconf"
+	"github.com/AthenZ/athenz/libs/go/athenzutils"
+	"gopkg.in/square/go-jose.v2"
+	"gopkg.in/square/go-jose.v2/jwt"
 	"io/ioutil"
 	"log"
-	"net/url"
 	"os"
-	"strconv"
 	"strings"
 )
 
+var (
+	// VERSION gets set by the build script via the LDFLAGS.
+	VERSION string
+
+	// BUILD_DATE gets set by the build script via the LDFLAGS.
+	BUILD_DATE string
+)
+
 func usage() {
-	fmt.Println("usage: zts-accesstoken -domain <domain> [-roles <roles>] [-service <service>] <credentials> -zts <zts-server-url> [-expire-time <time-in-mins>]")
+	fmt.Println("usage: zts-accesstoken -domain <domain> [-roles <roles>] [-service <service>] <credentials> -zts <zts-server-url> [-expire-time <time-in-mins>] [-authorization-details <authz-details>] [-proxy-principal-spiffe-uris <spiffe-uris>]")
 	fmt.Println("           <credentials> := -svc-key-file <private-key-file> -svc-cert-file <service-cert-file> [-svc-cacert-file <ca-cert-file>] | ")
 	fmt.Println("           	             -ntoken-file <ntoken-file> [-hdr <auth-header-name>]")
+	fmt.Println("       zts-accesstoken -validate -access-token <access-token> -conf <athenz-conf-path> [-claims]")
 	os.Exit(1)
 }
 
+func printVersion() {
+	if VERSION == "" {
+		fmt.Println("zts-accesstoken (development version)")
+	} else {
+		fmt.Println("zts-accesstoken " + VERSION + " " + BUILD_DATE)
+	}
+}
+
 func main() {
-	var domain, service, svcKeyFile, svcCertFile, svcCACertFile, roles, ntokenFile, ztsURL, hdr string
+	var domain, service, svcKeyFile, svcCertFile, svcCACertFile, roles, ntokenFile, ztsURL, hdr, conf, accessToken, authzDetails, proxyPrincipalSpiffeUris string
 	var expireTime int
-	var proxy bool
+	var proxy, validate, claims, showVersion bool
 	flag.StringVar(&domain, "domain", "", "name of provider domain")
 	flag.StringVar(&service, "service", "", "name of provider service")
 	flag.StringVar(&roles, "roles", "", "comma separated list of provider roles")
@@ -39,12 +59,69 @@ func main() {
 	flag.StringVar(&hdr, "hdr", "Athenz-Principal-Auth", "Header name")
 	flag.IntVar(&expireTime, "expire-time", 120, "token expire time in minutes")
 	flag.BoolVar(&proxy, "proxy", true, "enable proxy mode for request")
+	flag.BoolVar(&validate, "validate", false, "validate role token")
+	flag.BoolVar(&claims, "claims", false, "display all claims from access token")
+	flag.StringVar(&accessToken, "access-token", "", "access token to validate")
+	flag.StringVar(&conf, "conf", "/home/athenz/conf/athenz.conf", "path to configuration file with public keys")
+	flag.StringVar(&authzDetails, "authorization-details", "", "Authorization Details (json document)")
+	flag.StringVar(&proxyPrincipalSpiffeUris, "proxy-principal-spiffe-uris", "", "comm separated list of proxy principal spiffe uris")
+	flag.BoolVar(&showVersion, "version", false, "Show version")
 	flag.Parse()
 
-	fetchAccessToken(domain, service, roles, ztsURL, svcKeyFile, svcCertFile, svcCACertFile, ntokenFile, hdr, proxy, expireTime)
+	if showVersion {
+		printVersion()
+		return
+	}
+
+	if validate {
+		validateAccessToken(accessToken, conf, claims)
+	} else {
+		fetchAccessToken(domain, service, roles, ztsURL, svcKeyFile, svcCertFile, svcCACertFile, ntokenFile, hdr, authzDetails, proxyPrincipalSpiffeUris, proxy, expireTime)
+	}
 }
 
-func fetchAccessToken(domain, service, roles, ztsURL, svcKeyFile, svcCertFile, svcCACertFile, ntokenFile, hdr string, proxy bool, expireTime int) {
+func validateAccessToken(accessToken, conf string, showClaims bool) {
+	if accessToken == "" || conf == "" {
+		usage()
+	}
+	athenzConf, err := athenzconf.ReadConf(conf)
+	if err != nil {
+		log.Fatalf("unable to parse configuration file %s, error %v\n", conf, err)
+	}
+	tok, err := jwt.ParseSigned(accessToken)
+	if err != nil {
+		log.Fatalf("Unable to validate access token: %v\n", err)
+	}
+	publicKeyPEM, err := athenzConf.FetchZTSPublicKey(tok.Headers[0].KeyID)
+	if err != nil {
+		log.Fatalf("Public key fetch failure: %v\n", err)
+	}
+	publicKey, err := loadPublicKey(publicKeyPEM)
+	if err != nil {
+		log.Fatalf("Public key load failure: %v\n", err)
+	}
+	jwks := &jose.JSONWebKeySet {
+		Keys: []jose.JSONWebKey {
+			{
+				Key: publicKey,
+				Algorithm: tok.Headers[0].Algorithm,
+				KeyID: tok.Headers[0].KeyID,
+			},
+		},
+	}
+	var claims map[string]interface{}
+	if err := tok.Claims(jwks, &claims); err != nil {
+		log.Fatalf("Unable to validate access token: %v\n", err)
+	}
+	if showClaims {
+		for k, v := range claims {
+			fmt.Printf("claim[%s] value[%s]\n", k, v)
+		}
+	}
+	fmt.Println("Access Token successfully validated")
+}
+
+func fetchAccessToken(domain, service, roles, ztsURL, svcKeyFile, svcCertFile, svcCACertFile, ntokenFile, hdr, authzDetails, proxyPrincipalSpiffeUris string, proxy bool, expireTime int) {
 	if domain == "" || ztsURL == "" {
 		usage()
 	}
@@ -68,7 +145,7 @@ func fetchAccessToken(domain, service, roles, ztsURL, svcKeyFile, svcCertFile, s
 	}
 
 	// generate the scope for the request, convert time to seconds
-	request := generateRequestString(domain, service, roles, expireTime*60)
+	request := athenzutils.GenerateAccessTokenRequestString(domain, service, roles, authzDetails, proxyPrincipalSpiffeUris, expireTime*60)
 
 	// request an access token
 	accessTokenResponse, err := client.PostAccessTokenRequest(zts.AccessTokenRequest(request))
@@ -84,32 +161,6 @@ func fetchAccessToken(domain, service, roles, ztsURL, svcKeyFile, svcCertFile, s
 	fmt.Println(string(data))
 }
 
-func generateRequestString(domain, service, roles string, expiryTime int) string {
-
-	params := url.Values{}
-	params.Add("grant_type", "client_credentials")
-	params.Add("expires_in", strconv.Itoa(expiryTime))
-
-	var scope string
-	if roles == "" {
-		scope = domain + ":domain"
-	} else {
-		roleList := strings.Split(roles, ",")
-		for idx, role := range roleList {
-			if idx != 0 {
-				scope += " "
-			}
-			scope += domain + ":role." + role
-		}
-	}
-	if service != "" {
-		scope += " openid " + domain + ":service." + service
-	}
-
-	params.Add("scope", scope)
-	return params.Encode()
-}
-
 func ztsNtokenClient(ztsURL, ntokenFile, hdr string) (*zts.ZTSClient, error) {
 	// we need to load our ntoken from the given file
 	bytes, err := ioutil.ReadFile(ntokenFile)
@@ -122,4 +173,17 @@ func ztsNtokenClient(ztsURL, ntokenFile, hdr string) (*zts.ZTSClient, error) {
 	client := zts.NewClient(ztsURL, nil)
 	client.AddCredentials(hdr, ntoken)
 	return &client, nil
+}
+
+// NewVerifier creates an instance of Verifier using the given public key.
+func loadPublicKey(publicKeyPEM []byte) (interface{}, error) {
+	block, _ := pem.Decode(publicKeyPEM)
+	if block == nil {
+		return nil, fmt.Errorf("unable to load public key")
+	}
+	if !strings.HasSuffix(block.Type, "PUBLIC KEY") {
+		return nil, fmt.Errorf("invalid public key type: %s", block.Type)
+	}
+
+	return x509.ParsePKIXPublicKey(block.Bytes)
 }

@@ -21,6 +21,7 @@ import com.yahoo.athenz.auth.util.Crypto;
 import com.yahoo.athenz.auth.util.CryptoException;
 import io.jsonwebtoken.*;
 import org.mockito.Mockito;
+import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 import javax.net.ssl.SSLContext;
@@ -39,7 +40,7 @@ import static org.testng.Assert.*;
 
 public class AccessTokenTest {
 
-    private final File ecPrivateKey = new File("./src/test/resources/ec_private.key");
+    private final File ecPrivateKey = new File("./src/test/resources/unit_test_ec_private.key");
     private final File ecPublicKey = new File("./src/test/resources/ec_public.key");
 
     private final String JWT_KEYS = "{\"keys\":[{\"kty\":\"RSA\",\"kid\":\"0\",\"alg\":\"RS256\","
@@ -50,11 +51,9 @@ public class AccessTokenTest {
         + "G7HAjQynjCrcdCe\",\"y\":\"ATdV2ebpefqBli_SXZwvL3-7OiD3MTryGbR-zRSFZ_s=\"},"
         + "{\"kty\":\"ATHENZ\",\"alg\":\"ES256\"}]}";
 
-    AccessToken createAccessToken(long now) {
-
-        AccessToken accessToken = new AccessToken();
+    void setAccessCommonFields(AccessToken accessToken, long now) {
         accessToken.setAuthTime(now);
-        accessToken.setScope(Collections.singletonList("readers"));
+        accessToken.setJwtId("jwt-id001");
         accessToken.setSubject("subject");
         accessToken.setUserId("userid");
         accessToken.setExpiryTime(now + 3600);
@@ -65,6 +64,7 @@ public class AccessTokenTest {
         accessToken.setIssuer("athenz");
         accessToken.setProxyPrincipal("proxy.user");
         accessToken.setConfirmEntry("x5t#uri", "spiffe://athenz/sa/api");
+        accessToken.setAuthorizationDetails("[{\"type\":\"message_access\",\"data\":\"resource\"}]");
 
         try {
             Path path = Paths.get("src/test/resources/mtls_token_spec.cert");
@@ -74,14 +74,28 @@ public class AccessTokenTest {
         } catch (IOException ignored) {
             fail();
         }
+    }
+
+    AccessToken createAccessToken(long now) {
+
+        AccessToken accessToken = new AccessToken();
+        setAccessCommonFields(accessToken, now);
+        accessToken.setScope(Collections.singletonList("readers"));
 
         return accessToken;
     }
 
-    void validateAccessToken(AccessToken accessToken, long now) {
+    AccessToken createAccessTokenMultipleRoles(long now) {
+
+        AccessToken accessToken = new AccessToken();
+        setAccessCommonFields(accessToken, now);
+        accessToken.setScope(Arrays.asList("readers", "writers"));
+
+        return accessToken;
+    }
+
+    void validateAccessTokenCommon(AccessToken accessToken, long now) {
         assertEquals(now, accessToken.getAuthTime());
-        assertEquals(1, accessToken.getScope().size());
-        assertTrue(accessToken.getScope().contains("readers"));
         assertEquals("subject", accessToken.getSubject());
         assertEquals("userid", accessToken.getUserId());
         assertEquals(now + 3600, accessToken.getExpiryTime());
@@ -98,6 +112,7 @@ public class AccessTokenTest {
         assertEquals("spiffe://athenz/sa/api", confirm.get("x5t#uri"));
         assertEquals("spiffe://athenz/sa/api", accessToken.getConfirmEntry("x5t#uri"));
         assertNull(accessToken.getConfirmEntry("unknown"));
+        assertEquals("[{\"type\":\"message_access\",\"data\":\"resource\"}]", accessToken.getAuthorizationDetails());
 
         try {
             Path path = Paths.get("src/test/resources/mtls_token_spec.cert");
@@ -108,6 +123,35 @@ public class AccessTokenTest {
         } catch (IOException ignored) {
             fail();
         }
+    }
+
+    void validateAccessToken(AccessToken accessToken, long now) {
+        validateAccessTokenCommon(accessToken, now);
+        assertEquals(1, accessToken.getScope().size());
+        assertTrue(accessToken.getScope().contains("readers"));
+        assertEquals(accessToken.getScopeStd(), "readers");
+    }
+
+    void validateAccessTokenMultipleRoles(AccessToken accessToken, long now) {
+        validateAccessTokenCommon(accessToken, now);
+        assertEquals(2, accessToken.getScope().size());
+        assertTrue(accessToken.getScope().contains("readers"));
+        assertTrue(accessToken.getScope().contains("writers"));
+        assertEquals(accessToken.getScopeStd(), "readers writers");
+        assertEquals(accessToken.getJwtId(), "jwt-id001");
+    }
+
+    private void resetConfProperty(final String oldConf) {
+        if (oldConf == null) {
+            System.clearProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF);
+        } else {
+            System.setProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF, oldConf);
+        }
+    }
+
+    @BeforeMethod
+    public void setup() {
+        AccessToken.setAccessTokenCertOffset(3600);
     }
 
     @Test
@@ -130,16 +174,53 @@ public class AccessTokenTest {
         // now verify our signed token
 
         PublicKey publicKey = Crypto.loadPublicKey(ecPublicKey);
-        Jws<Claims> claims = Jwts.parser().setSigningKey(publicKey).parseClaimsJws(accessJws);
+        Jws<Claims> claims = Jwts.parserBuilder().setSigningKey(publicKey).build().parseClaimsJws(accessJws);
         assertNotNull(claims);
 
         assertEquals("subject", claims.getBody().getSubject());
         assertEquals("coretech", claims.getBody().getAudience());
         assertEquals("athenz", claims.getBody().getIssuer());
+        assertEquals("jwt-id001", claims.getBody().getId());
+        assertEquals("readers", claims.getBody().get("scope"));
         List<String> scopes = (List<String>) claims.getBody().get("scp");
         assertNotNull(scopes);
         assertEquals(1, scopes.size());
         assertEquals("readers", scopes.get(0));
+    }
+
+    @Test
+    public void testAccessTokenMultipleRoles() {
+
+        long now = System.currentTimeMillis() / 1000;
+
+        AccessToken accessToken = createAccessTokenMultipleRoles(now);
+
+        // verify the getters
+
+        validateAccessTokenMultipleRoles(accessToken, now);
+
+        // now get the signed token
+
+        PrivateKey privateKey = Crypto.loadPrivateKey(ecPrivateKey);
+        String accessJws = accessToken.getSignedToken(privateKey, "eckey1", SignatureAlgorithm.ES256);
+        assertNotNull(accessJws);
+
+        // now verify our signed token
+
+        PublicKey publicKey = Crypto.loadPublicKey(ecPublicKey);
+        Jws<Claims> claims = Jwts.parserBuilder().setSigningKey(publicKey).build().parseClaimsJws(accessJws);
+        assertNotNull(claims);
+
+        assertEquals("subject", claims.getBody().getSubject());
+        assertEquals("coretech", claims.getBody().getAudience());
+        assertEquals("athenz", claims.getBody().getIssuer());
+        assertEquals("jwt-id001", claims.getBody().getId());
+        assertEquals("readers writers", claims.getBody().get("scope"));
+        List<String> scopes = (List<String>) claims.getBody().get("scp");
+        assertNotNull(scopes);
+        assertEquals(2, scopes.size());
+        assertEquals("readers", scopes.get(0));
+        assertEquals("writers", scopes.get(1));
     }
 
     @Test
@@ -223,6 +304,37 @@ public class AccessTokenTest {
     }
 
     @Test
+    public void testAccessTokenWithoutSignedToken() {
+
+        long now = System.currentTimeMillis() / 1000;
+
+        AccessToken accessToken = createAccessToken(now);
+
+        // now get the signed token
+
+        PrivateKey privateKey = Crypto.loadPrivateKey(ecPrivateKey);
+        String accessJws = accessToken.getSignedToken(privateKey, "eckey1", SignatureAlgorithm.ES256);
+        assertNotNull(accessJws);
+
+        // now verify our signed token
+
+        JwtsSigningKeyResolver resolver = new JwtsSigningKeyResolver(null, null);
+        resolver.addPublicKey("eckey1", Crypto.loadPublicKey(ecPublicKey));
+
+        // remove the signature part from the token
+
+        int idx = accessJws.lastIndexOf('.');
+        final String unsignedJws = accessJws.substring(0, idx + 1);
+
+        try {
+            new AccessToken(unsignedJws, resolver);
+            fail();
+        } catch (Exception ex) {
+            assertTrue(ex instanceof UnsupportedJwtException);
+        }
+    }
+
+    @Test
     public void testAccessTokenSignedTokenPublicKey() {
 
         long now = System.currentTimeMillis() / 1000;
@@ -263,11 +375,7 @@ public class AccessTokenTest {
         AccessToken checkToken = new AccessToken(accessJws, resolver);
         validateAccessToken(checkToken, now);
 
-        if (oldConf == null) {
-            System.clearProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF);
-        } else {
-            System.setProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF, oldConf);
-        }
+        resetConfProperty(oldConf);
     }
 
     @Test
@@ -301,14 +409,10 @@ public class AccessTokenTest {
         try {
             new AccessToken(accessJws, resolver);
             fail();
-        } catch (Exception ex) {
+        } catch (Exception ignored) {
         }
 
-        if (oldConf == null) {
-            System.clearProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF);
-        } else {
-            System.setProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF, oldConf);
-        }
+        resetConfProperty(oldConf);
     }
 
     @Test
@@ -328,18 +432,13 @@ public class AccessTokenTest {
 
         final String oldConf = System.setProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF,
                 "src/test/resources/athenz-no-keys.conf");
-        MockJwtsSigningKeyResolver.setResponseCode(200);
         MockJwtsSigningKeyResolver.setResponseBody(JWT_KEYS);
         MockJwtsSigningKeyResolver resolver = new MockJwtsSigningKeyResolver("https://localhost:4443", null);
 
         AccessToken checkToken = new AccessToken(accessJws, resolver);
         validateAccessToken(checkToken, now);
 
-        if (oldConf == null) {
-            System.clearProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF);
-        } else {
-            System.setProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF, oldConf);
-        }
+        resetConfProperty(oldConf);
     }
 
     @Test
@@ -359,7 +458,6 @@ public class AccessTokenTest {
 
         final String oldConf = System.setProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF,
                 "src/test/resources/athenz-no-keys.conf");
-        MockJwtsSigningKeyResolver.setResponseCode(401);
         MockJwtsSigningKeyResolver.setResponseBody("");
         SSLContext sslContext = Mockito.mock(SSLContext.class);
         MockJwtsSigningKeyResolver resolver = new MockJwtsSigningKeyResolver("https://localhost:4443", sslContext);
@@ -371,11 +469,7 @@ public class AccessTokenTest {
             assertTrue(ex instanceof IllegalArgumentException, ex.getMessage());
         }
 
-        if (oldConf == null) {
-            System.clearProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF);
-        } else {
-            System.setProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF, oldConf);
-        }
+        resetConfProperty(oldConf);
     }
 
     @Test
@@ -406,11 +500,7 @@ public class AccessTokenTest {
             assertTrue(ex.getMessage().contains("expired"));
         }
 
-        if (oldConf == null) {
-            System.clearProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF);
-        } else {
-            System.setProperty(JwtsSigningKeyResolver.ZTS_PROP_ATHENZ_CONF, oldConf);
-        }
+        resetConfProperty(oldConf);
     }
 
     @Test
@@ -500,7 +590,7 @@ public class AccessTokenTest {
         String certStr = new String(Files.readAllBytes(path));
         X509Certificate cert = Crypto.loadX509Certificate(certStr);
 
-        AccessToken.setAccessTokenProxyPrincipals(new HashSet<>(Arrays.asList("athenz.syncer")));
+        AccessToken.setAccessTokenProxyPrincipals(new HashSet<>(Collections.singletonList("athenz.syncer")));
         assertTrue(accessToken.confirmMTLSBoundToken(cert, "A4DtL2JmUMhAsvJj5tKyn64SqzmuXbMrJa0n761y5v0"));
         AccessToken.setAccessTokenProxyPrincipals(null);
     }
@@ -565,7 +655,217 @@ public class AccessTokenTest {
     }
 
     @Test
+    public void testConfirmX509CertProxyPrincipal() throws IOException {
+
+        long now = System.currentTimeMillis() / 1000;
+        AccessToken accessToken = createAccessToken(now);
+        accessToken.setConfirmProxyPrincipalSpiffeUris(Collections.singletonList("spiffe://athenz/domain1/service1"));
+
+        // now get the signed token
+
+        PrivateKey privateKey = Crypto.loadPrivateKey(ecPrivateKey);
+        String accessJws = accessToken.getSignedToken(privateKey, "eckey1", SignatureAlgorithm.ES256);
+        assertNotNull(accessJws);
+
+        // now verify our signed token
+
+        JwtsSigningKeyResolver resolver = new JwtsSigningKeyResolver(null, null);
+        resolver.addPublicKey("eckey1", Crypto.loadPublicKey(ecPublicKey));
+
+        Path path = Paths.get("src/test/resources/x509_altnames_singleuri.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        AccessToken checkToken = new AccessToken(accessJws, resolver, cert);
+        assertNotNull(checkToken);
+        List<String> spiffeUris = checkToken.getConfirmProxyPrincpalSpiffeUris();
+        assertEquals(spiffeUris.size(), 1);
+        assertEquals(spiffeUris.get(0), "spiffe://athenz/domain1/service1");
+    }
+
+    @Test
+    public void testConfirmX509CertMultipleProxyPrincipal() throws IOException {
+
+        long now = System.currentTimeMillis() / 1000;
+        AccessToken accessToken = createAccessToken(now);
+        List<String> proxyPrincipalUris = new ArrayList<>();
+        proxyPrincipalUris.add("spiffe://athenz/domain1/service2");
+        proxyPrincipalUris.add("spiffe://athenz/domain1/service1");
+        accessToken.setConfirmProxyPrincipalSpiffeUris(proxyPrincipalUris);
+
+        // now get the signed token
+
+        PrivateKey privateKey = Crypto.loadPrivateKey(ecPrivateKey);
+        String accessJws = accessToken.getSignedToken(privateKey, "eckey1", SignatureAlgorithm.ES256);
+        assertNotNull(accessJws);
+
+        // now verify our signed token
+
+        JwtsSigningKeyResolver resolver = new JwtsSigningKeyResolver(null, null);
+        resolver.addPublicKey("eckey1", Crypto.loadPublicKey(ecPublicKey));
+
+        Path path = Paths.get("src/test/resources/x509_altnames_singleuri.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        AccessToken checkToken = new AccessToken(accessJws, resolver, cert);
+        assertNotNull(checkToken);
+    }
+
+    @Test
+    public void testConfirmX509CertMismatchProxyPrincipal() throws IOException {
+
+        long now = System.currentTimeMillis() / 1000;
+        AccessToken accessToken = createAccessToken(now);
+        accessToken.setConfirmProxyPrincipalSpiffeUris(Collections.singletonList("spiffe://athenz/sports/service1"));
+
+        // now get the signed token
+
+        PrivateKey privateKey = Crypto.loadPrivateKey(ecPrivateKey);
+        String accessJws = accessToken.getSignedToken(privateKey, "eckey1", SignatureAlgorithm.ES256);
+        assertNotNull(accessJws);
+
+        // now verify our signed token
+
+        JwtsSigningKeyResolver resolver = new JwtsSigningKeyResolver(null, null);
+        resolver.addPublicKey("eckey1", Crypto.loadPublicKey(ecPublicKey));
+
+        Path path = Paths.get("src/test/resources/x509_altnames_singleuri.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        try {
+            new AccessToken(accessJws, resolver, cert);
+            fail();
+        } catch (CryptoException ex) {
+            assertTrue(ex.getMessage().contains("Confirmation failure"));
+        }
+    }
+
+    @Test
+    public void testConfirmX509CertInvalidProxyPrincipal() throws IOException {
+
+        long now = System.currentTimeMillis() / 1000;
+        AccessToken accessToken = createAccessToken(now);
+        accessToken.setConfirmProxyPrincipalSpiffeUris(Collections.singletonList("spiffe://athenz/sports/service1"));
+
+        // now get the signed token
+
+        PrivateKey privateKey = Crypto.loadPrivateKey(ecPrivateKey);
+        String accessJws = accessToken.getSignedToken(privateKey, "eckey1", SignatureAlgorithm.ES256);
+        assertNotNull(accessJws);
+
+        // now verify our signed token
+
+        JwtsSigningKeyResolver resolver = new JwtsSigningKeyResolver(null, null);
+        resolver.addPublicKey("eckey1", Crypto.loadPublicKey(ecPublicKey));
+
+        Path path = Paths.get("src/test/resources/x509_altnames_singleuri.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        try {
+            new AccessToken(accessJws, resolver, cert);
+            fail();
+        } catch (CryptoException ex) {
+            assertTrue(ex.getMessage().contains("Confirmation failure"));
+        }
+    }
+
+    @Test
+    public void testConfirmX509CertInvalidEmptyProxyPrincipal() throws IOException {
+
+        long now = System.currentTimeMillis() / 1000;
+        AccessToken accessToken = createAccessToken(now);
+        accessToken.setConfirmProxyPrincipalSpiffeUris(Collections.emptyList());
+
+        // now get the signed token
+
+        PrivateKey privateKey = Crypto.loadPrivateKey(ecPrivateKey);
+        String accessJws = accessToken.getSignedToken(privateKey, "eckey1", SignatureAlgorithm.ES256);
+        assertNotNull(accessJws);
+
+        // now verify our signed token
+
+        JwtsSigningKeyResolver resolver = new JwtsSigningKeyResolver(null, null);
+        resolver.addPublicKey("eckey1", Crypto.loadPublicKey(ecPublicKey));
+
+        Path path = Paths.get("src/test/resources/x509_altnames_singleuri.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        try {
+            new AccessToken(accessJws, resolver, cert);
+            fail();
+        } catch (CryptoException ex) {
+            assertTrue(ex.getMessage().contains("Confirmation failure"));
+        }
+    }
+
+    @Test
+    public void testConfirmX509CertInvalidProxyPrincipalDetails() throws IOException {
+
+        long now = System.currentTimeMillis() / 1000;
+        AccessToken accessToken = createAccessToken(now);
+        accessToken.setConfirmEntry("proxy-principals#spiffe", "spiffe://athenz/sports/service1");
+
+        // now get the signed token
+
+        PrivateKey privateKey = Crypto.loadPrivateKey(ecPrivateKey);
+        String accessJws = accessToken.getSignedToken(privateKey, "eckey1", SignatureAlgorithm.ES256);
+        assertNotNull(accessJws);
+
+        // now verify our signed token
+
+        JwtsSigningKeyResolver resolver = new JwtsSigningKeyResolver(null, null);
+        resolver.addPublicKey("eckey1", Crypto.loadPublicKey(ecPublicKey));
+
+        Path path = Paths.get("src/test/resources/x509_altnames_singleuri.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        try {
+            new AccessToken(accessJws, resolver, cert);
+            fail();
+        } catch (CryptoException ex) {
+            assertTrue(ex.getMessage().contains("Confirmation failure"));
+        }
+    }
+
+    @Test
+    public void testConfirmX509CertNoAuthzDetails() throws IOException {
+
+        long now = System.currentTimeMillis() / 1000;
+        AccessToken accessToken = createAccessToken(now);
+        accessToken.setAuthorizationDetails(null);
+
+        // now get the signed token
+
+        PrivateKey privateKey = Crypto.loadPrivateKey(ecPrivateKey);
+        String accessJws = accessToken.getSignedToken(privateKey, "eckey1", SignatureAlgorithm.ES256);
+        assertNotNull(accessJws);
+
+        // now verify our signed token
+
+        JwtsSigningKeyResolver resolver = new JwtsSigningKeyResolver(null, null);
+        resolver.addPublicKey("eckey1", Crypto.loadPublicKey(ecPublicKey));
+
+        Path path = Paths.get("src/test/resources/x509_altnames_singleuri.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        try {
+            new AccessToken(accessJws, resolver, cert);
+            fail();
+        } catch (CryptoException ex) {
+            assertTrue(ex.getMessage().contains("Confirmation failure"));
+        }
+    }
+
+    @Test
     public void testConfirmX509CertPrincipalCertStartTime() throws IOException {
+
+        AccessToken.setAccessTokenCertOffset(3600);
 
         // our cert issue time is 1565245568
         // so we're going to set token issue time to cert time + 3600 + 100
@@ -576,6 +876,24 @@ public class AccessTokenTest {
         String certStr = new String(Files.readAllBytes(path));
         X509Certificate cert = Crypto.loadX509Certificate(certStr);
         assertFalse(accessToken.confirmX509CertPrincipal(cert, "mtls"));
+    }
+
+    @Test
+    public void testConfirmX509CertPrincipalCertStartTimeCheckDisabled() throws IOException {
+
+        AccessToken.setAccessTokenCertOffset(-1);
+
+        // our cert issue time is 1565245568
+        // so we're going to set token issue time to cert time + 3600 + 100
+
+        AccessToken accessToken = createAccessToken(1565245568 + 3600 + 100);
+
+        Path path = Paths.get("src/test/resources/mtls_token2_spec.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+        assertTrue(accessToken.confirmX509CertPrincipal(cert, "mtls"));
+
+        AccessToken.setAccessTokenCertOffset(3600);
     }
 
     @Test

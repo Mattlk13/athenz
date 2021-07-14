@@ -24,7 +24,6 @@ import com.yahoo.athenz.auth.Authority;
 import org.jvnet.libpam.PAM;
 import org.jvnet.libpam.PAMException;
 import org.jvnet.libpam.UnixUser;
-import org.mockito.Mock;
 import org.testng.annotations.Test;
 
 import com.yahoo.athenz.auth.Principal;
@@ -36,7 +35,7 @@ public class UserAuthorityTest {
     @Test
     public void testUserAuthority() throws PAMException {
         PAM pam = Mockito.mock(PAM.class);
-        UnixUser user = new UnixUser(System.getenv("USER"));
+        UnixUser user = Mockito.mock(UnixUser.class);
         Mockito.when(pam.authenticate("testuser", "testpwd")).thenReturn(user);
         UserAuthority userAuthority = new UserAuthority();
         userAuthority.setPAM(pam);
@@ -49,14 +48,22 @@ public class UserAuthorityTest {
         StringBuilder errMsg = new StringBuilder();
         String testToken = "Basic dGVzdHVzZXI6dGVzdHB3ZA==";
         Principal principal = userAuthority.authenticate(testToken, "10.72.118.45", "GET", errMsg);
-
         assertNotNull(principal);
+
+        assertEquals(principal.getName(), "testuser");
+        assertEquals(principal.getDomain(), expectedDomain);
+        assertEquals(principal.getCredentials(), testToken);
+        assertEquals(principal.getUnsignedCredentials(), "testuser");
+
         assertNotNull(principal.getAuthority());
         assertEquals(principal.getCredentials(), testToken);
-        assertEquals(principal.getDomain(), expectedDomain);
-        String expectedUserId = "testuser";
-        assertEquals(principal.getName(), expectedUserId);
+
         assertTrue(userAuthority.isValidUser("user1"));
+
+        // authenticate user without password which should fail
+
+        principal = userAuthority.authenticate("Basic dGVzdHVzZXIK", "10.72.118.45", "GET", errMsg);
+        assertNull(principal);
     }
 
     @Test
@@ -66,24 +73,29 @@ public class UserAuthorityTest {
     }
 
     @Test
+    public void testGetID() {
+        UserAuthority authority = new UserAuthority();
+        authority.initialize();
+        assertEquals("Auth-UNIX", authority.getID());
+    }
+
+    @Test
     public void testUserAuthorityAuthenticateException() throws PAMException {
         PAM pam = Mockito.mock(PAM.class);
         UserAuthority userAuthority = new UserAuthority();
         userAuthority.setPAM(pam);
         Mockito.when(pam.authenticate("testuser", "testpwd")).thenThrow(RuntimeException.class);
-        StringBuilder errMsg = new StringBuilder();
         Principal principal = userAuthority.authenticate("Basic dGVzdHVzZXI6dGVždšB3ZA==", "10.72.118.45", "GET", null);
         assertNull(principal);
 
         principal = userAuthority.authenticate("Basic dGVzdHVzZXI6dGVzdHB3ZA==", "10.72.118.45", "GET", null);
         assertNull(principal);
-
     }
 
     @Test
     public void testNullSimplePrincipal() throws PAMException {
         PAM pam = Mockito.mock(PAM.class);
-        UnixUser user = new UnixUser(System.getenv("USER"));
+        UnixUser user = Mockito.mock(UnixUser.class);
         Mockito.when(pam.authenticate("testuser", "testpwd")).thenReturn(user);
         UserAuthority authority = new UserAuthority();
         UserAuthority userAuthority = Mockito.spy(authority);
@@ -98,7 +110,7 @@ public class UserAuthorityTest {
         StringBuilder errMsg = new StringBuilder();
         String testToken = "Basic dGVzdHVzZXI6dGVzdHB3ZA==";
         Principal principal = userAuthority.authenticate(testToken, "10.72.118.45", "GET", errMsg);
-
+        assertNull(principal);
     }
 
     @Test
@@ -116,10 +128,10 @@ public class UserAuthorityTest {
         PAM pam = Mockito.mock(PAM.class);
         UserAuthority userAuthority = new UserAuthority();
         userAuthority.setPAM(pam);
-        
+
         assertFalse(userAuthority.allowAuthorization());
     }
-    
+
     @Test
     public void testAuthenticateException() throws PAMException {
         PAM pam = Mockito.mock(PAM.class);
@@ -142,7 +154,7 @@ public class UserAuthorityTest {
     @Test
     public void testIsValidUser() {
 
-        Authority userAuthortiy = new Authority() {
+        Authority userAuthority = new Authority() {
 
             @Override
             public void initialize() {
@@ -169,7 +181,7 @@ public class UserAuthorityTest {
             }
         };
 
-        assertFalse(userAuthortiy.isValidUser("invaliduser"));
-        assertTrue(userAuthortiy.isValidUser("validuser"));
+        assertFalse(userAuthority.isValidUser("invaliduser"));
+        assertTrue(userAuthority.isValidUser("validuser"));
     }
 }

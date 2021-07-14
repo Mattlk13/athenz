@@ -2,9 +2,21 @@
 
 # Athenz
 
-[![Build Status](https://travis-ci.org/yahoo/athenz.svg?branch=master)](https://travis-ci.org/yahoo/athenz)
+[![Pipeline Status][status-image]][status-url]
+[![Publish Status][publish-status-image]][status-url]
+[![SourceSpy Dashboard](https://sourcespy.com/shield.svg)](https://sourcespy.com/github/athenzathenz/)
+[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/4681/badge)](https://bestpractices.coreinfrastructure.org/projects/4681)
 
-> Athenz is a set of services and libraries supporting service authentication and role-based authorization (RBAC) for provisioning and configuration (centralized authorization) use cases as well as serving/runtime (decentralized authorization) use cases. Athenz authorization system utilizes x.509 certificates and two types of tokens: Principal Tokens (N-Tokens) and RoleTokens (Z-Tokens). The use of x.509 certificates is strongly recommended over tokens. The name "Athenz" is derived from "AuthNZ" (N for authentication and Z for authorization).
+[status-image]: https://cd.screwdriver.cd/pipelines/6606/badge
+[publish-status-image]: https://cd.screwdriver.cd/pipelines/6606/publish/badge
+[status-url]: https://cd.screwdriver.cd/pipelines/6606
+
+
+> Athenz is an open source platform for X.509 certificate based service authentication and fine-grained
+> access control in dynamic infrastructures. It supports provisioning and configuration (centralized
+> authorization) use cases as well as serving/runtime (decentralized authorization) use cases. Athenz
+> authorization system utilizes x.509 certificates and industry standard mutual TLS bound oauth2 access
+> tokens. The name “Athenz” is derived from “AuthNZ” (N for authentication and Z for authorization).
 
 ## Table of Contents
 
@@ -17,7 +29,7 @@
 ## Background
 
 Athenz is an open source platform for X.509 certificate based service authentication
-and fine grained role based access control in dynamic infrastructures. It provides
+and fine-grained role based access control in dynamic infrastructures. It provides
 support for the following three major functional areas.
 
 ### Service Authentication
@@ -26,11 +38,11 @@ Athenz provides secure identity in the form of short lived X.509 certificate
 for every workload or service deployed in private (e.g. Openstack, K8S, Screwdriver)
 or public cloud (e.g. AWS EC2, ECS, Fargate, Lambda). Using these X.509 certificates
 clients and services establish secure connections and through mutual TLS authentication verify
-each other's identity. The service identity certificates are valid for 30 days only
+each other's identity. The service identity certificates are valid for 30 days only,
 and the service identity agents (SIA) part of those frameworks automatically refresh
 them daily. The term service within Athenz is more generic than a traditional service.
 A service identity could represent a command, job, daemon, workflow, as well as both an
-application client and an application service.
+application client, and an application service.
 
 Since Athenz service authentication is based on
 [X.509 certificates](https://en.wikipedia.org/wiki/X.509), it is
@@ -68,9 +80,6 @@ credentials for configured AWS IAM roles.
     * [UI Server](docs/setup_ui_prod.md)
 * AWS Production Environment Setup
     * [Introduction](docs/aws_athenz_setup.md)
-    * [ZMS Server](docs/aws_zms_setup.md)
-    * [ZTS Server](docs/aws_zts_setup.md)
-    * [UI Server](docs/aws_ui_setup.md)
 
 ## Usage
 
@@ -81,10 +90,10 @@ credentials for configured AWS IAM roles.
 * Features
     * [Service Identity X.509 Certificates - Copper Argos](docs/copper_argos.md)
 * Developer Guide
-    * [Centralized Access Control](docs/dev_centralized_access.md)
+    * [Centralized Access Control](docs/cent_authz_flow.md)
         * [Java Client/Servlet Example](docs/example_java_centralized_access.md)
         * [Go Client/Server Example](docs/example_go_centralized_access.md)
-    * [Decentralized Access Control](docs/dev_decentralized_access.md)
+    * [Decentralized Access Control](docs/decent_authz_flow.md)
         * [Java Client/Servlet Example](docs/example_java_decentralized_access.md)
 * Customizing Athenz
     * [Principal Authentication](docs/principal_authentication.md)
@@ -95,18 +104,20 @@ credentials for configured AWS IAM roles.
     * [ZMS Client Utility](docs/zms_client.md)
     * [ZPU Utility](docs/setup_zpu.md)
     * [Registering ZMS Service Identity](docs/reg_service_guide.md)
+    * [ZMS API](docs/zms_api.md)
+    * [ZTS API](docs/zts_api.md)
 
 ## Contribute
 
-Please refer to the [contributing file](docs/contributing.md) for information about how to get involved. We welcome issues, questions, and pull requests.
+Please refer to the [contributing file](CONTRIBUTING.md) for information about how to get involved. We welcome issues, questions, and pull requests.
 
 You can also contact us for any user and development discussions through our groups:
 
 * [Athenz-Dev](https://groups.google.com/d/forum/athenz-dev) for development discussions
 * [Athenz-Users](https://groups.google.com/d/forum/athenz-users) for users questions
 
-## License
+The [sourcespy dashboard](https://sourcespy.com/github/yahooathenz/) provides a high level overview of the repository including [module dependencies](https://sourcespy.com/github/yahooathenz/xx-omodulesc-.html), [module hierarchy](https://sourcespy.com/github/yahooathenz/xx-omodules-.html), [external libraries](https://sourcespy.com/github/yahooathenz/xx-ojavalibs-.html), [web services](https://sourcespy.com/github/yahooathenz/xx-owebservices-.html), and other components of the system.
 
-Copyright 2016 Yahoo Inc.
+## License
 
 Licensed under the Apache License, Version 2.0: [http://www.apache.org/licenses/LICENSE-2.0](http://www.apache.org/licenses/LICENSE-2.0)

@@ -22,6 +22,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
+import com.yahoo.athenz.auth.ServerPrivateKey;
+import com.yahoo.athenz.common.server.dns.HostnameResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -36,13 +38,16 @@ import javax.net.ssl.SSLContext;
 public class InstanceProviderManager {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(InstanceProviderManager.class);
+
     private static final String SCHEME_HTTPS = "https";
     private static final String SCHEME_CLASS = "class";
+    private static final String ZTS_PROVIDER = "sys.auth.zts";
 
-    private ConcurrentHashMap<String, InstanceProvider> providerMap;
-    private DataStore dataStore;
-    private KeyStore keyStore;
-    private SSLContext sslContext;
+    private final ConcurrentHashMap<String, InstanceProvider> providerMap;
+    private final DataStore dataStore;
+    private final KeyStore keyStore;
+    private final SSLContext sslContext;
+    private final ServerPrivateKey serverPrivateKey;
     List<String> providerEndpoints = Collections.emptyList();
 
     enum ProviderScheme {
@@ -51,11 +56,14 @@ public class InstanceProviderManager {
         CLASS
     }
     
-    public InstanceProviderManager(DataStore dataStore, SSLContext sslContext, KeyStore keyStore) {
+    public InstanceProviderManager(DataStore dataStore, SSLContext sslContext, ServerPrivateKey serverPrivateKey,
+                                   KeyStore keyStore) {
         
         this.dataStore = dataStore;
         this.keyStore = keyStore;
         this.sslContext = sslContext;
+        this.serverPrivateKey = serverPrivateKey;
+
         providerMap = new ConcurrentHashMap<>();
         
         // get the list of valid provider endpoints
@@ -66,7 +74,7 @@ public class InstanceProviderManager {
         }
     }
     
-    InstanceProvider getProvider(String provider) {
+    InstanceProvider getProvider(String provider, HostnameResolver hostnameResolver) {
         int idx = provider.lastIndexOf('.');
         if (idx == -1) {
             LOGGER.error("getProviderClient: Invalid provider service name: {}", provider);
@@ -84,7 +92,7 @@ public class InstanceProviderManager {
         boolean validProviderName = false;
         List<com.yahoo.athenz.zms.ServiceIdentity> services = dataCache.getDomainData().getServices();
         if (services == null) {
-            LOGGER.error("getProviderClient: Unknown provider servicee: {}", provider);
+            LOGGER.error("getProviderClient: Unknown provider service: {}", provider);
             return null;
         }
         
@@ -129,7 +137,7 @@ public class InstanceProviderManager {
             instanceProvider.initialize(provider, providerEndpoint, sslContext, keyStore);
             break;
         case CLASS:
-            instanceProvider = getClassProvider(uri.getHost(), provider);
+            instanceProvider = getClassProvider(uri.getHost(), provider, hostnameResolver);
             break;
         default:
             break;
@@ -138,7 +146,7 @@ public class InstanceProviderManager {
         return instanceProvider;
     }
     
-    InstanceProvider getClassProvider(String className, String providerName) {
+    InstanceProvider getClassProvider(String className, String providerName, HostnameResolver hostnameResolver) {
         final String classKey = className + "-" + providerName;
         InstanceProvider provider = providerMap.get(classKey);
         if (provider != null) {
@@ -159,6 +167,11 @@ public class InstanceProviderManager {
             return null;
         }
         provider.initialize(providerName, className, sslContext, keyStore);
+        provider.setHostnameResolver(hostnameResolver);
+        if (ZTS_PROVIDER.equals(providerName)) {
+            provider.setPrivateKey(serverPrivateKey.getKey(), serverPrivateKey.getId(), serverPrivateKey.getAlgorithm());
+        }
+
         providerMap.put(classKey, provider);
         return provider;
     }

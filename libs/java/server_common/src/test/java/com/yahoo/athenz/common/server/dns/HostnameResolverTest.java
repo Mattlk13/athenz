@@ -15,11 +15,15 @@
  */
 package com.yahoo.athenz.common.server.dns;
 
+import com.yahoo.athenz.zts.CertType;
 import org.mockito.Mockito;
 import org.testng.annotations.Test;
 
+import java.util.Collections;
+
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.assertFalse;
 
 public class HostnameResolverTest {
 
@@ -44,5 +48,10 @@ public class HostnameResolverTest {
         assertTrue(resolver.isValidHostname("host1.athenz.cloud"));
         assertTrue(resolver.isValidHostname("host2.athenz.cloud"));
         assertTrue(resolver.isValidHostname("host3.athenz.cloud"));
+
+        assertNotNull(resolver.getAllByName("host1.athenz.cloud"));
+
+        assertFalse(resolver.isValidHostCnameList("athenz.examples.httpd", "host1.athenz.cloud",
+                Collections.singletonList("cname.athenz.cloud"), CertType.X509));
     }
 }

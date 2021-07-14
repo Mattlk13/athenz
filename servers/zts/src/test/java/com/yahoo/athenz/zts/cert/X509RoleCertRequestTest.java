@@ -30,6 +30,26 @@ import static org.testng.Assert.*;
 public class X509RoleCertRequestTest {
 
     @Test
+    public void testX509RoleCertRequest() throws IOException {
+        Path path = Paths.get("src/test/resources/spiffe_role.csr");
+        String csr = new String(Files.readAllBytes(path));
+
+        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
+        assertNotNull(certReq);
+
+        assertEquals("coretech", certReq.getReqRoleDomain());
+        assertEquals("api", certReq.getReqRoleName());
+
+        // override the values
+
+        certReq.setReqRoleDomain("athenz");
+        certReq.setReqRoleName("backend");
+
+        assertEquals("athenz", certReq.getReqRoleDomain());
+        assertEquals("backend", certReq.getReqRoleName());
+    }
+
+    @Test
     public void testValidateSpiffeRoleCert() throws IOException {
 
         Path path = Paths.get("src/test/resources/spiffe_role.csr");
@@ -37,13 +57,10 @@ public class X509RoleCertRequestTest {
 
         X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
 
-        Set<String> roles = new HashSet<>();
-        roles.add("api");
-
         Set<String> orgValues = new HashSet<>();
         orgValues.add("Athenz");
 
-        assertTrue(certReq.validate(roles, "coretech", "sports.api", orgValues));
+        assertTrue(certReq.validate("sports.api", null, orgValues));
     }
 
     @Test
@@ -121,67 +138,96 @@ public class X509RoleCertRequestTest {
     }
 
     @Test
-    public void testGetRequestedRoleListNoURI() throws IOException {
-
-        Path path = Paths.get("src/test/resources/role_multiple_ip.csr");
-        String csr = new String(Files.readAllBytes(path));
-        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
-        assertNull(certReq.getRequestedRoleList());
-    }
-
-    @Test
-    public void testGetRequestedRoleListNoRolesURI() throws IOException {
+    public void testValidateMissingProxyUserUri() throws IOException {
 
         Path path = Paths.get("src/test/resources/spiffe_role.csr");
         String csr = new String(Files.readAllBytes(path));
+
         X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
-        assertNull(certReq.getRequestedRoleList());
-    }
-
-    @Test
-    public void testGetRequestedRoleListInvalidRole() throws IOException {
-
-        Path path = Paths.get("src/test/resources/athenz_role_uri_invalid.csr");
-        String csr = new String(Files.readAllBytes(path));
-        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
-        assertNull(certReq.getRequestedRoleList());
-    }
-
-    @Test
-    public void testGetRequestedRoleList() throws IOException {
-
-        Path path = Paths.get("src/test/resources/athenz_role_uri.csr");
-        String csr = new String(Files.readAllBytes(path));
-        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
-        Map<String, String[]> roles = certReq.getRequestedRoleList();
-        assertEquals(roles.size(), 2);
-        String[] list1 = roles.get("sports");
-        assertEquals(list1.length, 1);
-        assertEquals(list1[0], "readers");
-        String[] list2 = roles.get("weather");
-        assertEquals(list2.length, 2);
-        assertEquals(list2[0], "readers");
-        assertEquals(list2[1], "writers");
-    }
-
-    @Test
-    public void testRoleCertValidate() throws IOException {
-
-        Path path = Paths.get("src/test/resources/athenz_role_uri.csr");
-        String csr = new String(Files.readAllBytes(path));
 
         Set<String> orgValues = new HashSet<>();
         orgValues.add("Athenz");
 
-        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
-        assertTrue(certReq.validate("athenz.production", "proxy.service", orgValues));
-        assertTrue(certReq.validate("athenz.production", "proxy.service", null));
-        assertFalse(certReq.validate("athenz.api", "proxy.service", orgValues));
-        assertFalse(certReq.validate("athenz.production", "proxy.api", orgValues));
+        assertFalse(certReq.validate("sports.api", "proxy.user", orgValues));
+    }
 
-        Set<String> orgValues2 = new HashSet<>();
-        orgValues2.add("sports");
-        assertFalse(certReq.validate("athenz.production", "proxy.service", orgValues2));
+    @Test
+    public void testValidateNoProxyUserUri() throws IOException {
+
+        Path path = Paths.get("src/test/resources/role_single_ip.csr");
+        String csr = new String(Files.readAllBytes(path));
+
+        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
+
+        Set<String> orgValues = new HashSet<>();
+        orgValues.add("Athenz");
+
+        assertFalse(certReq.validate("athenz.production", "proxy.user", orgValues));
+    }
+
+    @Test
+    public void testValidateMultipleProxyUserUri() throws IOException {
+
+        Path path = Paths.get("src/test/resources/multiple_proxy_role.csr");
+        String csr = new String(Files.readAllBytes(path));
+
+        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
+
+        Set<String> orgValues = new HashSet<>();
+        orgValues.add("Athenz");
+
+        assertFalse(certReq.validate("sports.api", "proxy.user", orgValues));
+    }
+
+    @Test
+    public void testValidateProxyUserUri() throws IOException {
+
+        Path path = Paths.get("src/test/resources/proxy_role.csr");
+        String csr = new String(Files.readAllBytes(path));
+
+        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
+
+        Set<String> orgValues = new HashSet<>();
+        orgValues.add("Athenz");
+
+        // valid proxy user
+        assertTrue(certReq.validate("sports.api", "proxy.user", orgValues));
+
+        // mismatch proxy user
+        assertFalse(certReq.validate("sports.api", "proxy2.user", orgValues));
+    }
+
+    @Test
+    public void testRoleCertValidatePrincipalURINoEmail() throws IOException {
+
+        Path path = Paths.get("src/test/resources/athenz_role_principal_uri.csr");
+        String csr = new String(Files.readAllBytes(path));
+
+        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
+        assertTrue(certReq.validate("athenz.production", null, null));
+        assertFalse(certReq.validate("athenz.api", null, null));
+    }
+
+    @Test
+    public void testRoleCertValidatePrincipalURIWithEmail() throws IOException {
+
+        Path path = Paths.get("src/test/resources/athenz_role_principal_uri_email.csr");
+        String csr = new String(Files.readAllBytes(path));
+
+        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
+        assertTrue(certReq.validate("athenz.production", null, null));
+        assertFalse(certReq.validate("athenz.api", null, null));
+    }
+
+    @Test
+    public void testRoleCertValidatePrincipalURIWithEmailMismatch() throws IOException {
+
+        Path path = Paths.get("src/test/resources/athenz_role_principal_uri_email_mismatch.csr");
+        String csr = new String(Files.readAllBytes(path));
+
+        X509RoleCertRequest certReq = new X509RoleCertRequest(csr);
+        assertFalse(certReq.validate("athenz.production", null, null));
+        assertFalse(certReq.validate("athenz.api", null, null));
     }
 }
 

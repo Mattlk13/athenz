@@ -79,19 +79,19 @@ public class TestAuthZpe {
     @BeforeClass
     public void beforeClass() throws IOException {
 
-        Path path = Paths.get("./src/test/resources/zts_private_k0.pem");
+        Path path = Paths.get("./src/test/resources/unit_test_zts_private_k0.pem");
         ztsPrivateKeyK0 = Crypto.loadPrivateKey(new String((Files.readAllBytes(path))));
 
-        path = Paths.get("./src/test/resources/zms_private_k0.pem");
+        path = Paths.get("./src/test/resources/unit_test_zms_private_k0.pem");
         zmsPrivateKeyK0 = Crypto.loadPrivateKey(new String((Files.readAllBytes(path))));
         
-        path = Paths.get("./src/test/resources/zts_private_k1.pem");
+        path = Paths.get("./src/test/resources/unit_test_zts_private_k1.pem");
         ztsPrivateKeyK1 = Crypto.loadPrivateKey(new String((Files.readAllBytes(path))));
 
-        path = Paths.get("./src/test/resources/zts_private_k17.pem");
+        path = Paths.get("./src/test/resources/unit_test_zts_private_k17.pem");
         ztsPrivateKeyK17 = Crypto.loadPrivateKey(new String((Files.readAllBytes(path))));
 
-        path = Paths.get("./src/test/resources/zts_private_k99.pem");
+        path = Paths.get("./src/test/resources/unit_test_zts_private_k99.pem");
         ztsPrivateKeyK99 = Crypto.loadPrivateKey(new String((Files.readAllBytes(path))));
 
         List<String> roles = new ArrayList<>();
@@ -286,7 +286,7 @@ public class TestAuthZpe {
         try {
             AuthZpeClient.setPublicKeyStoreFactoryClass("invalidclass");
             fail();
-        } catch (Exception ex) {
+        } catch (Exception ignored) {
         }
     }
 
@@ -296,7 +296,7 @@ public class TestAuthZpe {
         try {
             AuthZpeClient.setZPEClientClass("invalidclass");
             fail();
-        } catch (Exception ex) {
+        } catch (Exception ignored) {
         }
 
         AuthZpeClient.setZPEClientClass("com.yahoo.athenz.zpe.ZpeUpdater");
@@ -558,7 +558,17 @@ public class TestAuthZpe {
         AccessCheckStatus status = AuthZpeClient.allowAccess(rToken0AnglerPublic, angResource, action, roleName);
         Assert.assertEquals(status, AccessCheckStatus.DENY);
     }
-    
+
+    @Test
+    public void testPublicThrowDeniedCaseSensitive() {
+        String action      = "THrow2";
+        String angResource = "angler:StufF2";
+        StringBuilder roleName = new StringBuilder();
+
+        AccessCheckStatus status = AuthZpeClient.allowAccess(rToken0AnglerPublic, angResource, action, roleName);
+        Assert.assertEquals(status, AccessCheckStatus.DENY);
+    }
+
     @Test
     public void testAdminThrowAllowed() {
         String action      = "THrow";
@@ -572,6 +582,17 @@ public class TestAuthZpe {
     public void testValidAccessResource() {
         String action      = "ACCESS";
         String angResource = "angler:tables.blah";
+        StringBuilder roleName = new StringBuilder();
+
+        AccessCheckStatus status = AuthZpeClient.allowAccess(rToken0AnglerPachinko, angResource, action, roleName);
+        Assert.assertEquals(status, AccessCheckStatus.ALLOW);
+        Assert.assertEquals(roleName.toString(), "pachinko");
+    }
+
+    @Test
+    public void testValidAccessResourceCaseSensitive() {
+        String action      = "AccesS2";
+        String angResource = "angler:TableS.BlaH2";
         StringBuilder roleName = new StringBuilder();
 
         AccessCheckStatus status = AuthZpeClient.allowAccess(rToken0AnglerPachinko, angResource, action, roleName);
@@ -882,6 +903,59 @@ public class TestAuthZpe {
         status = AuthZpeClient.allowAccess("Bearer " + accessToken0AnglerRegex, resource, action, roleName);
         Assert.assertEquals(status, AccessCheckStatus.ALLOW);
         Assert.assertEquals(roleName.toString(), "matchall");
+    }
+
+    @Test
+    public void testAllowAccessMatchAllAccessTokenNoRoleName() throws IOException {
+
+        String action = "all";
+        String resource = "angler:stuff";
+
+        Path path = Paths.get("src/test/resources/mtls_token_spec.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        AccessCheckStatus status = AuthZpeClient.allowAccess(accessToken0AnglerRegex, cert, null, resource, action);
+        Assert.assertEquals(status, AccessCheckStatus.ALLOW);
+
+        // second time for the same token we should get from the cache
+
+        status = AuthZpeClient.allowAccess(accessToken0AnglerRegex, resource, action);
+        Assert.assertEquals(status, AccessCheckStatus.ALLOW);
+
+        // now we're going to include the Bearer part
+
+        status = AuthZpeClient.allowAccess("Bearer " + accessToken0AnglerRegex, resource, action);
+        Assert.assertEquals(status, AccessCheckStatus.ALLOW);
+    }
+
+    @Test
+    public void testAllowAccessCertHashMismatch() throws IOException {
+
+        String action = "all";
+        String resource = "angler:stuff";
+        StringBuilder roleName = new StringBuilder();
+
+        Path path = Paths.get("src/test/resources/mtls_token_mismatch.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        AccessCheckStatus status = AuthZpeClient.allowAccess(accessToken0AnglerRegex, cert, null, resource, action, roleName);
+        Assert.assertEquals(status, AccessCheckStatus.DENY_CERT_HASH_MISMATCH);
+    }
+
+    @Test
+    public void testAllowAccessCertHashMismatchNoRoleName() throws IOException {
+
+        String action = "all";
+        String resource = "angler:stuff";
+
+        Path path = Paths.get("src/test/resources/mtls_token_mismatch.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        AccessCheckStatus status = AuthZpeClient.allowAccess(accessToken0AnglerRegex, cert, null, resource, action);
+        Assert.assertEquals(status, AccessCheckStatus.DENY_CERT_HASH_MISMATCH);
     }
 
     @Test
@@ -1313,5 +1387,50 @@ public class TestAuthZpe {
         // we should now get null since the token is expired
 
         assertNull(AuthZpeClient.validateRoleToken(rtoken.getSignedToken()));
+    }
+
+    @Test
+    public void testValidateAccessTokenWithMtlsBound() throws IOException {
+
+        Path path = Paths.get("src/test/resources/mtls_token_spec.cert");
+        String certStr = new String(Files.readAllBytes(path));
+        X509Certificate cert = Crypto.loadX509Certificate(certStr);
+
+        AccessToken accessToken = AuthZpeClient.validateAccessToken(accessToken0AnglerRegex, cert, null);
+        assertNotNull(accessToken);
+
+        // now we're going to include the Bearer part
+
+        accessToken = AuthZpeClient.validateAccessToken("Bearer " + accessToken0AnglerRegex, cert, null);
+        assertNotNull(accessToken);
+    }
+
+    @Test
+    public void testValidateAccessTokenWithoutMtlsBound() {
+
+        AccessToken accessToken = AuthZpeClient.validateAccessToken(accessToken0AnglerRegex, null, null);
+        assertNotNull(accessToken);
+
+        // now we're going to include the Bearer part
+
+        accessToken = AuthZpeClient.validateAccessToken("Bearer " + accessToken0AnglerRegex, null, null);
+        assertNotNull(accessToken);
+    }
+
+    @Test
+    public void testValidateAccessTokenInvalid() {
+
+        // create a token with a key id that does not exist
+
+        List<String> roles = Collections.singletonList("matchall");
+        final String invalidKeyIdToken = createInvalidAccessToken("angler", roles);
+
+        AccessToken accessToken = AuthZpeClient.validateAccessToken(invalidKeyIdToken, null, null);
+        assertNull(accessToken);
+
+        // now we're going to include the Bearer part
+
+        accessToken = AuthZpeClient.validateAccessToken("Bearer " + invalidKeyIdToken, null, null);
+        assertNull(accessToken);
     }
 }

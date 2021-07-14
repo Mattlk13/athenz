@@ -21,9 +21,11 @@ resource RoleList GET "/domain/{domainName}/role?limit={limit}&skip={skip}" {
 
 // Get the list of all roles in a domain with optional flag
 // whether or not include members
-resource Roles GET "/domain/{domainName}/roles?members={members}" {
+resource Roles GET "/domain/{domainName}/roles?members={members}&tagKey={tagKey}&tagValue={tagValue}" {
     DomainName domainName; // name of the domain
     Bool members (optional, default=false); // return list of members in the role
+    CompoundName tagKey (optional); //flag to query all roles that have a given tagName
+    CompoundName tagValue (optional); //flag to query all roles that have a given tag name and value
     authenticate;
     exceptions {
         ResourceError BAD_REQUEST;
@@ -103,6 +105,19 @@ resource Membership GET "/domain/{domainName}/role/{roleName}/member/{memberName
     }
 }
 
+//Get members with overdue review
+resource DomainRoleMembers GET "/domain/{domainName}/overdue" (name=GetOverdueReview) {
+    DomainName domainName; //name of the domain
+    authenticate;
+    exceptions {
+        ResourceError BAD_REQUEST;
+        ResourceError NOT_FOUND;
+        ResourceError FORBIDDEN;
+        ResourceError UNAUTHORIZED;
+        ResourceError TOO_MANY_REQUESTS;
+    }
+}
+
 //Get list of principals defined in roles in the given domain
 resource DomainRoleMembers GET "/domain/{domainName}/member" {
     DomainName domainName; //name of the domain
@@ -116,8 +131,23 @@ resource DomainRoleMembers GET "/domain/{domainName}/member" {
     }
 }
 
+// Fetch all the roles across domains by either calling or specified principal
+resource DomainRoleMember GET "/role?principal={principal}&domain={domainName}" (name=getPrincipalRoles) {
+    ResourceName principal (optional); //If not present, will return roles for the user making the call
+    DomainName domainName (optional); //If not present, will return roles from all domains
+    authenticate;
+    exceptions {
+        ResourceError BAD_REQUEST;
+        ResourceError NOT_FOUND;
+        ResourceError FORBIDDEN;
+        ResourceError UNAUTHORIZED;
+        ResourceError TOO_MANY_REQUESTS;
+    }
+}
+
 //Add the specified user to the role's member list.
 //If the role is neither auditEnabled nor selfserve, then it will use authorize ("update", "{domainName}:role.{roleName}")
+//or ("update_members", "{domainName}:role.{roleName}"). This only allows access to members and not role attributes.
 //otherwise membership will be sent for approval to either designated delegates ( in case of auditEnabled roles ) or to
 //domain admins ( in case of selfserve roles )
 resource Membership PUT "/domain/{domainName}/role/{roleName}/member/{memberName}" {
@@ -139,14 +169,37 @@ resource Membership PUT "/domain/{domainName}/role/{roleName}/member/{memberName
 }
 
 //Delete the specified role membership. Upon successful completion of this delete
-//request, the server will return NO_CONTENT status code without any data (no 
-//object will be returned).
+//request, the server will return NO_CONTENT status code without any data (no
+//object will be returned). The required authorization includes two options:
+//("update", "{domainName}:role.{roleName}") or ("update_members", "{domainName}:role.{roleName}")
 resource Membership DELETE "/domain/{domainName}/role/{roleName}/member/{memberName}" {
     DomainName domainName; //name of the domain
     EntityName roleName; //name of the role
     MemberName memberName; //name of the user to be removed as a member
     String auditRef (header="Y-Audit-Ref"); //Audit param required(not empty) if domain auditEnabled is true.
-    authorize ("update", "{domainName}:role.{roleName}");
+    authenticate;
+    expected NO_CONTENT;
+    exceptions {
+        ResourceError NOT_FOUND;
+        ResourceError BAD_REQUEST;
+        ResourceError FORBIDDEN;
+        ResourceError UNAUTHORIZED;
+        ResourceError CONFLICT;
+        ResourceError TOO_MANY_REQUESTS;
+    }
+}
+
+//Delete the specified pending role membership. Upon successful completion of this delete
+//request, the server will return NO_CONTENT status code without any data (no
+//object will be returned). Authorization will be completed within the server itself
+//since there are two possibilities: 1) The domain admins can delete any pending requests
+//2) the requestor can also delete his/her own pending request.
+resource Membership DELETE "/domain/{domainName}/role/{roleName}/pendingmember/{memberName}" (name=DeletePendingMembership) {
+    DomainName domainName; //name of the domain
+    EntityName roleName; //name of the role
+    MemberName memberName; //name of the user to be removed as a pending member
+    String auditRef (header="Y-Audit-Ref"); //Audit param required(not empty) if domain auditEnabled is true.
+    authenticate;
     expected NO_CONTENT;
     exceptions {
         ResourceError NOT_FOUND;
@@ -186,7 +239,7 @@ resource Role PUT "/domain/{domainName}/role/{roleName}/meta/system/{attribute}"
     SimpleName attribute; //name of the system attribute to be modified
     String auditRef (header="Y-Audit-Ref"); //Audit param required(not empty) if domain auditEnabled is true.
     RoleSystemMeta detail; //RoleSystemMeta object with updated attribute values
-    authorize ("update", "sys.auth:role.meta.{attribute}.{domainName}");
+    authorize ("update", "sys.auth:meta.role.{attribute}.{domainName}");
     expected NO_CONTENT;
     exceptions {
         ResourceError NOT_FOUND;
@@ -218,7 +271,7 @@ resource Role PUT "/domain/{domainName}/role/{roleName}/meta" {
 
 //Approve or Reject the request to add specified user to role membership.
 // This endpoint will be used by 2 use cases:
-// 1. Audit enabled roles with authorize ("update", "sys.auth:role.meta.{attribute}.{domainName}")
+// 1. Audit enabled roles with authorize ("update", "sys.auth:meta.role.{attribute}.{domainName}")
 // 2. Selfserve roles in any domain with authorize ("update", "{domainName}:")
 resource Membership PUT "/domain/{domainName}/role/{roleName}/member/{memberName}/decision" (name=PutMembershipDecision) {
     DomainName domainName; //name of the domain
@@ -227,6 +280,24 @@ resource Membership PUT "/domain/{domainName}/role/{roleName}/member/{memberName
     String auditRef (header="Y-Audit-Ref"); //Audit param required(not empty) if domain auditEnabled is true.
     Membership membership; //Membership object (must contain role/member names as specified in the URI)
     authenticate;
+    expected NO_CONTENT;
+    exceptions {
+        ResourceError NOT_FOUND;
+        ResourceError BAD_REQUEST;
+        ResourceError FORBIDDEN;
+        ResourceError UNAUTHORIZED;
+        ResourceError CONFLICT;
+        ResourceError TOO_MANY_REQUESTS;
+    }
+}
+
+// Review role membership and take action to either extend and/or delete existing members.
+resource Role PUT "/domain/{domainName}/role/{roleName}/review" (name=PutRoleReview) {
+    DomainName domainName; //name of the domain
+    EntityName roleName; //name of the role
+    String auditRef (header="Y-Audit-Ref"); //Audit param required(not empty) if domain auditEnabled is true.
+    Role role; // Role object with updated and/or deleted members
+    authorize ("update", "{domainName}:role.{roleName}");
     expected NO_CONTENT;
     exceptions {
         ResourceError NOT_FOUND;

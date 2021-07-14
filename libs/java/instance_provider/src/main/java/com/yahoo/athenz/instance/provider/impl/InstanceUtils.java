@@ -38,25 +38,25 @@ public class InstanceUtils {
 
         final String value = attributes.get(propertyName);
         if (value == null) {
-            LOGGER.error("getInstanceProperty: " + propertyName + " attribute not available");
+            LOGGER.error("getInstanceProperty: {} attribute not available", propertyName);
             return null;
         }
 
         return value;
     }
 
-    public static boolean validateCertRequestHostnames(final Map<String, String> attributes,
-            final String domain, final String service, final String dnsSuffix,
-            StringBuilder instanceId) {
+    public static boolean validateCertRequestSanDnsNames(final Map<String, String> attributes,
+                                                         final String domain, final String service, final String dnsSuffix,
+                                                         StringBuilder instanceId) {
 
         // make sure we have valid dns suffix specified
 
         if (dnsSuffix == null || dnsSuffix.isEmpty()) {
-            LOGGER.error("No AWS DNS suffix specified for validation");
+            LOGGER.error("No Cloud Provider DNS suffix specified for validation");
             return false;
         }
 
-        // first check to see if we're given any hostnames to validate
+        // first check to see if we're given any san dns names to validate
         // if the list is empty then something is not right thus we'll
         // reject the request
 
@@ -144,10 +144,16 @@ public class InstanceUtils {
             if (!uri.startsWith(ZTS_CERT_INSTANCE_ID_URI)) {
                 continue;
             }
-            // skip the provider value
-            int idx = uri.substring(ZTS_CERT_INSTANCE_ID_URI.length()).indexOf('/');
+            // skip the provider value but take into account the case
+            // where there is no value specified after provider /
+            int idx = uri.indexOf('/', ZTS_CERT_INSTANCE_ID_URI.length());
             if (idx != -1) {
-                instanceId.append(uri.substring(ZTS_CERT_INSTANCE_ID_URI.length() + idx + 1));
+                final String id = uri.substring(idx + 1);
+                if (id.isEmpty()) {
+                    LOGGER.error("Empty instance uri provided in uri: {}", uri);
+                    return false;
+                }
+                instanceId.append(id);
                 return true;
             }
         }

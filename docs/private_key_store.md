@@ -11,7 +11,7 @@ Athenz servers (both ZMS and ZTS) require a unique private key
 to sign their respective tokens. There are 2 distinct operations
 that require the use of signatures:
 
-* NToken/ZToken signatures
+* X509 Certificates / Access Token signatures
 * Policy Document signatures
 
 The private key could be unique per host (if you have multiple
@@ -30,13 +30,13 @@ rather than a file).
 To provide ZMS/ZTS servers with private keys, the following two
 interfaces must be implemented:
 
-* [PrivateKeyStoreFactory](https://github.com/yahoo/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/PrivateKeyStoreFactory.java)
+* [PrivateKeyStoreFactory](https://github.com/AthenZ/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/PrivateKeyStoreFactory.java)
 
 The job of the PrivateKeyStoreFactory class is to implement a single
 `create()` method which returns an instance of `PrivateKeyStore` class
 implementation.
 
-* [PrivateKeyStore](https://github.com/yahoo/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/PrivateKeyStore.java)
+* [PrivateKeyStore](https://github.com/AthenZ/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/PrivateKeyStore.java)
 
 The job of the PrivateKeyStore class is to return a private key
 for a given host in a PEM format. The hostname is passed as the first
@@ -58,7 +58,7 @@ then the server will continue to run. This is necessary since it's
 possible that an environment may choose to run only ZMS Servers
 for centralized authorization thus no need to sign and distribute
 policy documents and only supports TLS certificates for principal
-authentication thus no need to sign and issue NTokens.
+authentication.
 
 ## Configuration
 ----------------

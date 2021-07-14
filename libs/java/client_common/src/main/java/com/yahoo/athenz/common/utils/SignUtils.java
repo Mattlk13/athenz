@@ -24,6 +24,8 @@ import com.yahoo.athenz.zms.Policy;
 import com.yahoo.athenz.zms.PublicKeyEntry;
 import com.yahoo.athenz.zms.Role;
 import com.yahoo.athenz.zms.RoleMember;
+import com.yahoo.athenz.zms.Group;
+import com.yahoo.athenz.zms.GroupMember;
 import com.yahoo.athenz.zms.ServiceIdentity;
 import com.yahoo.athenz.zms.SignedPolicies;
 import com.yahoo.athenz.zts.PolicyData;
@@ -32,7 +34,7 @@ import com.yahoo.rdl.Array;
 import com.yahoo.rdl.Struct;
 
 public class SignUtils {
-    
+
     private static final String ATTR_ENABLED = "enabled";
     private static final String ATTR_MODIFIED = "modified";
     private static final String ATTR_POLICIES = "policies";
@@ -43,7 +45,10 @@ public class SignUtils {
     private static final String ATTR_ZMS_KEY_ID = "zmsKeyId";
     private static final String ATTR_MEMBERS = "members";
     private static final String ATTR_ROLE_MEMBERS = "roleMembers";
+    private static final String ATTR_GROUP_MEMBERS = "groupMembers";
     private static final String ATTR_MEMBER_NAME = "memberName";
+    private static final String ATTR_GROUP_NAME = "groupName";
+    private static final String ATTR_SYSTEM_DISABLED = "systemDisabled";
     private static final String ATTR_EXPIRATION = "expiration";
     private static final String ATTR_NAME = "name";
     private static final String ATTR_ROLE = "role";
@@ -65,14 +70,23 @@ public class SignUtils {
     private static final String ATTR_HOSTS = "hosts";
     private static final String ATTR_KEY = "key";
     private static final String ATTR_ROLES = "roles";
+    private static final String ATTR_GROUPS = "groups";
     private static final String ATTR_SIGNATURE = "signature";
     private static final String ATTR_KEYID = "keyId";
     private static final String ATTR_CONTENTS = "contents";
     private static final String ATTR_CERT_DNS_DOMAIN = "certDnsDomain";
     private static final String ATTR_AUDIT_ENABLED = "auditEnabled";
+    private static final String ATTR_REVIEW_ENABLED = "reviewEnabled";
     private static final String ATTR_SELF_SERVE = "selfServe";
     private static final String ATTR_MEMBER_EXPIRY_DAYS = "memberExpiryDays";
     private static final String ATTR_TOKEN_EXPIRY_MINS = "tokenExpiryMins";
+    private static final String ATTR_CERT_EXPIRY_MINS = "certExpiryMins";
+    private static final String ATTR_ROLE_CERT_EXPIRY_MINS = "roleCertExpiryMins";
+    private static final String ATTR_SERVICE_EXPIRY_DAYS = "serviceExpiryDays";
+    private static final String ATTR_SERVICE_CERT_EXPIRY_MINS = "serviceCertExpiryMins";
+    private static final String ATTR_MEMBER_REVIEW_DAYS = "memberReviewDays";
+    private static final String ATTR_SERVICE_REVIEW_DAYS = "serviceReviewDays";
+    private static final String ATTR_SIGN_ALGORITHM = "signAlgorithm";
 
     private static Struct asStruct(DomainPolicies domainPolicies) {
         // all of our fields are in canonical order based
@@ -136,7 +150,9 @@ public class SignUtils {
         // on their attribute name
         Struct struct = new Struct();
         appendObject(struct, ATTR_AUDIT_ENABLED, role.getAuditEnabled());
+        appendObject(struct, ATTR_CERT_EXPIRY_MINS, role.getCertExpiryMins());
         appendObject(struct, ATTR_MEMBER_EXPIRY_DAYS, role.getMemberExpiryDays());
+        appendObject(struct, ATTR_MEMBER_REVIEW_DAYS, role.getMemberReviewDays());
         appendList(struct, ATTR_MEMBERS, role.getMembers());
         appendObject(struct, ATTR_MODIFIED, role.getModified());
         appendObject(struct, ATTR_NAME, role.getName());
@@ -147,16 +163,47 @@ public class SignUtils {
                 Struct structRoleMember = new Struct();
                 appendObject(structRoleMember, ATTR_EXPIRATION, roleMember.getExpiration());
                 appendObject(structRoleMember, ATTR_MEMBER_NAME, roleMember.getMemberName());
+                appendObject(structRoleMember, ATTR_SYSTEM_DISABLED, roleMember.getSystemDisabled());
                 roleMembersArray.add(structRoleMember);
             }
             appendArray(struct, ATTR_ROLE_MEMBERS, roleMembersArray);
         }
         appendObject(struct, ATTR_SELF_SERVE, role.getSelfServe());
+        appendObject(struct, ATTR_SERVICE_EXPIRY_DAYS, role.getServiceExpiryDays());
+        appendObject(struct, ATTR_SERVICE_REVIEW_DAYS, role.getServiceReviewDays());
+        appendObject(struct, ATTR_SIGN_ALGORITHM, role.getSignAlgorithm());
         appendObject(struct, ATTR_TOKEN_EXPIRY_MINS, role.getTokenExpiryMins());
         appendObject(struct, ATTR_TRUST, role.getTrust());
         return struct;
     }
-    
+
+    private static Struct asStruct(Group group) {
+        // all of our fields are in canonical order based
+        // on their attribute name
+        Struct struct = new Struct();
+        appendObject(struct, ATTR_AUDIT_ENABLED, group.getAuditEnabled());
+        appendObject(struct, ATTR_MEMBER_EXPIRY_DAYS, group.getMemberExpiryDays());
+        List<GroupMember> groupMembers = group.getGroupMembers();
+        if (groupMembers != null) {
+            Array groupMembersArray = new Array();
+            for (GroupMember groupMember : groupMembers) {
+                Struct structRoleMember = new Struct();
+                appendObject(structRoleMember, ATTR_EXPIRATION, groupMember.getExpiration());
+                appendObject(structRoleMember, ATTR_GROUP_NAME, groupMember.getGroupName());
+                appendObject(structRoleMember, ATTR_MEMBER_NAME, groupMember.getMemberName());
+                appendObject(structRoleMember, ATTR_SYSTEM_DISABLED, groupMember.getSystemDisabled());
+                groupMembersArray.add(structRoleMember);
+            }
+            appendArray(struct, ATTR_GROUP_MEMBERS, groupMembersArray);
+        }
+        appendObject(struct, ATTR_MODIFIED, group.getModified());
+        appendObject(struct, ATTR_NAME, group.getName());
+        appendObject(struct, ATTR_REVIEW_ENABLED, group.getReviewEnabled());
+        appendObject(struct, ATTR_SELF_SERVE, group.getSelfServe());
+        appendObject(struct, ATTR_SERVICE_EXPIRY_DAYS, group.getServiceExpiryDays());
+        return struct;
+    }
+
     private static Struct asStruct(ServiceIdentity service) {
         // all of our fields are in canonical order based
         // on their attribute name
@@ -249,6 +296,13 @@ public class SignUtils {
         appendObject(struct, ATTR_AUDIT_ENABLED, domainData.getAuditEnabled());
         appendObject(struct, ATTR_CERT_DNS_DOMAIN, domainData.getCertDnsDomain());
         appendObject(struct, ATTR_ENABLED, domainData.getEnabled());
+        if (domainData.getGroups() != null && !domainData.getGroups().isEmpty()) {
+            Array structGroups = new Array();
+            for (Group group : domainData.getGroups()) {
+                structGroups.add(asStruct(group));
+            }
+            appendArray(struct, ATTR_GROUPS, structGroups);
+        }
         appendObject(struct, ATTR_MEMBER_EXPIRY_DAYS, domainData.getMemberExpiryDays());
         appendObject(struct, ATTR_MODIFIED, domainData.getModified());
         appendObject(struct, ATTR_NAME, domainData.getName());
@@ -260,6 +314,7 @@ public class SignUtils {
             appendObject(struct, ATTR_POLICIES, structSignedPolicies);
             appendObject(structSignedPolicies, ATTR_SIGNATURE, signedPolicies.getSignature());
         }
+        appendObject(struct, ATTR_ROLE_CERT_EXPIRY_MINS, domainData.getRoleCertExpiryMins());
         Array structRoles = new Array();
         if (domainData.getRoles() != null) {
             for (Role role : domainData.getRoles()) {
@@ -273,7 +328,10 @@ public class SignUtils {
                 structServices.add(asStruct(service));
             }
         }
+        appendObject(struct, ATTR_SERVICE_CERT_EXPIRY_MINS, domainData.getServiceCertExpiryMins());
+        appendObject(struct, ATTR_SERVICE_EXPIRY_DAYS, domainData.getServiceExpiryDays());
         appendArray(struct, ATTR_SERVICES, structServices);
+        appendObject(struct, ATTR_SIGN_ALGORITHM, domainData.getSignAlgorithm());
         appendObject(struct, ATTR_TOKEN_EXPIRY_MINS, domainData.getTokenExpiryMins());
         appendObject(struct, ATTR_YPMID, domainData.getYpmId());
         return struct;

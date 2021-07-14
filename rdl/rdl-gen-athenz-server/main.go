@@ -256,7 +256,8 @@ import javax.servlet.http.HttpServletResponse;
 //
 public interface {{cName}}Handler {{openBrace}} {{range .Resources}}
     {{methodSig .}};{{end}}
-    ResourceContext newResourceContext(HttpServletRequest request, HttpServletResponse response);
+    ResourceContext newResourceContext(HttpServletRequest request, HttpServletResponse response, String apiName);
+    void recordMetrics(ResourceContext ctx, int httpStatus);
 }
 `
 
@@ -271,6 +272,8 @@ import javax.servlet.http.HttpServletResponse;
 public interface ResourceContext {
     HttpServletRequest request();
     HttpServletResponse response();
+    String getApiName();
+    String getHttpMethod();
     void authenticate();
     void authorize(String action, String resource, String trustedDomain);
 }
@@ -284,6 +287,8 @@ import javax.ws.rs.core.*;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import javax.inject.Inject;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
 
 @Path("{{rootPath}}")
 public class {{cName}}Resources {
@@ -342,7 +347,7 @@ func makeJavaTypeRef(reg rdl.TypeRegistry, t *rdl.Type) string {
 
 func (gen *javaServerGenerator) processTemplate(templateSource string) error {
 	commentFun := func(s string) string {
-		return formatComment(s, 0, 80)
+		return formatComment(s, 0)
 	}
 	basenameFunc := func(s string) string {
 		i := strings.LastIndex(s, ".")
@@ -385,11 +390,11 @@ func (gen *javaServerGenerator) processTemplate(templateSource string) error {
 		"server":      func() string { return gen.name + "Server" },
 		"name":        func() string { return gen.name },
 		"cName":       func() string { return capitalize(gen.name) },
-		"methodName":  func(r *rdl.Resource) string { return strings.ToLower(string(r.Method)) + string(r.Type) + "Handler" }, //?
+		"methodName":  func(r *rdl.Resource) string { return strings.ToLower(r.Method) + string(r.Type) + "Handler" }, //?
 		"methodPath":  func(r *rdl.Resource) string { return gen.resourcePath(r) },
 		"rootPath":    func() string { return javaGenerationRootPath(gen.schema, gen.base) },
 		"rName": func(r *rdl.Resource) string {
-			return capitalize(strings.ToLower(string(r.Method))) + string(r.Type) + "Result"
+			return capitalize(strings.ToLower(r.Method)) + string(r.Type) + "Result"
 		},
 	}
 	t := template.Must(template.New(gen.name).Funcs(funcMap).Parse(templateSource))
@@ -406,9 +411,12 @@ func (gen *javaServerGenerator) resourcePath(r *rdl.Resource) string {
 }
 
 func (gen *javaServerGenerator) handlerBody(r *rdl.Resource) string {
+	methName, _ := javaMethodName(gen.registry, r)
 	noContent := r.Expected == "NO_CONTENT" && r.Alternatives == nil
-	s := "        try {\n"
-	s += "            ResourceContext context = this.delegate.newResourceContext(this.request, this.response);\n"
+	s := "        int code = ResourceException.OK;\n"
+	s += "        ResourceContext context = null;\n"
+	s += "        try {\n"
+	s += "            context = this.delegate.newResourceContext(this.request, this.response, \"" + methName + "\");\n"
 	var fargs []string
 	bodyName := ""
 	if r.Auth != nil {
@@ -446,7 +454,6 @@ func (gen *javaServerGenerator) handlerBody(r *rdl.Resource) string {
 			fargs = append(fargs, bodyName)
 		}
 	}
-	methName, _ := javaMethodName(gen.registry, r)
 	sargs := ""
 	if len(fargs) > 0 {
 		sargs = ", " + strings.Join(fargs, ", ")
@@ -457,7 +464,7 @@ func (gen *javaServerGenerator) handlerBody(r *rdl.Resource) string {
 		s += "            return this.delegate." + methName + "(context" + sargs + ");\n"
 	}
 	s += "        } catch (ResourceException e) {\n"
-	s += "            int code = e.getCode();\n"
+	s += "            code = e.getCode();\n"
 	s += "            switch (code) {\n"
 	if r.Exceptions != nil && len(r.Exceptions) > 0 {
 		keys := sortedExceptionKeys(r.Exceptions)
@@ -471,6 +478,8 @@ func (gen *javaServerGenerator) handlerBody(r *rdl.Resource) string {
 	s += "                System.err.println(\"*** Warning: undeclared exception (\" + code + \") for resource " + methName + "\");\n"
 	s += "                throw typedException(code, e, ResourceError.class);\n" //? really
 	s += "            }\n"
+	s += "        } finally {\n"
+	s += "            this.delegate.recordMetrics(context, code);\n"
 	s += "        }\n"
 	return s
 }
@@ -528,13 +537,19 @@ func (gen *javaServerGenerator) handlerSignature(r *rdl.Resource) string {
 			continue
 		}
 		k := v.Name
+		required := "true"
+		if v.Optional {
+			required = "false"
+		}
+		escapedComment := strings.Replace(v.Comment ,`"`, `\"`, -1)
 		pdecl := ""
+		pdecl += "@Parameter(description = \"" + escapedComment + "\", required = " + required + ") "
 		if v.QueryParam != "" {
-			pdecl = fmt.Sprintf("@QueryParam(%q) ", v.QueryParam) + defaultValueAnnotation(v.Default)
+			pdecl += fmt.Sprintf("@QueryParam(%q) ", v.QueryParam) + defaultValueAnnotation(v.Default)
 		} else if v.PathParam {
-			pdecl = fmt.Sprintf("@PathParam(%q) ", k)
+			pdecl += fmt.Sprintf("@PathParam(%q) ", k)
 		} else if v.Header != "" {
-			pdecl = fmt.Sprintf("@HeaderParam(%q) ", v.Header)
+			pdecl += fmt.Sprintf("@HeaderParam(%q) ", v.Header)
 		}
 		ptype := javaType(reg, v.Type, true, "", "")
 		params = append(params, pdecl+ptype+" "+javaName(k))
@@ -557,9 +572,10 @@ func (gen *javaServerGenerator) handlerSignature(r *rdl.Resource) string {
 	default:
 		spec += "@Produces(MediaType.APPLICATION_JSON)\n    "
 	}
-
+	escapedComment := strings.Replace(r.Comment ,`"`, `\"`, -1)
+	spec += "@Operation(description = \"" + escapedComment + "\")\n    "
 	methName, _ := javaMethodName(reg, r)
-	return spec + "public " + returnType + " " + methName + "(" + strings.Join(params, ", ") + ")"
+	return spec + "public " + returnType + " " + methName + "(\n        " + strings.Join(params, ",\n        ") + ")"
 }
 
 func defaultValueAnnotation(val interface{}) string {
@@ -586,7 +602,7 @@ func defaultValueAnnotation(val interface{}) string {
 	return ""
 }
 
-func (gen *javaServerGenerator) handlerReturnType(r *rdl.Resource, methName string, returnType string) string {
+func (gen *javaServerGenerator) handlerReturnType(r *rdl.Resource, returnType string) string {
 	if len(r.Outputs) > 0 {
 		return "void"
 	}
@@ -626,12 +642,11 @@ func javaMethodName(reg rdl.TypeRegistry, r *rdl.Resource) (string, []string) {
 			bodyType = string(safeTypeVarName(v.Type))
 		}
 		//rest_core always uses the boxed type
-		optional := true
-		params = append(params, javaType(reg, v.Type, optional, "", "")+" "+javaName(k))
+		params = append(params, javaType(reg, v.Type, true, "", "")+" "+javaName(k))
 	}
 	meth := string(r.Name)
 	if meth == "" {
-		meth = strings.ToLower(string(r.Method)) + string(bodyType)
+		meth = strings.ToLower(r.Method) + bodyType
 	} else {
 		meth = uncapitalize(meth)
 	}
@@ -649,7 +664,7 @@ func javaName(name rdl.Identifier) string {
 
 func sortedExceptionKeys(excs map[string]*rdl.ExceptionDef) []string {
 	var keys []string
-	for ecode, _ := range excs {
+	for ecode := range excs {
 		keys = append(keys, ecode)
 	}
 	sort.Strings(keys)

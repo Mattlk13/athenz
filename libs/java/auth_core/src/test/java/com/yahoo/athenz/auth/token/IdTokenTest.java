@@ -32,7 +32,7 @@ import static org.testng.Assert.assertEquals;
 
 public class IdTokenTest {
 
-    private final File ecPrivateKey = new File("./src/test/resources/ec_private.key");
+    private final File ecPrivateKey = new File("./src/test/resources/unit_test_ec_private.key");
     private final File ecPublicKey = new File("./src/test/resources/ec_public.key");
 
     IdToken createIdToken(long now) {
@@ -78,7 +78,7 @@ public class IdTokenTest {
         // now verify our signed token
 
         PublicKey publicKey = Crypto.loadPublicKey(ecPublicKey);
-        Jws<Claims> claims = Jwts.parser().setSigningKey(publicKey).parseClaimsJws(idJws);
+        Jws<Claims> claims = Jwts.parserBuilder().setSigningKey(publicKey).build().parseClaimsJws(idJws);
         assertNotNull(claims);
 
         assertEquals("subject", claims.getBody().getSubject());

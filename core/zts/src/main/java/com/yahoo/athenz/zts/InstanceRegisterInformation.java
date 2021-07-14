@@ -3,12 +3,15 @@
 //
 
 package com.yahoo.athenz.zts;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import java.util.List;
 import com.yahoo.rdl.*;
 
 //
 // InstanceRegisterInformation -
 //
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class InstanceRegisterInformation {
     public String provider;
     public String domain;
@@ -27,6 +30,9 @@ public class InstanceRegisterInformation {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public String hostname;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public List<String> hostCnames;
 
     public InstanceRegisterInformation setProvider(String provider) {
         this.provider = provider;
@@ -91,6 +97,13 @@ public class InstanceRegisterInformation {
     public String getHostname() {
         return hostname;
     }
+    public InstanceRegisterInformation setHostCnames(List<String> hostCnames) {
+        this.hostCnames = hostCnames;
+        return this;
+    }
+    public List<String> getHostCnames() {
+        return hostCnames;
+    }
 
     @Override
     public boolean equals(Object another) {
@@ -124,6 +137,9 @@ public class InstanceRegisterInformation {
                 return false;
             }
             if (hostname == null ? a.hostname != null : !hostname.equals(a.hostname)) {
+                return false;
+            }
+            if (hostCnames == null ? a.hostCnames != null : !hostCnames.equals(a.hostCnames)) {
                 return false;
             }
         }

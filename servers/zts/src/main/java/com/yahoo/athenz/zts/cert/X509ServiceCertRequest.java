@@ -19,24 +19,25 @@ import java.util.List;
 import java.util.Set;
 import com.yahoo.athenz.auth.util.CryptoException;
 import com.yahoo.athenz.common.server.dns.HostnameResolver;
+import com.yahoo.athenz.zts.cache.DataCache;
 
 public class X509ServiceCertRequest extends X509CertRequest {
+
+    private static final String SPIFFE_SERVICE_AGENT = "sa";
 
     public X509ServiceCertRequest(String csr) throws CryptoException {
         super(csr);
     }
 
-    public boolean validate(final String domainName, final String serviceName,
-            final Set<String> validSubjectOValues, final List<String> providerDnsSuffixList,
-            final String serviceDnsSuffix, final String instanceHostname,
+    public boolean validate(final String domainName, final String serviceName, final String provider,
+            final Set<String> validSubjectOValues, final DataCache athenzSysDomainCache,
+            final String serviceDnsSuffix, final String instanceHostname, final List<String> instanceHostCnames,
             HostnameResolver hostnameResolver, StringBuilder errorMsg) {
 
-        // parse the cert request (csr) to extract the DNS entries
-        // along with IP addresses. Validate that all hostnames
-        // include the same dns suffix and the instance id required
-        // hostname is specified
+        // instanceId must be non empty
 
-        if (!parseCertRequest(errorMsg)) {
+        if (instanceId == null || instanceId.isEmpty()) {
+            errorMsg.append("InstanceId cannot be empty");
             return false;
         }
 
@@ -49,11 +50,19 @@ public class X509ServiceCertRequest extends X509CertRequest {
             return false;
         }
 
+        // ensure the uri Hostname is same as instance Hostname that gets further verified later
+
+        if (!validateUriHostname(instanceHostname)) {
+            errorMsg.append("Instance/Uri hostname mismatch: ").append(instanceHostname)
+                .append(" vs. ").append(uriHostname);
+            return false;
+        }
+
         // validate that the dnsSuffix used in the dnsName attribute has
         // been authorized to be used by the given provider
 
-        if (!validateDnsNames(domainName, serviceName, providerDnsSuffixList, serviceDnsSuffix,
-                instanceHostname, hostnameResolver)) {
+        if (!validateDnsNames(domainName, serviceName, provider, athenzSysDomainCache, serviceDnsSuffix,
+                instanceHostname, instanceHostCnames, hostnameResolver)) {
             errorMsg.append("Unable to validate CSR SAN dnsNames - invalid dns suffix");
             return false;
         }
@@ -67,7 +76,7 @@ public class X509ServiceCertRequest extends X509CertRequest {
 
         // validate spiffe uri if one is provided
 
-        if (!validateSpiffeURI(domainName, "sa", serviceName)) {
+        if (!validateSpiffeURI(domainName, SPIFFE_SERVICE_AGENT, serviceName)) {
             errorMsg.append("Unable to validate Service SPIFFE URI");
             return false;
         }

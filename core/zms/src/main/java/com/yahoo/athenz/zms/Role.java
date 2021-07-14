@@ -3,13 +3,16 @@
 //
 
 package com.yahoo.athenz.zms;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import java.util.List;
+import java.util.Map;
 import com.yahoo.rdl.*;
 
 //
 // Role - The representation for a Role with set of members.
 //
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class Role {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
@@ -20,6 +23,42 @@ public class Role {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public Integer tokenExpiryMins;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer certExpiryMins;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String signAlgorithm;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer serviceExpiryDays;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer memberReviewDays;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer serviceReviewDays;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Boolean reviewEnabled;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String notifyRoles;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String userAuthorityFilter;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String userAuthorityExpiration;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer groupExpiryDays;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer groupReviewDays;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Map<String, TagValueList> tags;
     public String name;
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
@@ -39,6 +78,9 @@ public class Role {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public Boolean auditEnabled;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Timestamp lastReviewedDate;
 
     public Role setSelfServe(Boolean selfServe) {
         this.selfServe = selfServe;
@@ -60,6 +102,90 @@ public class Role {
     }
     public Integer getTokenExpiryMins() {
         return tokenExpiryMins;
+    }
+    public Role setCertExpiryMins(Integer certExpiryMins) {
+        this.certExpiryMins = certExpiryMins;
+        return this;
+    }
+    public Integer getCertExpiryMins() {
+        return certExpiryMins;
+    }
+    public Role setSignAlgorithm(String signAlgorithm) {
+        this.signAlgorithm = signAlgorithm;
+        return this;
+    }
+    public String getSignAlgorithm() {
+        return signAlgorithm;
+    }
+    public Role setServiceExpiryDays(Integer serviceExpiryDays) {
+        this.serviceExpiryDays = serviceExpiryDays;
+        return this;
+    }
+    public Integer getServiceExpiryDays() {
+        return serviceExpiryDays;
+    }
+    public Role setMemberReviewDays(Integer memberReviewDays) {
+        this.memberReviewDays = memberReviewDays;
+        return this;
+    }
+    public Integer getMemberReviewDays() {
+        return memberReviewDays;
+    }
+    public Role setServiceReviewDays(Integer serviceReviewDays) {
+        this.serviceReviewDays = serviceReviewDays;
+        return this;
+    }
+    public Integer getServiceReviewDays() {
+        return serviceReviewDays;
+    }
+    public Role setReviewEnabled(Boolean reviewEnabled) {
+        this.reviewEnabled = reviewEnabled;
+        return this;
+    }
+    public Boolean getReviewEnabled() {
+        return reviewEnabled;
+    }
+    public Role setNotifyRoles(String notifyRoles) {
+        this.notifyRoles = notifyRoles;
+        return this;
+    }
+    public String getNotifyRoles() {
+        return notifyRoles;
+    }
+    public Role setUserAuthorityFilter(String userAuthorityFilter) {
+        this.userAuthorityFilter = userAuthorityFilter;
+        return this;
+    }
+    public String getUserAuthorityFilter() {
+        return userAuthorityFilter;
+    }
+    public Role setUserAuthorityExpiration(String userAuthorityExpiration) {
+        this.userAuthorityExpiration = userAuthorityExpiration;
+        return this;
+    }
+    public String getUserAuthorityExpiration() {
+        return userAuthorityExpiration;
+    }
+    public Role setGroupExpiryDays(Integer groupExpiryDays) {
+        this.groupExpiryDays = groupExpiryDays;
+        return this;
+    }
+    public Integer getGroupExpiryDays() {
+        return groupExpiryDays;
+    }
+    public Role setGroupReviewDays(Integer groupReviewDays) {
+        this.groupReviewDays = groupReviewDays;
+        return this;
+    }
+    public Integer getGroupReviewDays() {
+        return groupReviewDays;
+    }
+    public Role setTags(Map<String, TagValueList> tags) {
+        this.tags = tags;
+        return this;
+    }
+    public Map<String, TagValueList> getTags() {
+        return tags;
     }
     public Role setName(String name) {
         this.name = name;
@@ -110,6 +236,13 @@ public class Role {
     public Boolean getAuditEnabled() {
         return auditEnabled;
     }
+    public Role setLastReviewedDate(Timestamp lastReviewedDate) {
+        this.lastReviewedDate = lastReviewedDate;
+        return this;
+    }
+    public Timestamp getLastReviewedDate() {
+        return lastReviewedDate;
+    }
 
     @Override
     public boolean equals(Object another) {
@@ -125,6 +258,42 @@ public class Role {
                 return false;
             }
             if (tokenExpiryMins == null ? a.tokenExpiryMins != null : !tokenExpiryMins.equals(a.tokenExpiryMins)) {
+                return false;
+            }
+            if (certExpiryMins == null ? a.certExpiryMins != null : !certExpiryMins.equals(a.certExpiryMins)) {
+                return false;
+            }
+            if (signAlgorithm == null ? a.signAlgorithm != null : !signAlgorithm.equals(a.signAlgorithm)) {
+                return false;
+            }
+            if (serviceExpiryDays == null ? a.serviceExpiryDays != null : !serviceExpiryDays.equals(a.serviceExpiryDays)) {
+                return false;
+            }
+            if (memberReviewDays == null ? a.memberReviewDays != null : !memberReviewDays.equals(a.memberReviewDays)) {
+                return false;
+            }
+            if (serviceReviewDays == null ? a.serviceReviewDays != null : !serviceReviewDays.equals(a.serviceReviewDays)) {
+                return false;
+            }
+            if (reviewEnabled == null ? a.reviewEnabled != null : !reviewEnabled.equals(a.reviewEnabled)) {
+                return false;
+            }
+            if (notifyRoles == null ? a.notifyRoles != null : !notifyRoles.equals(a.notifyRoles)) {
+                return false;
+            }
+            if (userAuthorityFilter == null ? a.userAuthorityFilter != null : !userAuthorityFilter.equals(a.userAuthorityFilter)) {
+                return false;
+            }
+            if (userAuthorityExpiration == null ? a.userAuthorityExpiration != null : !userAuthorityExpiration.equals(a.userAuthorityExpiration)) {
+                return false;
+            }
+            if (groupExpiryDays == null ? a.groupExpiryDays != null : !groupExpiryDays.equals(a.groupExpiryDays)) {
+                return false;
+            }
+            if (groupReviewDays == null ? a.groupReviewDays != null : !groupReviewDays.equals(a.groupReviewDays)) {
+                return false;
+            }
+            if (tags == null ? a.tags != null : !tags.equals(a.tags)) {
                 return false;
             }
             if (name == null ? a.name != null : !name.equals(a.name)) {
@@ -146,6 +315,9 @@ public class Role {
                 return false;
             }
             if (auditEnabled == null ? a.auditEnabled != null : !auditEnabled.equals(a.auditEnabled)) {
+                return false;
+            }
+            if (lastReviewedDate == null ? a.lastReviewedDate != null : !lastReviewedDate.equals(a.lastReviewedDate)) {
                 return false;
             }
         }

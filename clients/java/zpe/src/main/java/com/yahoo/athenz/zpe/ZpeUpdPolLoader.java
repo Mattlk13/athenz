@@ -21,9 +21,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 
 import com.yahoo.athenz.auth.token.AccessToken;
 import org.slf4j.Logger;
@@ -49,14 +47,17 @@ import com.yahoo.athenz.zts.SignedPolicyData;
 public class ZpeUpdPolLoader implements Closeable {
 
     private static final Logger LOG = LoggerFactory.getLogger(ZpeUpdPolLoader.class);
-     
+
+    static boolean skipPolicyDirCheck;
     static long sleepTimeMillis = -1;
     static long cleanupTokenInterval = 600000; // 600 secs = 10 minutes
     static long lastRoleTokenCleanup = System.currentTimeMillis();
     static long lastAccessTokenCleanup = System.currentTimeMillis();
 
     static {
-        
+
+        skipPolicyDirCheck = Boolean.parseBoolean(System.getProperty(ZpeConsts.ZPE_PROP_SKIP_POLICY_DIR_CHECK, "false"));
+
         String timeoutSecs = System.getProperty(ZpeConsts.ZPE_PROP_MON_TIMEOUT);
         if (timeoutSecs == null) {
             // default to 5 minutes
@@ -88,12 +89,10 @@ public class ZpeUpdPolLoader implements Closeable {
     }
 
     // create thread or event handler to monitor changes to ZpePolFiles
-    // see JavaYnetDbWrapper for scheduled thread way to monitor
     // find the java7 api for monitoring files
     // see http://docs.oracle.com/javase/tutorial/essential/io/notification.html
-    private ScheduledThreadPoolExecutor scheduledExecutorSvc = new ScheduledThreadPoolExecutor(
-            1, new ZpeThreadFactory("ZpeUpdPolLoader"));
 
+    private final ScheduledExecutorService scheduledExecutorSvc = Executors.newScheduledThreadPool(1);
     private ZpeUpdMonitor updMonWorker;
 
     // key is the domain name, value is a map keyed by role name with list of assertions
@@ -116,19 +115,18 @@ public class ZpeUpdPolLoader implements Closeable {
 
     // array of file status objects
     static class ZpeFileStatus {
-        String fname;
         String domain;
         long modifyTimeMillis;
         boolean validPolFile;
         
-        ZpeFileStatus(String fname, long modTimeMillis) {
+        ZpeFileStatus(long modTimeMillis) {
             domain = null;
             modifyTimeMillis = modTimeMillis;
             validPolFile = false;
         }
     }
 
-    private Map<String, ZpeFileStatus> fileStatusRef = new ConcurrentHashMap<>();
+    private final Map<String, ZpeFileStatus> fileStatusRef = new ConcurrentHashMap<>();
     private String polDirName;
 
     ZpeUpdPolLoader(String dirName) {
@@ -138,7 +136,7 @@ public class ZpeUpdPolLoader implements Closeable {
             try {
                 loadDb();
             } catch (Exception exc) {
-                LOG.error("loadDb Failed, exc: {}", exc);
+                LOG.error("loadDb Failed", exc);
             }
         }
     }
@@ -191,8 +189,7 @@ public class ZpeUpdPolLoader implements Closeable {
         if (updMonWorker == null) {
             updMonWorker = new ZpeUpdMonitor(this);
         }
-        scheduledExecutorSvc.scheduleAtFixedRate(updMonWorker, 0,
-                sleepTimeMillis, TimeUnit.MILLISECONDS);
+        scheduledExecutorSvc.scheduleAtFixedRate(updMonWorker, 0, sleepTimeMillis, TimeUnit.MILLISECONDS);
     }
 
     @Override
@@ -228,9 +225,15 @@ public class ZpeUpdPolLoader implements Closeable {
     }
 
     void loadDb() {
+
         if (updMonWorker == null) {
             updMonWorker = new ZpeUpdMonitor(this);
         }
+
+        if (skipPolicyDirCheck) {
+            return;
+        }
+
         File[] polFileNames = updMonWorker.loadFileStatus();
         loadDb(polFileNames);
     }
@@ -298,7 +301,7 @@ public class ZpeUpdPolLoader implements Closeable {
             
                 }
             } else {
-                fstat = new ZpeFileStatus(fileName, lastModMilliSeconds);
+                fstat = new ZpeFileStatus(lastModMilliSeconds);
                 fsmap.put(fileName, fstat);
             }
             loadFile(polFile);
@@ -418,7 +421,7 @@ public class ZpeUpdPolLoader implements Closeable {
         for (Policy policy : policies) {
             String pname = policy.getName();
             if (LOG.isDebugEnabled()) {
-                LOG.debug("loadFile: domain([}) policy({})", domainName, pname);
+                LOG.debug("loadFile: domain({}) policy({})", domainName, pname);
             }
             List<Assertion> assertions = policy.getAssertions();
             if (assertions == null) {
@@ -427,12 +430,14 @@ public class ZpeUpdPolLoader implements Closeable {
             for (Assertion assertion : assertions) {
                 com.yahoo.rdl.Struct strAssert = new Struct();
                 strAssert.put(ZpeConsts.ZPE_FIELD_POLICY_NAME, pname);
-                
-                String passertAction = assertion.getAction();
+
+                // Is is possible for action and resource to retain case. Need to lower them both.
+                String passertAction = assertion.getAction().toLowerCase();
+
                 ZpeMatch matchStruct = getMatchObject(passertAction);
                 strAssert.put(ZpeConsts.ZPE_ACTION_MATCH_STRUCT, matchStruct);
                 
-                String passertResource = assertion.getResource();
+                String passertResource = assertion.getResource().toLowerCase();
                 String rsrc = AuthZpeClient.stripDomainPrefix(passertResource, domainName, passertResource);
                 strAssert.put(ZpeConsts.ZPE_FIELD_RESOURCE, rsrc);
                 matchStruct = getMatchObject(rsrc);

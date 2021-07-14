@@ -5,14 +5,18 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/ardielle/ardielle-go/rdl"
+	"gopkg.in/yaml.v2"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"syscall"
 	"time"
@@ -20,8 +24,8 @@ import (
 	"golang.org/x/crypto/ssh/terminal"
 	"golang.org/x/net/proxy"
 
-	"github.com/yahoo/athenz/clients/go/zms"
-	"github.com/yahoo/athenz/libs/go/zmscli"
+	"github.com/AthenZ/athenz/clients/go/zms"
+	"github.com/AthenZ/athenz/libs/go/zmscli"
 )
 
 var (
@@ -102,7 +106,7 @@ func getAuthNToken(identity, authorizedServices, zmsUrl string, tr *http.Transpo
 	}
 
 	fmt.Fprintf(os.Stderr, "Enter password for "+user+": ")
-	pass, err := terminal.ReadPassword(syscall.Stdin)
+	pass, err := terminal.ReadPassword(int(syscall.Stdin))
 	if err != nil {
 		return "", err
 	}
@@ -149,6 +153,7 @@ func usage() string {
 	buf.WriteString("                       (default=" + defaultIdentity() + ")\n")
 	buf.WriteString("   -k                  Disable peer verification of SSL certificates.\n")
 	buf.WriteString("   -key x509_key       Athenz X.509 Key file for authentication\n")
+	buf.WriteString("   -o output_format    Output format - json or yaml (default=yaml)\n")
 	buf.WriteString("   -s host:port        The SOCKS5 proxy to route requests through\n")
 	buf.WriteString("   -v                  Verbose mode. Full resource names are included in output (default=false)\n")
 	buf.WriteString("   -x                  For user token output, exclude the header name (default=false)\n")
@@ -169,6 +174,14 @@ func loadNtokenFromFile(fileName string) (string, error) {
 	return strings.TrimSpace(string(buf)), nil
 }
 
+func printVersion() {
+	if VERSION == "" {
+		fmt.Println("zms-cli (development version)")
+	} else {
+		fmt.Println("zms-cli " + VERSION + " " + BUILD_DATE)
+	}
+}
+
 func main() {
 	pZMS := flag.String("z", defaultZmsURL(), "Base URL of the ZMS server to use")
 	pIdentity := flag.String("i", defaultIdentity(), "the identity to authenticate as")
@@ -183,11 +196,14 @@ func main() {
 	pHomeDomain := flag.String("h", "home", "Home domain name as configured in Athenz systems")
 	pSocks := flag.String("s", defaultSocksProxy(), "The SOCKS5 proxy to route requests through, i.e. 127.0.0.1:1080")
 	pSkipVerify := flag.Bool("k", false, "Disable peer verification of SSL certificates")
+	pOutputFormat := flag.String("o", "manualYaml", "Output format - json or yaml")
 	pDebug := flag.Bool("debug", defaultDebug(), "debug mode (for authentication, mainly)")
 	pAuditRef := flag.String("a", "", "Audit Reference Token if auditing is enabled for the domain")
 	pExcludeHeader := flag.Bool("x", false, "Exclude header in user-token output")
 	pX509KeyFile := flag.String("key", "", "x.509 private key file for authentication")
 	pX509CertFile := flag.String("cert", "", "x.509 certificate key file for authentication")
+	pShowVersion := flag.Bool("version", false, "Show version")
+
 	flag.Usage = func() {
 		fmt.Println(usage())
 	}
@@ -196,6 +212,11 @@ func main() {
 	// on the flags we defined above
 
 	flag.Parse()
+
+	if *pShowVersion {
+		printVersion()
+		return
+	}
 
 	if *pZMS == "" {
 		fmt.Println("No ZMS Url specified")
@@ -231,11 +252,7 @@ func main() {
 		}
 		return
 	} else if args[0] == "version" {
-		if VERSION == "" {
-			fmt.Println("zms-cli (development version)")
-		} else {
-			fmt.Println("zms-cli " + VERSION + " " + BUILD_DATE)
-		}
+		printVersion()
 		return
 	}
 
@@ -252,6 +269,7 @@ func main() {
 		ProductIdSupport: *pProductIDSupport,
 		Debug:            *pDebug,
 		AddSelf:          *pAddSelf,
+		OutputFormat:     *pOutputFormat,
 	}
 
 	if *pX509KeyFile != "" && *pX509CertFile != "" {
@@ -306,15 +324,39 @@ func main() {
 		}
 	}
 
-	if len(args) > 0 && args[0] == "repl" {
-		cli.Interactive = true
-		cli.Repl()
-		return
-	}
-
 	msg, err := cli.EvalCommand(args)
 	if err != nil {
-		fmt.Println("***", err)
+		if reflect.ValueOf(err).Kind() != reflect.Struct {
+			err = rdl.ResourceError{
+				Code:    400,
+				Message: err.Error(),
+			}
+		}
+		switch cli.OutputFormat {
+			case zmscli.JSONOutputFormat:
+				jsonOutput, errJson := json.MarshalIndent(err, "", "    ")
+				if errJson != nil {
+					fmt.Println("failed to produce JSON output: ", errJson)
+				}
+				output := string(jsonOutput)
+				fmt.Println(output)
+			case zmscli.YAMLOutputFormat:
+				yamlOutput, errYaml := yaml.Marshal(err)
+				if errYaml != nil {
+					fmt.Println("failed to produce YAML output: ", errYaml)
+				}
+				output := string(yamlOutput)
+				fmt.Println(output)
+			case zmscli.DefaultOutputFormat:
+				yamlOutput, errYaml := yaml.Marshal(err)
+				if errYaml != nil {
+					fmt.Println("failed to produce YAML output: ", errYaml)
+				}
+				output := string(yamlOutput)
+				fmt.Println(output)
+			default:
+				fmt.Println("***", err)
+		}
 		os.Exit(1)
 	} else if msg != nil {
 		fmt.Println(*msg)

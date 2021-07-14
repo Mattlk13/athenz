@@ -17,35 +17,47 @@ package com.yahoo.athenz.zms;
 
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
+import com.yahoo.athenz.auth.AuthorityConsts;
 import com.yahoo.athenz.auth.Principal;
+import com.yahoo.athenz.auth.impl.SimplePrincipal;
+import com.yahoo.athenz.auth.util.AthenzUtils;
+import com.yahoo.athenz.auth.util.StringUtils;
 import com.yahoo.athenz.common.server.audit.AuditReferenceValidator;
+import com.yahoo.athenz.common.server.db.RolesProvider;
 import com.yahoo.athenz.common.server.log.AuditLogMsgBuilder;
 import com.yahoo.athenz.common.server.log.AuditLogger;
-import com.yahoo.athenz.common.server.util.StringUtils;
+import com.yahoo.athenz.common.server.util.AuthzHelper;
+import com.yahoo.athenz.common.server.util.ResourceUtils;
+import com.yahoo.athenz.zms.config.MemberDueDays;
 import com.yahoo.athenz.zms.store.AthenzDomain;
 import com.yahoo.athenz.zms.store.ObjectStore;
 import com.yahoo.athenz.zms.store.ObjectStoreConnection;
 import com.yahoo.athenz.zms.utils.ZMSUtils;
 import com.yahoo.rdl.JSON;
 import com.yahoo.rdl.Timestamp;
-import com.yahoo.rdl.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 
-public class DBService {
-    
+public class DBService implements RolesProvider {
+
     ObjectStore store;
     BitSet auditRefSet;
-    final String userDomain;
     AuditLogger auditLogger;
     Cache<String, DataCache> cacheStore;
     QuotaChecker quotaCheck;
     int retrySleepTime;
     int defaultRetryCount;
     int defaultOpTimeout;
-    
+    ZMSConfig zmsConfig;
+
     private static final Logger LOG = LoggerFactory.getLogger(DBService.class);
 
     public static int AUDIT_TYPE_ROLE     = 0;
@@ -55,38 +67,45 @@ public class DBService {
     public static int AUDIT_TYPE_ENTITY   = 4;
     public static int AUDIT_TYPE_TENANCY  = 5;
     public static int AUDIT_TYPE_TEMPLATE = 6;
+    public static int AUDIT_TYPE_GROUP    = 7;
 
     private static final String ROLE_PREFIX = "role.";
     private static final String POLICY_PREFIX = "policy.";
     private static final String TEMPLATE_DOMAIN_NAME = "_domain_";
+    private static final String AUDIT_REF = "Athenz User Authority Enforcer";
+
     AuditReferenceValidator auditReferenceValidator;
-    
-    public DBService(ObjectStore store, AuditLogger auditLogger, String userDomain, AuditReferenceValidator auditReferenceValidator) {
-        
+    private ScheduledExecutorService userAuthorityFilterExecutor;
+
+    public DBService(ObjectStore store, AuditLogger auditLogger, ZMSConfig zmsConfig, AuditReferenceValidator auditReferenceValidator) {
+
         this.store = store;
-        this.userDomain = userDomain;
+        this.zmsConfig = zmsConfig;
         this.auditLogger = auditLogger;
         cacheStore = CacheBuilder.newBuilder().concurrencyLevel(25).build();
 
         // default timeout in seconds for object store commands
-        
+
         defaultOpTimeout = Integer.parseInt(System.getProperty(ZMSConsts.ZMS_PROP_STORE_OP_TIMEOUT, "60"));
         if (defaultOpTimeout < 0) {
             defaultOpTimeout = 60;
         }
+        int roleTagsLimit = Integer.getInteger(ZMSConsts.ZMS_PROP_QUOTA_ROLE_TAG, ZMSConsts.ZMS_DEFAULT_TAG_LIMIT);
+        int domainTagsLimit = Integer.getInteger(ZMSConsts.ZMS_PROP_QUOTA_DOMAIN_TAG, ZMSConsts.ZMS_DEFAULT_TAG_LIMIT);
         if (this.store != null) {
             this.store.setOperationTimeout(defaultOpTimeout);
+            this.store.setTagLimit(domainTagsLimit, roleTagsLimit);
         }
 
         // retrieve the concurrent update retry count. If we're given an invalid negative
         // value for count, we'll default back to our default configured value of 120 retries
         // which would result up to 30 seconds sleeping 250ms each time
-        
+
         defaultRetryCount = Integer.parseInt(System.getProperty(ZMSConsts.ZMS_PROP_CONFLICT_RETRY_COUNT, "120"));
         if (defaultRetryCount < 0) {
             defaultRetryCount = 120;
         }
-        
+
         retrySleepTime = Integer.parseInt(System.getProperty(ZMSConsts.ZMS_PROP_CONFLICT_RETRY_SLEEP_TIME, "250"));
         if (retrySleepTime < 0) {
             retrySleepTime = 250;
@@ -98,28 +117,34 @@ public class DBService {
         this.auditReferenceValidator = auditReferenceValidator;
 
         // create our quota checker class
-        
+
         quotaCheck = new QuotaChecker();
+
+        // start our thread to process user authority changes daily
+
+        userAuthorityFilterExecutor = Executors.newScheduledThreadPool(1);
+        userAuthorityFilterExecutor.scheduleAtFixedRate(
+                new UserAuthorityFilterEnforcer(), 0, 1, TimeUnit.DAYS);
     }
 
     void setAuditRefObjectBits() {
 
         auditRefSet = new BitSet();
 
-        // by default we're only going to handle audit enabled roles
+        // by default we're only going to handle audit enabled roles and groups
         // the value is a comma separated list of supported objects:
-        // role, policy, service, domain, entity
+        // role, group, policy, service, domain, entity, tenancy, and template
 
-        final String auditCheck = System.getProperty(ZMSConsts.ZMS_PROP_AUDIT_REF_CHECK_OBJECTS);
-        if (auditCheck == null) {
-            return;
-        }
+        final String auditCheck = System.getProperty(ZMSConsts.ZMS_PROP_AUDIT_REF_CHECK_OBJECTS, "role,group");
 
         String[] objects = auditCheck.split(",");
         for (String object : objects) {
             switch (object) {
                 case ZMSConsts.ZMS_AUDIT_TYPE_ROLE:
                     auditRefSet.set(AUDIT_TYPE_ROLE);
+                    break;
+                case ZMSConsts.ZMS_AUDIT_TYPE_GROUP:
+                    auditRefSet.set(AUDIT_TYPE_GROUP);
                     break;
                 case ZMSConsts.ZMS_AUDIT_TYPE_POLICY:
                     auditRefSet.set(AUDIT_TYPE_POLICY);
@@ -143,26 +168,51 @@ public class DBService {
         }
     }
 
+    public DomainRoleMembers listOverdueReviewRoleMembers(String domainName) {
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            return con.listOverdueReviewRoleMembers(domainName);
+        }
+    }
+
+    @Override
+    public List<Role> getRolesByDomain(String domain) {
+        AthenzDomain athenzDomain = getAthenzDomain(domain, false);
+        return athenzDomain.getRoles();
+    }
+
+    public DomainList lookupDomainByTag(String tagKey, String tagValue) {
+        DomainList domList = new DomainList();
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            domList.setNames(con.lookupDomainByTags(tagKey, tagValue));
+        }
+        return domList;
+    }
+
     static class DataCache {
         AthenzDomain athenzDomain;
         long modTime;
-        
+
         DataCache(AthenzDomain athenzDomain, long modTime) {
             this.athenzDomain = athenzDomain;
             this.modTime = modTime;
         }
-        
+
         AthenzDomain getAthenzDomain() {
             return athenzDomain;
         }
-        
+
         long getModTime() {
             return modTime;
         }
     }
-    
-    AthenzDomain getAthenzDomainFromCache(String domainName, boolean masterCopy) {
-        
+
+    AthenzDomain getAthenzDomainFromCache(ObjectStoreConnection con, String domainName) {
+
+        DataCache data = cacheStore.getIfPresent(domainName);
+        if (data == null) {
+            return null;
+        }
+
         // if we have a match for a given domain name then we're going
         // to check if the last modified domain timestamp matches to what's
         // in the db: So if there is no match, then we'll take the hit
@@ -170,47 +220,31 @@ public class DBService {
         // changed that often so we'll satisfy the request with just
         // verifying the last modification time as oppose to reading the
         // full domain data from db
-        
-        DataCache data = cacheStore.getIfPresent(domainName);
-        if (data == null) {
-            return null;
-        }
-        
+
         long modTime = 0;
-        try (ObjectStoreConnection con = store.getConnection(true, masterCopy)) {
-            
-            // we expect this response to come back immediately from
-            // object store so we're going to use a smaller timeout
-            // so we should know right away to use our cache
-            
-            con.setOperationTimeout(10);
+
+        try {
             modTime = con.getDomainModTimestamp(domainName);
-            
-        } catch (ResourceException ex) {
-            
+        } catch (ResourceException ignored) {
             // if the exception is due to timeout or we were not able
             // to get a connection to the object store then we're
             // going to use our cache as is instead of rejecting
             // the operation
-            
-            if (ex.getCode() == ResourceException.SERVICE_UNAVAILABLE) {
-                return data.getAthenzDomain();
-            }
         }
-        
+
         // if our cache data is same or newer than db then return
         // data from the cache (it could be newer if we just updated
         // the cache based on write db but during read, the server
         // hasn't replicated the data yet)
-        
+
         if (data.getModTime() >= modTime) {
             return data.getAthenzDomain();
         }
-        
+
         cacheStore.invalidate(domainName);
         return null;
     }
-    
+
     String getPrincipalName(ResourceContext ctx) {
         if (ctx == null) {
             return null;
@@ -221,19 +255,19 @@ public class DBService {
         }
         return principal.getFullName();
     }
-    
+
     void saveChanges(ObjectStoreConnection con, String domainName) {
-        
+
         // we're first going to commit our changes which will
         // also set the connection in auto-commit mode. we are
         // going to change the domain timestamp in auto-commit
         // mode so that we don't have a contention
-        
+
         con.commitChanges();
         con.updateDomainModTimestamp(domainName);
         cacheStore.invalidate(domainName);
     }
-    
+
     void auditLogRequest(ResourceContext ctx, String domainName, String auditRef,
             String caller, String operation, String entityName, String auditDetails) {
         auditLogger.log(getAuditLogMsgBuilder(ctx, domainName, auditRef, caller, operation, entityName, auditDetails));
@@ -257,23 +291,15 @@ public class DBService {
         return msgBldr;
     }
 
-    Domain makeDomain(ResourceContext ctx, String domainName, String description, String org,
-            Boolean auditEnabled, List<String> adminUsers, String account, int productId, String applicationId,
-            Integer expiryDays, List<String> solutionTemplates, String auditRef) {
-        
+    Domain makeDomain(ResourceContext ctx, Domain domain, List<String> adminUsers,
+            List<String> solutionTemplates, String auditRef) {
+
         final String caller = "makedomain";
-        
-        Domain domain = new Domain()
-                .setName(domainName)
-                .setAuditEnabled(auditEnabled)
-                .setDescription(description)
-                .setOrg(org)
-                .setId(UUID.fromCurrentTime())
-                .setAccount(account)
-                .setYpmId(productId)
-                .setModified(Timestamp.fromCurrentTime())
-                .setApplicationId(applicationId)
-                .setMemberExpiryDays(expiryDays);
+        final String domainName = domain.getName();
+        String principalName = getPrincipalName(ctx);
+        if (principalName == null) {
+            principalName = "system-account";
+        }
 
         // our exception handling code does the check for retry count
         // and throws the exception it had received when the retry
@@ -291,6 +317,8 @@ public class DBService {
                 quotaCheck.checkSubdomainQuota(con, domainName, caller);
 
                 boolean objectsInserted = con.insertDomain(domain);
+                objectsInserted &= processDomainTags(con, domain.getTags(), null, domainName, false);
+
                 if (!objectsInserted) {
                     con.rollbackChanges();
                     throw ZMSUtils.requestError("makeDomain: Cannot create domain: " +
@@ -306,7 +334,7 @@ public class DBService {
                 Role adminRole = ZMSUtils.makeAdminRole(domainName, adminUsers);
                 auditDetails.append(", \"role\": ");
                 if (!processRole(con, null, domainName, ZMSConsts.ADMIN_ROLE_NAME, adminRole,
-                        getPrincipalName(ctx), auditRef, false, auditDetails)) {
+                        principalName, auditRef, false, auditDetails)) {
                     con.rollbackChanges();
                     throw ZMSUtils.internalServerError("makeDomain: Cannot process role: '" +
                             adminRole.getName(), caller);
@@ -329,7 +357,7 @@ public class DBService {
                 if (solutionTemplates != null) {
                     for (String templateName : solutionTemplates) {
                         auditDetails.append(", \"template\": ");
-                        if (!addSolutionTemplate(con, domainName, templateName, getPrincipalName(ctx),
+                        if (!addSolutionTemplate(con, domainName, templateName, principalName,
                                 null, auditRef, auditDetails)) {
                             con.rollbackChanges();
                             throw ZMSUtils.internalServerError("makeDomain: Cannot apply templates: '" +
@@ -357,37 +385,37 @@ public class DBService {
             }
         }
     }
-    
+
     boolean processPolicy(ObjectStoreConnection con, Policy originalPolicy, String domainName,
             String policyName, Policy policy, boolean ignoreDeletes, StringBuilder auditDetails) {
 
         // check to see if we need to insert the policy or update it
-        
+
         boolean requestSuccess;
         if (originalPolicy == null) {
             requestSuccess = con.insertPolicy(domainName, policy);
         } else {
             requestSuccess = con.updatePolicy(domainName, policy);
         }
-        
+
         // if we didn't update any policies then we need to return failure
-        
+
         if (!requestSuccess) {
             return false;
         }
-        
+
         // open our audit record
-        
+
         auditDetails.append("{\"name\": \"").append(policyName).append('\"');
 
         // now we need process our policy assertions depending this is
         // a new insert operation or an update
-        
+
         List<Assertion> newAssertions = policy.getAssertions();
         if (originalPolicy == null) {
-            
+
             // we're just going to process our new assertions
-            
+
             if (newAssertions != null) {
                 for (Assertion assertion : newAssertions) {
                     if (!con.insertAssertion(domainName, policyName, assertion)) {
@@ -396,11 +424,11 @@ public class DBService {
                 }
                 auditLogAssertions(auditDetails, "added-assertions", newAssertions);
             }
-            
+
         } else {
-            
+
             // first we need to retrieve the current set of assertions
-            
+
             List<Assertion> curAssertions = originalPolicy.getAssertions();
             if (curAssertions == null) {
                 curAssertions = new ArrayList<>();
@@ -408,7 +436,7 @@ public class DBService {
             List<Assertion> addAssertions = new ArrayList<>();
             List<Assertion> delAssertions = new ArrayList<>();
             policyAssertionChanges(newAssertions, curAssertions, addAssertions, delAssertions);
-            
+
             if (!ignoreDeletes) {
                 for (Assertion assertion : delAssertions) {
                     if (!con.deleteAssertion(domainName, policyName, assertion.getId())) {
@@ -417,7 +445,7 @@ public class DBService {
                 }
                 auditLogAssertions(auditDetails, "deleted-assertions", delAssertions);
             }
-            
+
             for (Assertion assertion : addAssertions) {
                 if (!con.insertAssertion(domainName, policyName, assertion)) {
                     return false;
@@ -425,23 +453,23 @@ public class DBService {
             }
             auditLogAssertions(auditDetails, "added-assertions", addAssertions);
         }
-        
+
         auditDetails.append('}');
         return true;
     }
-    
+
     boolean removeMatchedAssertion(Assertion assertion, List<Assertion> assertions, List<Assertion> matchedAssertions) {
-        
+
         AssertionEffect effect = AssertionEffect.ALLOW;
         if (assertion.getEffect() != null) {
             effect = assertion.getEffect();
         }
-        
+
         Iterator<Assertion> itr = assertions.iterator();
         while (itr.hasNext()) {
-            
+
             Assertion checkAssertion = itr.next();
-            
+
             if (!assertion.getAction().equals(checkAssertion.getAction())) {
                 continue;
             }
@@ -451,30 +479,30 @@ public class DBService {
             if (!assertion.getRole().equals(checkAssertion.getRole())) {
                 continue;
             }
-            
+
             AssertionEffect checkEffect = AssertionEffect.ALLOW;
             if (checkAssertion.getEffect() != null) {
                 checkEffect = checkAssertion.getEffect();
             }
-            
+
             if (effect != checkEffect) {
                 continue;
             }
-            
+
             itr.remove();
             matchedAssertions.add(checkAssertion);
             return true;
         }
-        
+
         return false;
     }
-    
+
     void policyAssertionChanges(List<Assertion> newAssertions, List<Assertion> curAssertions,
             List<Assertion> addAssertions, List<Assertion> delAssertions) {
-        
+
         // let's iterate through the new list and the ones that are
         // not in the current list should be added to the add list
-        
+
         List<Assertion> matchedAssertions = new ArrayList<>();
         if (newAssertions != null) {
             for (Assertion assertion : newAssertions) {
@@ -483,26 +511,26 @@ public class DBService {
                 }
             }
         }
-        
+
         // now our current list has been updated as well and
         // all the assertions that were present moved to the
         // matched assertion list so whatever left in the
         // current list must be deleted
-        
+
         delAssertions.addAll(curAssertions);
-        
+
         // now let's go back and re-add the matched assertions
         // back to our list so we can get the right audit data
-        
+
         curAssertions.addAll(matchedAssertions);
     }
-    
+
     boolean processRole(ObjectStoreConnection con, Role originalRole, String domainName,
             String roleName, Role role, String admin, String auditRef, boolean ignoreDeletes,
             StringBuilder auditDetails) {
-        
+
         // check to see if we need to insert the role or update it
-        
+
         boolean requestSuccess;
         if (originalRole == null) {
             // auditEnabled can only be set with system admin privileges
@@ -513,38 +541,28 @@ public class DBService {
             role.setAuditEnabled(originalRole.getAuditEnabled());
             requestSuccess = con.updateRole(domainName, role);
         }
-        
+
         // if we didn't update any roles then we need to return failure
-        
+
         if (!requestSuccess) {
             return false;
         }
 
         // open our audit record and log our trust field if one is available
-        
+
         auditDetails.append("{\"name\": \"").append(roleName)
             .append("\", \"trust\": \"").append(role.getTrust()).append('\"');
-        
+
         // now we need process our role members depending this is
         // a new insert operation or an update
 
         List<RoleMember> roleMembers = role.getRoleMembers();
-        
-        // support older clients which might send members field
-        // at this point, we expect either roleMembers or members,
-        // and we can't have both
-        
-        List<String> members = role.getMembers();
-        if (members != null && !members.isEmpty()) {
-            roleMembers = ZMSUtils.convertMembersToRoleMembers(members);
-        }
-        
         if (originalRole == null) {
-            
+
             // we are just going to process all members as new inserts
-            
+
             if (roleMembers != null) {
-                
+
                 for (RoleMember member : roleMembers) {
                     if (!con.insertRoleMember(domainName, roleName, member, admin, auditRef)) {
                         return false;
@@ -553,34 +571,181 @@ public class DBService {
                 auditLogRoleMembers(auditDetails, "added-members", roleMembers);
             }
         } else {
-            processUpdateRoleMembers(con, originalRole, roleMembers, ignoreDeletes,
-                    domainName, roleName, admin, auditRef, auditDetails);
+            if (!processUpdateRoleMembers(con, originalRole, roleMembers, ignoreDeletes,
+                    domainName, roleName, admin, auditRef, auditDetails)) {
+                return false;
+            }
         }
-        
+
+        if (!processRoleTags(role, roleName, domainName, originalRole, con)) {
+            return false;
+        }
+
         auditDetails.append('}');
         return true;
     }
-    
+
+    private boolean processRoleTags(Role role, String roleName, String domainName,
+                                    Role originalRole, ObjectStoreConnection con) {
+        if (role.getTags() != null && !role.getTags().isEmpty()) {
+            if (originalRole == null) {
+                return con.insertRoleTags(roleName, domainName, role.getTags());
+            } else {
+                return processUpdateRoleTags(role, originalRole, con, roleName, domainName);
+            }
+        }
+        return true;
+    }
+
+    private boolean processUpdateRoleTags(Role role, Role originalRole, ObjectStoreConnection con, String roleName, String domainName) {
+        if (originalRole.getTags() == null || originalRole.getTags().isEmpty()) {
+            if (role.getTags() == null || role.getTags().isEmpty()) {
+                // no tags to process..
+                return true;
+            }
+            return con.insertRoleTags(roleName, domainName, role.getTags());
+        }
+        Map<String, TagValueList> originalRoleTags = originalRole.getTags();
+        Map<String, TagValueList> currentTags = role.getTags();
+
+        Set<String> tagsToRemove = originalRoleTags.entrySet().stream()
+                .filter(curTag -> currentTags.get(curTag.getKey()) == null
+                        || !currentTags.get(curTag.getKey()).equals(curTag.getValue()))
+                .map(Map.Entry::getKey)
+                .collect(Collectors.toSet());
+
+        Map<String, TagValueList> tagsToAdd = currentTags.entrySet().stream()
+                .filter(curTag -> originalRoleTags.get(curTag.getKey()) == null
+                        || !originalRoleTags.get(curTag.getKey()).equals(curTag.getValue()))
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+        boolean res = con.deleteRoleTags(roleName, domainName, tagsToRemove);
+
+        return res && con.insertRoleTags(roleName, domainName, tagsToAdd);
+    }
+
+    boolean processGroup(ObjectStoreConnection con, Group originalGroup, final String domainName,
+                        final String groupName, Group group, final String admin, final String auditRef,
+                        StringBuilder auditDetails) {
+
+        // check to see if we need to insert the group or update it
+
+        boolean requestSuccess;
+        if (originalGroup == null) {
+            // auditEnabled can only be set with system admin privileges
+            group.setAuditEnabled(false);
+            requestSuccess = con.insertGroup(domainName, group);
+        } else {
+            // carrying over auditEnabled from original group
+            group.setAuditEnabled(originalGroup.getAuditEnabled());
+            requestSuccess = con.updateGroup(domainName, group);
+        }
+
+        // if we didn't update any groups then we need to return failure
+
+        if (!requestSuccess) {
+            return false;
+        }
+
+        // open our audit record and log our trust field if one is available
+
+        auditDetails.append("{\"name\": \"").append(groupName).append('\"');
+
+        // now we need process our groups members depending this is
+        // a new insert operation or an update
+
+        List<GroupMember> groupMembers = group.getGroupMembers();
+
+        if (originalGroup == null) {
+
+            // we are just going to process all members as new inserts
+
+            for (GroupMember member : groupMembers) {
+                if (!con.insertGroupMember(domainName, groupName, member, admin, auditRef)) {
+                    return false;
+                }
+            }
+            auditLogGroupMembers(auditDetails, "added-members", groupMembers);
+
+        } else {
+
+            if (!processUpdateGroupMembers(con, originalGroup, groupMembers, domainName, groupName,
+                    admin, auditRef, auditDetails)) {
+                return false;
+            }
+        }
+
+        auditDetails.append('}');
+        return true;
+    }
+
+    void mergeOriginalRoleAndMetaRoleAttributes(Role originalRole, Role templateRole) {
+        //Only if the template rolemeta value is null, update with original role value
+        //else use the rolemeta value from template
+        if (templateRole.getSelfServe() == null) {
+            templateRole.setSelfServe(originalRole.getSelfServe());
+        }
+        if (templateRole.getMemberExpiryDays() == null) {
+            templateRole.setMemberExpiryDays(originalRole.getMemberExpiryDays());
+        }
+        if (templateRole.getServiceExpiryDays() == null) {
+            templateRole.setServiceExpiryDays(originalRole.getServiceExpiryDays());
+        }
+        if (templateRole.getGroupExpiryDays() == null) {
+            templateRole.setGroupExpiryDays(originalRole.getGroupExpiryDays());
+        }
+        if (templateRole.getGroupReviewDays() == null) {
+            templateRole.setGroupReviewDays(originalRole.getGroupReviewDays());
+        }
+        if (templateRole.getTokenExpiryMins() == null) {
+            templateRole.setTokenExpiryMins(originalRole.getTokenExpiryMins());
+        }
+        if (templateRole.getCertExpiryMins() == null) {
+            templateRole.setCertExpiryMins(originalRole.getCertExpiryMins());
+        }
+        if (templateRole.getSignAlgorithm() == null) {
+            templateRole.setSignAlgorithm(originalRole.getSignAlgorithm());
+        }
+        if (templateRole.getReviewEnabled() == null) {
+            templateRole.setReviewEnabled(originalRole.getReviewEnabled());
+        }
+        if (templateRole.getNotifyRoles() == null) {
+            templateRole.setNotifyRoles(originalRole.getNotifyRoles());
+        }
+        if (templateRole.getMemberReviewDays() == null) {
+            templateRole.setMemberReviewDays(originalRole.getMemberReviewDays());
+        }
+        if (templateRole.getServiceReviewDays() == null) {
+            templateRole.setServiceReviewDays(originalRole.getServiceReviewDays());
+        }
+        if (templateRole.getUserAuthorityFilter() == null) {
+            templateRole.setUserAuthorityFilter(originalRole.getUserAuthorityFilter());
+        }
+        if (templateRole.getUserAuthorityExpiration() == null) {
+            templateRole.setUserAuthorityExpiration(originalRole.getUserAuthorityExpiration());
+        }
+    }
+
     private boolean processUpdateRoleMembers(ObjectStoreConnection con, Role originalRole,
             List<RoleMember> roleMembers, boolean ignoreDeletes, String domainName,
             String roleName, String admin, String auditRef, StringBuilder auditDetails) {
 
         // first we need to retrieve the current set of members
-        
+
         List<RoleMember> originalMembers = originalRole.getRoleMembers();
         List<RoleMember> curMembers = (null == originalMembers) ? new ArrayList<>() : new ArrayList<>(originalMembers);
         List<RoleMember> delMembers = new ArrayList<>(curMembers);
         ArrayList<RoleMember> newMembers = (null == roleMembers) ? new ArrayList<>() : new ArrayList<>(roleMembers);
-        
+
         // remove current members from new members
-        
-        ZMSUtils.removeMembers(newMembers, curMembers);
-        
+
+        AuthzHelper.removeRoleMembers(newMembers, curMembers);
+
         // remove new members from current members
         // which leaves the deleted members.
-        
-        ZMSUtils.removeMembers(delMembers, roleMembers);
-        
+
+        AuthzHelper.removeRoleMembers(delMembers, roleMembers);
+
         if (!ignoreDeletes) {
             for (RoleMember member : delMembers) {
                 if (!con.deleteRoleMember(domainName, roleName, member.getMemberName(), admin, auditRef)) {
@@ -589,7 +754,7 @@ public class DBService {
             }
             auditLogRoleMembers(auditDetails, "deleted-members", delMembers);
         }
-        
+
         for (RoleMember member : newMembers) {
             if (!con.insertRoleMember(domainName, roleName, member, admin, auditRef)) {
                 return false;
@@ -598,43 +763,83 @@ public class DBService {
         auditLogRoleMembers(auditDetails, "added-members", newMembers);
         return true;
     }
-    
+
+    private boolean processUpdateGroupMembers(ObjectStoreConnection con, Group originalGroup,
+                                              List<GroupMember> groupMembers, final String domainName,
+                                              final String groupName, final String admin, final String auditRef,
+                                              StringBuilder auditDetails) {
+
+        // first we need to retrieve the current set of members
+
+        List<GroupMember> originalMembers = originalGroup.getGroupMembers();
+        List<GroupMember> curMembers = new ArrayList<>(originalMembers);
+        List<GroupMember> delMembers = new ArrayList<>(curMembers);
+        ArrayList<GroupMember> newMembers = new ArrayList<>(groupMembers);
+
+        // remove current members from new members
+
+        AuthzHelper.removeGroupMembers(newMembers, curMembers);
+
+        // remove new members from current members
+        // which leaves the deleted members.
+
+        AuthzHelper.removeGroupMembers(delMembers, groupMembers);
+
+        for (GroupMember member : delMembers) {
+            if (!con.deleteGroupMember(domainName, groupName, member.getMemberName(), admin, auditRef)) {
+                return false;
+            }
+        }
+        auditLogGroupMembers(auditDetails, "deleted-members", delMembers);
+
+        for (GroupMember member : newMembers) {
+            if (!con.insertGroupMember(domainName, groupName, member, admin, auditRef)) {
+                return false;
+            }
+        }
+        auditLogGroupMembers(auditDetails, "added-members", newMembers);
+        return true;
+    }
+
     boolean processServiceIdentity(ObjectStoreConnection con, ServiceIdentity originalService,
             String domainName, String serviceName, ServiceIdentity service,
             boolean ignoreDeletes, StringBuilder auditDetails) {
-        
+
         boolean requestSuccess;
         if (originalService == null) {
+            // provider endpoint can only be set with system admin privileges
+            service.setProviderEndpoint(null);
             requestSuccess = con.insertServiceIdentity(domainName, service);
         } else {
+            // carrying over provider endpoint from original service
+            service.setProviderEndpoint(originalService.getProviderEndpoint());
             requestSuccess = con.updateServiceIdentity(domainName, service);
         }
-        
+
         // if we didn't update any services then we need to return failure
-        
+
         if (!requestSuccess) {
             return false;
         }
 
         // open our audit record and log our service details
-        
+
         auditDetails.append("{\"name\": \"").append(serviceName).append('\"')
             .append(", \"executable\": \"").append(service.getExecutable()).append('\"')
             .append(", \"user\": \"").append(service.getUser()).append('\"')
             .append(", \"group\": \"").append(service.getGroup()).append('\"')
-            .append(", \"providerEndpoint\": \"").append(service.getProviderEndpoint()).append('\"')
             .append(", \"description\": \"").append(service.getDescription()).append('\"');
-         
+
         // now we need process our public keys depending this is
         // a new insert operation or an update
 
         List<PublicKeyEntry> publicKeys = service.getPublicKeys();
         if (originalService == null) {
-            
+
             // we are just going to process all public keys as new inserts
-            
+
             if (publicKeys != null) {
-                
+
                 for (PublicKeyEntry publicKey : publicKeys) {
                     if (!con.insertPublicKeyEntry(domainName, serviceName, publicKey)) {
                         return false;
@@ -642,11 +847,11 @@ public class DBService {
                 }
                 auditLogPublicKeyEntries(auditDetails, "added-publickeys", publicKeys);
             }
-            
+
         } else {
-            
+
             // first we need to retrieve the current set of public keys
-            
+
             List<PublicKeyEntry> curPublicKeys = originalService.getPublicKeys();
             Map<String, PublicKeyEntry> curPublicKeysMap = new HashMap<>();
             if (curPublicKeys != null) {
@@ -674,7 +879,7 @@ public class DBService {
                 }
                 auditLogPublicKeyEntries(auditDetails, "deleted-publickeys", delPublicKeysSet);
             }
-            
+
             for (String publicKey : newPublicKeysSet) {
                 if (!con.insertPublicKeyEntry(domainName, serviceName, publicKeysMap.get(publicKey))) {
                     return false;
@@ -682,9 +887,9 @@ public class DBService {
             }
             auditLogPublicKeyEntries(auditDetails, "added-publickeys", newPublicKeysSet, publicKeysMap);
         }
-        
+
         // now we need to process the hosts defined for this service
-        
+
         Set<String> curHosts;
         if (originalService != null && originalService.getHosts() != null) {
             curHosts = new HashSet<>(originalService.getHosts());
@@ -698,11 +903,11 @@ public class DBService {
         } else {
             newHosts = new HashSet<>();
         }
-        
+
         Set<String> delHosts = new HashSet<>(curHosts);
         delHosts.removeAll(newHosts);
         newHosts.removeAll(curHosts);
-        
+
         for (String host : delHosts) {
             if (!con.deleteServiceHost(domainName, serviceName, host)) {
                 return false;
@@ -722,26 +927,26 @@ public class DBService {
     }
 
     boolean shouldRetryOperation(ResourceException ex, int retryCount) {
-        
+
         // before doing anything else let's check to see if
         // we still have the option to retry the operation
-        
+
         if (retryCount <= 1) {
             return false;
         }
-        
+
         // if we got a conflict result it means we either had
         // no connection or deadlock was detected and as such
         // the changes were aborted
-        
+
         boolean retry = false;
         switch (ex.getCode()) {
-            
+
             case ResourceException.CONFLICT:
-                
+
                 retry = true;
                 break;
-                
+
             case ResourceException.GONE:
 
                 // this error indicates that the server is reporting it is in
@@ -749,30 +954,30 @@ public class DBService {
                 // and we need to clear all connections and start new ones
                 // this could only happen with write operations against the
                 // read-write object store
-                
+
                 store.clearConnections();
                 retry = true;
                 break;
         }
-        
+
         // if we're asked to retry then we're going to
         // wait for a short period of time to allow the other
         // connection to finish its work
-        
+
         if (retry) {
-            
+
             if (LOG.isDebugEnabled()) {
-                LOG.debug(": possible deadlock, retries available: " + retryCount);
+                LOG.debug(": possible deadlock, retries available: {}", retryCount);
             }
 
             ZMSUtils.threadSleep(retrySleepTime);
         }
-        
+
         // return our response
-        
+
         return retry;
     }
-    
+
     void executePutPolicy(ResourceContext ctx, String domainName, String policyName, Policy policy,
             String auditRef, String caller) {
 
@@ -822,7 +1027,7 @@ public class DBService {
             }
         }
     }
-    
+
     void executePutRole(ResourceContext ctx, String domainName, String roleName, Role role,
             String auditRef, String caller) {
 
@@ -835,6 +1040,7 @@ public class DBService {
             try (ObjectStoreConnection con = store.getConnection(false, true)) {
 
                 String principal = getPrincipalName(ctx);
+
                 // first verify that auditing requirements are met
 
                 checkDomainAuditEnabled(con, domainName, auditRef, caller, principal, AUDIT_TYPE_ROLE);
@@ -847,8 +1053,9 @@ public class DBService {
 
                 Role originalRole = getRole(con, domainName, roleName, false, false, false);
 
-                if (originalRole != null && originalRole.getAuditEnabled() == Boolean.TRUE) {
-                    throw ZMSUtils.requestError("Can not update the auditEnabled role", caller);
+                if (originalRole != null &&
+                        (originalRole.getAuditEnabled() == Boolean.TRUE || originalRole.getReviewEnabled() == Boolean.TRUE)) {
+                    throw ZMSUtils.requestError("Can not update auditEnabled and/or reviewEnabled roles", caller);
                 }
 
                 // now process the request
@@ -868,6 +1075,63 @@ public class DBService {
 
                 auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
                         roleName, auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    void executePutGroup(ResourceContext ctx, final String domainName, final String groupName, Group group, final String auditRef) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                String principal = getPrincipalName(ctx);
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, ctx.getApiName(), principal, AUDIT_TYPE_GROUP);
+
+                // check that quota is not exceeded
+
+                quotaCheck.checkGroupQuota(con, domainName, group, ctx.getApiName());
+
+                // retrieve our original group
+
+                Group originalGroup = getGroup(con, domainName, groupName, false, false);
+
+                if (originalGroup != null &&
+                        (originalGroup.getAuditEnabled() == Boolean.TRUE || originalGroup.getReviewEnabled() == Boolean.TRUE)) {
+                    throw ZMSUtils.requestError("Can not update auditEnabled and/or reviewEnabled groups", ctx.getApiName());
+                }
+
+                // now process the request
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                if (!processGroup(con, originalGroup, domainName, groupName, group,
+                        principal, auditRef, auditDetails)) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.internalServerError("unable to put group: " + group.getName(), ctx.getApiName());
+                }
+
+                // update our domain time-stamp and save changes
+
+                saveChanges(con, domainName);
+
+                // audit log the request
+
+                auditLogRequest(ctx, domainName, auditRef, ctx.getApiName(), ZMSConsts.HTTP_PUT,
+                        groupName, auditDetails.toString());
 
                 return;
 
@@ -929,7 +1193,7 @@ public class DBService {
             }
         }
     }
-    
+
     void executePutPublicKeyEntry(ResourceContext ctx, String domainName, String serviceName,
             PublicKeyEntry keyEntry, String auditRef, String caller) {
 
@@ -973,7 +1237,7 @@ public class DBService {
                 if (!requestSuccess) {
                     con.rollbackChanges();
                     throw ZMSUtils.internalServerError("unable to put public key: " + keyEntry.getId() +
-                            " in service " + ZMSUtils.serviceResourceName(domainName, serviceName), caller);
+                            " in service " + ResourceUtils.serviceResourceName(domainName, serviceName), caller);
                 }
 
                 // update our service and domain time-stamp and save changes
@@ -986,10 +1250,8 @@ public class DBService {
                 auditLogPublicKeyEntry(auditDetails, keyEntry, true);
                 auditDetails.append("]}");
 
-                if (null != ctx) {
-                    auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
-                            serviceName, auditDetails.toString());
-                }
+                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
+                        serviceName, auditDetails.toString());
 
                 return;
 
@@ -1000,7 +1262,7 @@ public class DBService {
             }
         }
     }
-    
+
     void executeDeletePublicKeyEntry(ResourceContext ctx, String domainName, String serviceName,
             String keyId, String auditRef, String caller) {
 
@@ -1021,7 +1283,7 @@ public class DBService {
                 if (!con.deletePublicKeyEntry(domainName, serviceName, keyId)) {
                     con.rollbackChanges();
                     throw ZMSUtils.notFoundError("unable to delete public key: " + keyId +
-                            " in service " + ZMSUtils.serviceResourceName(domainName, serviceName), caller);
+                            " in service " + ResourceUtils.serviceResourceName(domainName, serviceName), caller);
                 }
 
                 // update our service and domain time-stamp and save changes
@@ -1031,13 +1293,8 @@ public class DBService {
 
                 // audit log the request
 
-                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
-                auditDetails.append("{\"deleted-publicKeys\": [{\"id\": \"").append(keyId).append("\"}]}");
-
-                if (null != ctx) {
-                    auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_DELETE,
-                            serviceName, auditDetails.toString());
-                }
+                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_DELETE,
+                        serviceName, "{\"deleted-publicKeys\": [{\"id\": \"" + keyId + "\"}]}");
 
                 return;
 
@@ -1048,16 +1305,16 @@ public class DBService {
             }
         }
     }
-    
+
     boolean isTrustRole(Role role) {
-        
+
         if (role == null) {
             return false;
         }
 
         return role.getTrust() != null && !role.getTrust().isEmpty();
     }
-    
+
     void executePutMembership(ResourceContext ctx, String domainName, String roleName,
             RoleMember roleMember, String auditRef, String caller) {
 
@@ -1075,7 +1332,7 @@ public class DBService {
 
                 checkDomainAuditEnabled(con, domainName, auditRef, caller, principal, AUDIT_TYPE_ROLE);
 
-                // make sure the role auditing requires are bet
+                // make sure the role auditing requirements are met
 
                 Role originalRole = con.getRole(domainName, roleName);
                 if (originalRole == null) {
@@ -1083,7 +1340,8 @@ public class DBService {
                     throw ZMSUtils.notFoundError(caller + ": Unknown role: " + roleName, caller);
                 }
 
-                checkRoleAuditEnabled(con, originalRole, auditRef, caller, principal);
+                checkObjectAuditEnabled(con, originalRole.getAuditEnabled(), originalRole.getName(),
+                        auditRef, caller, principal);
 
                 // before inserting a member we need to verify that
                 // this is a group role and not a delegated one.
@@ -1116,8 +1374,10 @@ public class DBService {
 
                 // audit log the request
 
-                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
-                        roleName, "{\"member\": \"" + roleMember.getMemberName() + "\"}");
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditLogRoleMember(auditDetails, roleMember, true);
+                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT, roleName,
+                        auditDetails.toString());
 
                 return;
 
@@ -1131,7 +1391,69 @@ public class DBService {
             }
         }
     }
-    
+
+    void executePutGroupMembership(ResourceContext ctx, final String domainName, Group group,
+                                   GroupMember groupMember, final String auditRef) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+                String principal = getPrincipalName(ctx);
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, ctx.getApiName(), principal, AUDIT_TYPE_GROUP);
+
+                // make sure the group auditing requirements are met
+
+                checkObjectAuditEnabled(con, group.getAuditEnabled(), group.getName(),
+                        auditRef, ctx.getApiName(), principal);
+
+                // now we need verify our quota check
+
+                final String groupName = ZMSUtils.extractGroupName(domainName, group.getName());
+                quotaCheck.checkGroupMembershipQuota(con, domainName, groupName, ctx.getApiName());
+
+                // process our insert group member support. since this is a "single"
+                // operation, we are not using any transactions.
+
+                if (!con.insertGroupMember(domainName, groupName, groupMember, principal, auditRef)) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.requestError("unable to insert group member: " +
+                            groupMember.getMemberName() + " to group: " + groupName, ctx.getApiName());
+                }
+
+                // update our group and domain time-stamps, and invalidate local cache entry
+
+                con.updateGroupModTimestamp(domainName, groupName);
+                con.updateDomainModTimestamp(domainName);
+                cacheStore.invalidate(domainName);
+
+                // audit log the request
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditLogGroupMember(auditDetails, groupMember, true);
+                auditLogRequest(ctx, domainName, auditRef, ctx.getApiName(), ZMSConsts.HTTP_PUT, groupName,
+                        auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+
+                // otherwise check if we need to retry or return failure
+
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
     void executePutEntity(ResourceContext ctx, String domainName, String entityName,
             Entity entity, String auditRef, String caller) {
 
@@ -1177,7 +1499,7 @@ public class DBService {
                 // audit log the request
 
                 auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
-                        entity.getName(), JSON.string(entity.getValue()));
+                        entityName, JSON.string(entity.getValue()));
 
                 return;
 
@@ -1188,7 +1510,7 @@ public class DBService {
             }
         }
     }
-    
+
     void executeDeleteMembership(ResourceContext ctx, String domainName, String roleName,
             String normalizedMember, String auditRef, String caller) {
 
@@ -1200,28 +1522,15 @@ public class DBService {
 
             try (ObjectStoreConnection con = store.getConnection(true, true)) {
 
-                String principal = getPrincipalName(ctx);
+                final String principal = getPrincipalName(ctx);
 
                 // first verify that auditing requirements are met
 
                 checkDomainAuditEnabled(con, domainName, auditRef, caller, principal, AUDIT_TYPE_ROLE);
 
-                // if this is the admin role then we need to make sure
-                // the admin is not himself who happens to be the last
-                // member in the role
-
-                if (ZMSConsts.ADMIN_ROLE_NAME.equals(roleName)) {
-                    List<RoleMember> members = con.listRoleMembers(domainName, roleName, false);
-                    if (members.size() == 1 && members.get(0).getMemberName().equals(normalizedMember)) {
-                        throw ZMSUtils.forbiddenError(caller +
-                                ": Cannot delete last member of 'admin' role", caller);
-                    }
-                }
-
                 // process our delete role member operation
 
-                if (!con.deleteRoleMember(domainName, roleName, normalizedMember,
-                        principal, auditRef)) {
+                if (!con.deleteRoleMember(domainName, roleName, normalizedMember, principal, auditRef)) {
                     con.rollbackChanges();
                     throw ZMSUtils.notFoundError(caller + ": unable to delete role member: " +
                             normalizedMember + " from role: " + roleName, caller);
@@ -1247,7 +1556,146 @@ public class DBService {
             }
         }
     }
-    
+
+    void executeDeletePendingMembership(ResourceContext ctx, String domainName, String roleName,
+                String normalizedMember, String auditRef, String caller) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+                String principal = getPrincipalName(ctx);
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, caller, principal, AUDIT_TYPE_ROLE);
+
+                // process our delete role member operation
+
+                if (!con.deletePendingRoleMember(domainName, roleName, normalizedMember,
+                        principal, auditRef)) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.notFoundError(caller + ": unable to delete pending role member: " +
+                            normalizedMember + " from role: " + roleName, caller);
+                }
+
+                // update our role and domain time-stamps, and invalidate local cache entry
+
+                con.updateRoleModTimestamp(domainName, roleName);
+                con.updateDomainModTimestamp(domainName);
+                cacheStore.invalidate(domainName);
+
+                // audit log the request
+
+                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_DELETE,
+                        roleName, "{\"pending-member\": \"" + normalizedMember + "\"}");
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    void executeDeleteGroupMembership(ResourceContext ctx, final String domainName, final String groupName,
+                                      final String normalizedMember, final String auditRef) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+                String principal = getPrincipalName(ctx);
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, ctx.getApiName(), principal, AUDIT_TYPE_GROUP);
+
+                // process our delete group member operation
+
+                if (!con.deleteGroupMember(domainName, groupName, normalizedMember, principal, auditRef)) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.notFoundError("unable to delete group member: " +
+                            normalizedMember + " from group: " + groupName, ctx.getApiName());
+                }
+
+                // update our group and domain time-stamps, and invalidate local cache entry
+
+                con.updateGroupModTimestamp(domainName, groupName);
+                con.updateDomainModTimestamp(domainName);
+                cacheStore.invalidate(domainName);
+
+                // audit log the request
+
+                auditLogRequest(ctx, domainName, auditRef, ctx.getApiName(), ZMSConsts.HTTP_DELETE,
+                        groupName, "{\"member\": \"" + normalizedMember + "\"}");
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    void executeDeletePendingGroupMembership(ResourceContext ctx, final String domainName, final String groupName,
+                                             final String normalizedMember, final String auditRef) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+                String principal = getPrincipalName(ctx);
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, ctx.getApiName(), principal, AUDIT_TYPE_GROUP);
+
+                // process our delete pending group member operation
+
+                if (!con.deletePendingGroupMember(domainName, groupName, normalizedMember, principal, auditRef)) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.notFoundError("unable to delete pending group member: " +
+                            normalizedMember + " from group: " + groupName, ctx.getApiName());
+                }
+
+                // update our group and domain time-stamps, and invalidate local cache entry
+
+                con.updateGroupModTimestamp(domainName, groupName);
+                con.updateDomainModTimestamp(domainName);
+                cacheStore.invalidate(domainName);
+
+                // audit log the request
+
+                auditLogRequest(ctx, domainName, auditRef, ctx.getApiName(), ZMSConsts.HTTP_DELETE,
+                        groupName, "{\"pending-member\": \"" + normalizedMember + "\"}");
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
     void executeDeleteServiceIdentity(ResourceContext ctx, String domainName, String serviceName,
             String auditRef, String caller) {
 
@@ -1329,7 +1777,7 @@ public class DBService {
             }
         }
     }
-    
+
     void executeDeleteRole(ResourceContext ctx, String domainName, String roleName,
             String auditRef, String caller) {
 
@@ -1370,7 +1818,47 @@ public class DBService {
             }
         }
     }
-    
+
+    void executeDeleteGroup(ResourceContext ctx, final String domainName, final String groupName, final String auditRef) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, ctx.getApiName(), getPrincipalName(ctx), AUDIT_TYPE_GROUP);
+
+                // process our delete group request
+
+                if (!con.deleteGroup(domainName, groupName)) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.notFoundError("unable to delete group: " + groupName, ctx.getApiName());
+                }
+
+                // update our domain time-stamp and save changes
+
+                saveChanges(con, domainName);
+
+                // audit log the request
+
+                auditLogRequest(ctx, domainName, auditRef, ctx.getApiName(), ZMSConsts.HTTP_DELETE,
+                        groupName, null);
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
     void executeDeletePolicy(ResourceContext ctx, String domainName, String policyName,
             String auditRef, String caller) {
 
@@ -1386,6 +1874,17 @@ public class DBService {
 
                 checkDomainAuditEnabled(con, domainName, auditRef, caller, getPrincipalName(ctx), AUDIT_TYPE_POLICY);
 
+                // extract the current policy for audit log purposes
+
+                Policy policy = getPolicy(con, domainName, policyName);
+                if (policy == null) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.notFoundError(caller + ": unable to read policy: " + policyName, caller);
+                }
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditLogPolicy(auditDetails, policy, "deleted-assertions");
+
                 // process our delete policy request
 
                 if (!con.deletePolicy(domainName, policyName)) {
@@ -1400,7 +1899,7 @@ public class DBService {
                 // audit log the request
 
                 auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_DELETE,
-                        policyName, null);
+                        policyName, auditDetails.toString());
 
                 return;
 
@@ -1411,7 +1910,7 @@ public class DBService {
             }
         }
     }
-    
+
     /**
      * If the domain has audit enabled, and user did not provide the auditRef,
      * an exception will be thrown
@@ -1449,7 +1948,7 @@ public class DBService {
     void auditReferenceCheck(ObjectStoreConnection con, Domain domain, final String auditRef,
             final String caller, final String principal) {
 
-        if (domain.getAuditEnabled()) {
+        if (domain.getAuditEnabled() == Boolean.TRUE) {
             if (auditRef == null || auditRef.length() == 0) {
                 con.rollbackChanges();
                 throw ZMSUtils.requestError(caller + ": Audit reference required for domain: " + domain.getName(), caller);
@@ -1496,22 +1995,22 @@ public class DBService {
             }
         }
     }
-    
+
     List<String> listPrincipals(String domainName, boolean domainOnly) {
-        
+
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
-            
+
             List<String> principals = con.listPrincipals(domainName);
-            
+
             // if no further filtering is necessary, return the data
             // right away
-            
+
             if (!domainOnly) {
                 return principals;
             }
-            
+
             // generate our return list
-            
+
             List<String> users = new ArrayList<>();
 
             // if we're asked for domain only then we need to match
@@ -1519,34 +2018,34 @@ public class DBService {
             // only includes a single period/domain separator
             // we need to skip an extra byte to accommodate for the
             // domain separator (e.g. <domainName>.<userName>)
-            
+
             int prefixLength = 0;
             if (domainName != null) {
                 prefixLength = domainName.length() + 1;
             }
-                
+
             for (String principal : principals) {
-                    
+
                 // make sure the principal name doesn't have multiple
                 // components - e.g. user.joe.test since it represents
                 // a service or a sub-domain and we're only interested
                 // in actual users
-                
+
                 if (prefixLength > 0) {
-                    if (principal.substring(prefixLength).indexOf('.') == -1) {
+                    if (principal.indexOf('.', prefixLength) == -1) {
                         users.add(principal);
                     }
                 } else {
-                    
+
                     // we have a single separator when the first index
                     // and the last index are the same
-                    
+
                     if (principal.indexOf('.') == principal.lastIndexOf('.')) {
                         users.add(principal);
                     }
                 }
             }
-            
+
             return users;
         }
     }
@@ -1599,19 +2098,19 @@ public class DBService {
 
     void removePrincipalFromAllRoles(ObjectStoreConnection con, String principalName,
             String adminUser, String auditRef) {
-        
+
         // extract all the roles that this principal is member of
         // we have to this here so that there are records of
         // entries in the role member audit logs and the domain
         // entries are properly invalidated
-        
+
         List<PrincipalRole> roles;
         try {
             roles = con.listPrincipalRoles(null, principalName);
         } catch (ResourceException ex) {
-            
+
             // if there is no such principal then we have nothing to do
-            
+
             if (ex.getCode() == ResourceException.NOT_FOUND) {
                 return;
             } else {
@@ -1620,12 +2119,12 @@ public class DBService {
         }
 
         for (PrincipalRole role : roles) {
-            
+
             final String domainName = role.getDomainName();
             final String roleName = role.getRoleName();
-            
+
             // process our delete role member operation
-            
+
             if (LOG.isDebugEnabled()) {
                 LOG.debug("removePrincipalFromAllRoles: removing member {} from {}:role.{}",
                         principalName, domainName, roleName);
@@ -1634,7 +2133,7 @@ public class DBService {
             // we are going to ignore all errors here rather than
             // rejecting the full operation. our delete user will
             // eventually remove all these principals
-            
+
             try {
                 con.deleteRoleMember(domainName, roleName, principalName, adminUser, auditRef);
             } catch (ResourceException ex) {
@@ -1643,25 +2142,25 @@ public class DBService {
             }
 
             // update our role and domain time-stamps, and invalidate local cache entry
-            
+
             con.updateRoleModTimestamp(domainName, roleName);
             con.updateDomainModTimestamp(domainName);
         }
     }
-    
+
     void removePrincipalDomains(ObjectStoreConnection con, String principalName) {
-        
+
         // first we're going to retrieve the list domains for
         // the given user
-        
+
         final String domainPrefix = principalName + ".";
         List<String> subDomains = con.listDomains(domainPrefix, 0);
-        
+
         // first we're going to delete the user domain if
         // one exists and then all the sub-domains. We're not
         // going to fail the operation for these steps - only
         // if the actual user is not deleted
-        
+
         con.deleteDomain(principalName);
         cacheStore.invalidate(principalName);
 
@@ -1755,14 +2254,14 @@ public class DBService {
             }
         }
     }
-    
+
     ServiceIdentity getServiceIdentity(String domainName, String serviceName, boolean attrsOnly) {
 
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             return getServiceIdentity(con, domainName, serviceName, attrsOnly);
         }
     }
-    
+
     DomainTemplateList listDomainTemplates(String domainName) {
 
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
@@ -1771,7 +2270,7 @@ public class DBService {
             return domainTemplateList;
         }
     }
-    
+
     ServiceIdentity getServiceIdentity(ObjectStoreConnection con, String domainName,
             String serviceName, boolean attrsOnly) {
 
@@ -1785,25 +2284,25 @@ public class DBService {
         }
         return service;
     }
-    
+
     PublicKeyEntry getPublicKeyFromCache(String domainName, String serviceName, String keyId) {
-        
+
         DataCache data = cacheStore.getIfPresent(domainName);
         if (data == null) {
             return null;
         }
-            
+
         AthenzDomain athenzDomain = data.getAthenzDomain();
         if (athenzDomain == null) {
             return null;
         }
-        
+
         List<ServiceIdentity> services = athenzDomain.getServices();
         if (services == null) {
             return null;
         }
-        
-        final String fullServiceName = ZMSUtils.serviceResourceName(domainName, serviceName);
+
+        final String fullServiceName = ResourceUtils.serviceResourceName(domainName, serviceName);
         for (ServiceIdentity service : services) {
             if (fullServiceName.equals(service.getName())) {
                 List<PublicKeyEntry> publicKeys = service.getPublicKeys();
@@ -1817,10 +2316,10 @@ public class DBService {
                 break;
             }
         }
-        
+
         return null;
     }
-    
+
     PublicKeyEntry getServicePublicKeyEntry(String domainName, String serviceName,
             String keyId, boolean domainStateCheck) {
 
@@ -1831,12 +2330,12 @@ public class DBService {
                 throw ex;
             }
         }
-        
+
         // if we got this far it means we couldn't get our public key
         // from our DB store either due to timeout or communication
         // error so we're going to see if we have the public key in
         // our cache and use that for our requests
-        
+
         PublicKeyEntry keyEntry = getPublicKeyFromCache(domainName, serviceName, keyId);
         if (keyEntry == null) {
             throw new ResourceException(ResourceException.SERVICE_UNAVAILABLE,
@@ -1844,77 +2343,86 @@ public class DBService {
         }
         return keyEntry;
     }
-    
+
     public ResourceAccessList getResourceAccessList(String principal, String action) {
-        
+
         // this commands takes a quite a bit of time due to joining tables
         // and needs to be optimized. For now we'll configure it with
         // default timeout of 30 minutes to avoid any issues
-        
+
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             con.setOperationTimeout(1800);
-            return con.listResourceAccess(principal, action, userDomain);
+            return con.listResourceAccess(principal, action, zmsConfig.getUserDomain());
         }
     }
-    
+
     Domain getDomain(String domainName, boolean masterCopy) {
 
         try (ObjectStoreConnection con = store.getConnection(true, masterCopy)) {
             return con.getDomain(domainName);
         }
     }
-    
-    List<String> listDomains(String prefix, long modifiedSince) {
-        
-        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+
+    List<String> listDomains(String prefix, long modifiedSince, boolean masterCopy) {
+
+        try (ObjectStoreConnection con = store.getConnection(true, masterCopy)) {
             return con.listDomains(prefix, modifiedSince);
         }
     }
 
-    DomainList lookupDomainById(String account, int productId) {
-        
+    DomainList lookupDomainById(final String account, final String subscription, int productId) {
+
         DomainList domList = new DomainList();
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
-            String domain = con.lookupDomainById(account, productId);
+            String domain = con.lookupDomainById(account, subscription, productId);
             if (domain != null) {
-                List<String> list = Collections.singletonList(domain);
-                domList.setNames(list);
+                domList.setNames(Collections.singletonList(domain));
             }
         }
         return domList;
     }
-    
-    DomainList lookupDomainByAccount(String account) {
-        return lookupDomainById(account, 0);
+
+    DomainList lookupDomainByAWSAccount(final String account) {
+        return lookupDomainById(account, null, 0);
+    }
+
+    DomainList lookupDomainByAzureSubscription(final String subscription) {
+        return lookupDomainById(null, subscription, 0);
     }
 
     DomainList lookupDomainByProductId(Integer productId) {
-        return lookupDomainById(null, productId);
+        return lookupDomainById(null, null, productId);
     }
-    
-    DomainList lookupDomainByRole(String roleMember, String roleName) {
-        
+
+    DomainList lookupDomainByBusinessService(final String businessService) {
         DomainList domList = new DomainList();
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
-            List<String> domains = con.lookupDomainByRole(roleMember, roleName);
-            if (domains != null) {
-                domList.setNames(domains);
-            }
+            domList.setNames(con.lookupDomainByBusinessService(businessService));
         }
         return domList;
     }
-    
+
+    DomainList lookupDomainByRole(String roleMember, String roleName) {
+
+        DomainList domList = new DomainList();
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            domList.setNames(con.lookupDomainByRole(roleMember, roleName));
+        }
+        return domList;
+    }
+
     List<String> listRoles(String domainName) {
-        
+
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             return con.listRoles(domainName);
         }
     }
-    
-    Membership getMembership(String domainName, String roleName, String principal, long expiryTimestamp) {
-        
+
+    Membership getMembership(String domainName, String roleName, String principal,
+            long expiryTimestamp, boolean pending) {
+
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
-            Membership membership = con.getRoleMember(domainName, roleName, principal, expiryTimestamp);
+            Membership membership = con.getRoleMember(domainName, roleName, principal, expiryTimestamp, pending);
             Timestamp expiration = membership.getExpiration();
 
             //need to check expiration and set isMember if expired
@@ -1922,7 +2430,24 @@ public class DBService {
             if (expiration != null && expiration.millis() < System.currentTimeMillis()) {
                 membership.setIsMember(false);
             }
-            
+
+            return membership;
+        }
+    }
+
+    GroupMembership getGroupMembership(final String domainName, final String groupName, final String principal,
+                                       long expiryTimestamp, boolean pending) {
+
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            GroupMembership membership = con.getGroupMember(domainName, groupName, principal, expiryTimestamp, pending);
+            Timestamp expiration = membership.getExpiration();
+
+            //need to check expiration and set isMember if expired
+
+            if (expiration != null && expiration.millis() < System.currentTimeMillis()) {
+                membership.setIsMember(false);
+            }
+
             return membership;
         }
     }
@@ -1933,110 +2458,196 @@ public class DBService {
         }
     }
 
+    DomainRoleMember getPrincipalRoles(String principal, String domainName) {
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            return con.getPrincipalRoles(principal, domainName);
+        }
+    }
+
+    DomainGroupMember getPrincipalGroups(String principal, String domainName) {
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            return con.getPrincipalGroups(principal, domainName);
+        }
+    }
+
+    Group getGroup(final String domainName, final String groupName, Boolean auditLog, Boolean pending) {
+
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            return getGroup(con, domainName, groupName, auditLog, pending);
+        }
+    }
+
+    Group getGroup(ObjectStoreConnection con, final String domainName, final String groupName,
+                 Boolean auditLog, Boolean pending) {
+
+        Group group = con.getGroup(domainName, groupName);
+        if (group == null) {
+            return null;
+        }
+
+        // let's retrieve our standard group members
+
+        group.setGroupMembers(con.listGroupMembers(domainName, groupName, pending));
+
+        if (auditLog == Boolean.TRUE) {
+            group.setAuditLog(con.listGroupAuditLogs(domainName, groupName));
+        }
+
+        return group;
+    }
+
     Role getRole(String domainName, String roleName, Boolean auditLog, Boolean expand, Boolean pending) {
 
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             return getRole(con, domainName, roleName, auditLog, expand, pending);
         }
     }
-    
+
+    Timestamp memberStrictExpiration(Timestamp groupExpiration, Timestamp memberExpiration) {
+        if (groupExpiration == null) {
+            return memberExpiration;
+        } else if (memberExpiration == null) {
+            return groupExpiration;
+        } else if (groupExpiration.millis() < memberExpiration.millis()) {
+            return groupExpiration;
+        } else {
+            return memberExpiration;
+        }
+    }
+
+    RoleMember convertGroupToRoleMember(GroupMember groupMember, Timestamp groupExpiration) {
+        return new RoleMember()
+                .setMemberName(groupMember.getMemberName())
+                .setActive(groupMember.getActive())
+                .setApproved(groupMember.getApproved())
+                .setAuditRef(groupMember.getAuditRef())
+                .setSystemDisabled(groupMember.getSystemDisabled())
+                .setRequestTime(groupMember.getRequestTime())
+                .setExpiration(memberStrictExpiration(groupExpiration, groupMember.getExpiration()));
+    }
+
+    void expandRoleGroupMembers(ObjectStoreConnection con, Role role, List<RoleMember> roleMembers, Boolean pending) {
+
+        List<RoleMember> expandedMembers = new ArrayList<>();
+        for (RoleMember roleMember : roleMembers) {
+            final String memberName = roleMember.getMemberName();
+
+            int idx = memberName.indexOf(AuthorityConsts.GROUP_SEP);
+            if (idx == -1) {
+                expandedMembers.add(roleMember);
+            } else {
+                final String domainName = memberName.substring(0, idx);
+                final String groupName = memberName.substring(idx + AuthorityConsts.GROUP_SEP.length());
+                List<GroupMember> groupMembers = con.listGroupMembers(domainName, groupName, pending);
+                for (GroupMember groupMember : groupMembers) {
+                    expandedMembers.add(convertGroupToRoleMember(groupMember, roleMember.getExpiration()));
+                }
+            }
+        }
+        role.setRoleMembers(expandedMembers);
+    }
+
     Role getRole(ObjectStoreConnection con, String domainName, String roleName,
             Boolean auditLog, Boolean expand, Boolean pending) {
 
         Role role = con.getRole(domainName, roleName);
         if (role != null) {
-            
-            if (role.getTrust() == null) {
-                
-                // if we have no trust field specified then we need to
-                // retrieve our standard group role members
-                
-                role.setRoleMembers(con.listRoleMembers(domainName, roleName, pending));
-                
-                // still populate the members for old clients
 
-                role.setMembers(ZMSUtils.convertRoleMembersToMembers(
-                        role.getRoleMembers()));
+            if (role.getTrust() == null) {
+
+                // if we have no trust field specified then we need to
+                // retrieve our standard group role members. However,
+                // since we can have groups as members in roles check
+                // to see if we're asked to expand them
+
+                if (expand == Boolean.TRUE) {
+                    expandRoleGroupMembers(con, role, con.listRoleMembers(domainName, roleName, pending), pending);
+                } else {
+                    role.setRoleMembers(con.listRoleMembers(domainName, roleName, pending));
+                }
 
                 if (auditLog == Boolean.TRUE) {
                     role.setAuditLog(con.listRoleAuditLogs(domainName, roleName));
                 }
-                
+
             } else if (expand == Boolean.TRUE) {
 
                 // otherwise, if asked, let's expand the delegated
                 // membership and return the list of members
-                
-                role.setRoleMembers(getDelegatedRoleMembers(domainName, role.getTrust(), roleName));
-                
-                // still populate the members for old clients
 
-                role.setMembers(ZMSUtils.convertRoleMembersToMembers(role.getRoleMembers()));
+                role.setRoleMembers(getDelegatedRoleMembers(con, domainName, role.getTrust(), roleName));
+            }
+
+            Map<String, TagValueList> roleTags = con.getRoleTags(domainName, roleName);
+            if (roleTags != null) {
+                role.setTags(roleTags);
             }
         }
         return role;
     }
-    
-    List<RoleMember> getDelegatedRoleMembers(String domainName, String trustDomain, String roleName) {
-        
+
+    List<RoleMember> getDelegatedRoleMembers(ObjectStoreConnection con, final String domainName,
+                                             final String trustDomain, final String roleName) {
+
         // verify that the domain and trust domain are not the same
-        
+
         if (domainName.equals(trustDomain)) {
             return null;
         }
-        
+
         // retrieve our trust domain
-        
+
         AthenzDomain domain = null;
         try {
-            domain = getAthenzDomain(trustDomain, false);
-        } catch (ResourceException ignored) {
+            domain = getAthenzDomain(con, trustDomain);
+        } catch (ResourceException ex) {
+            LOG.error("unable to fetch domain {}: {}", trustDomain, ex.getMessage());
         }
-        
+
         if (domain == null) {
             return null;
         }
-        
+
         // we need to use a set since we might be matching
         // multiple assertions and we want to automatically
         // skip any duplicate members
-        
+
         Map<String, RoleMember> roleMembers = new HashMap<>();
-        
+
         // generate our full role name
-        
-        String fullRoleName = ZMSUtils.roleResourceName(domainName, roleName);
-        
+
+        String fullRoleName = ResourceUtils.roleResourceName(domainName, roleName);
+
         // iterate through all policies to see which one has the
         // assume_role assertion for the given role
-        
+
         for (Policy policy : domain.getPolicies()) {
-            
+
             List<Assertion> assertions = policy.getAssertions();
             if (assertions == null) {
                 continue;
             }
-            
+
             for (Assertion assertion : assertions) {
-                
-                if (!ZMSUtils.assumeRoleResourceMatch(fullRoleName, assertion)) {
+
+                if (!AuthzHelper.assumeRoleResourceMatch(fullRoleName, assertion)) {
                     continue;
                 }
-                
+
                 String rolePattern = StringUtils.patternFromGlob(assertion.getRole());
                 for (Role role : domain.getRoles()) {
-                    
+
                     // make sure we have members before trying to match the name
-                    
+
                     List<RoleMember> members = role.getRoleMembers();
                     if (members == null || members.isEmpty()) {
                         continue;
                     }
-                    
+
                     if (!role.getName().matches(rolePattern)) {
                         continue;
                     }
-                    
+
                     for (RoleMember member : members) {
                         String memberName = member.getMemberName();
                         if (!roleMembers.containsKey(memberName)) {
@@ -2049,21 +2660,21 @@ public class DBService {
 
         return new ArrayList<>(roleMembers.values());
     }
-    
+
     Policy getPolicy(String domainName, String policyName) {
 
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             return getPolicy(con, domainName, policyName);
         }
     }
-    
+
     Assertion getAssertion(String domainName, String policyName, Long assertionId) {
 
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             return con.getAssertion(domainName, policyName, assertionId);
         }
     }
-    
+
     void executePutAssertion(ResourceContext ctx, String domainName, String policyName,
             Assertion assertion, String auditRef, String caller) {
 
@@ -2117,7 +2728,7 @@ public class DBService {
             }
         }
     }
-    
+
     void executeDeleteAssertion(ResourceContext ctx, String domainName, String policyName,
             Long assertionId, String auditRef, String caller) {
 
@@ -2132,6 +2743,14 @@ public class DBService {
                 // first verify that auditing requirements are met
 
                 checkDomainAuditEnabled(con, domainName, auditRef, caller, getPrincipalName(ctx), AUDIT_TYPE_POLICY);
+
+                // fetch the assertion for our audit log
+
+                Assertion assertion = con.getAssertion(domainName, policyName, assertionId);
+                if (assertion == null) {
+                    throw ZMSUtils.notFoundError(caller + ": unable to read assertion: " +
+                            assertionId + " from policy: " + policyName, caller);
+                }
 
                 // process our delete assertion. since this is a "single"
                 // operation, we are not using any transactions.
@@ -2149,10 +2768,15 @@ public class DBService {
 
                 // audit log the request
 
-                final String auditDetails = "{\"policy\": \"" + policyName +
-                        "\", \"assertionId\": \"" + assertionId + "\"}";
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditDetails.append("{\"policy\": \"").append(policyName)
+                        .append("\", \"assertionId\": \"").append(assertionId)
+                        .append("\", \"deleted-assertions\": [");
+                auditLogAssertion(auditDetails, assertion, true);
+                auditDetails.append("]}");
+
                 auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_DELETE,
-                        policyName, auditDetails);
+                        policyName, auditDetails.toString());
 
                 return;
 
@@ -2166,21 +2790,21 @@ public class DBService {
             }
         }
     }
-    
+
     List<String> listEntities(String domainName) {
-        
+
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             return con.listEntities(domainName);
         }
     }
-    
+
     Entity getEntity(String domainName, String entityName) {
 
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             return con.getEntity(domainName, entityName);
         }
     }
-    
+
     Policy getPolicy(ObjectStoreConnection con, String domainName, String policyName) {
 
         Policy policy = con.getPolicy(domainName, policyName);
@@ -2189,22 +2813,22 @@ public class DBService {
         }
         return policy;
     }
-    
+
     List<String> listPolicies(String domainName) {
 
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             return con.listPolicies(domainName, null);
         }
     }
-    
+
     List<String> listServiceIdentities(String domainName) {
 
         try (ObjectStoreConnection con = store.getConnection(true, false)) {
             return con.listServiceIdentities(domainName);
         }
     }
-    
-    void executePutDomainMeta(ResourceContext ctx, String domainName, DomainMeta meta,
+
+    void executePutDomainMeta(ResourceContext ctx, Domain domain, DomainMeta meta,
             final String systemAttribute, boolean deleteAllowed, String auditRef, String caller) {
 
         // our exception handling code does the check for retry count
@@ -2215,11 +2839,7 @@ public class DBService {
 
             try (ObjectStoreConnection con = store.getConnection(false, true)) {
 
-                Domain domain = con.getDomain(domainName);
-                if (domain == null) {
-                    con.rollbackChanges();
-                    throw ZMSUtils.notFoundError(caller + ": Unknown domain: " + domainName, caller);
-                }
+                final String domainName = domain.getName();
 
                 // first verify that auditing requirements are met
 
@@ -2237,9 +2857,20 @@ public class DBService {
                         .setOrg(domain.getOrg())
                         .setApplicationId(domain.getApplicationId())
                         .setAccount(domain.getAccount())
+                        .setAzureSubscription(domain.getAzureSubscription())
                         .setYpmId(domain.getYpmId())
                         .setCertDnsDomain(domain.getCertDnsDomain())
-                        .setMemberExpiryDays(domain.getMemberExpiryDays());
+                        .setMemberExpiryDays(domain.getMemberExpiryDays())
+                        .setServiceExpiryDays(domain.getServiceExpiryDays())
+                        .setGroupExpiryDays(domain.getGroupExpiryDays())
+                        .setTokenExpiryMins(domain.getTokenExpiryMins())
+                        .setRoleCertExpiryMins(domain.getRoleCertExpiryMins())
+                        .setServiceCertExpiryMins(domain.getServiceCertExpiryMins())
+                        .setSignAlgorithm(domain.getSignAlgorithm())
+                        .setUserAuthorityFilter(domain.getUserAuthorityFilter())
+                        .setBusinessService(domain.getBusinessService())
+                        .setTags(domain.getTags())
+                        .setBusinessService(domain.getBusinessService());
 
                 // then we're going to apply the updated fields
                 // from the given object
@@ -2251,6 +2882,17 @@ public class DBService {
                 }
 
                 con.updateDomain(updatedDomain);
+
+                // if we're only updating our tags then we need to explicitly
+                // update our domain last mod timestamp since it won't be
+                // updated during the updateDomain call if there are no other
+                // changes present in the request
+
+                if (!processDomainTags(con, meta.getTags(), domain, domainName, true)) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.internalServerError(caller + "Unable to update tags", caller);
+                }
+
                 con.commitChanges();
                 cacheStore.invalidate(domainName);
 
@@ -2262,6 +2904,17 @@ public class DBService {
                 auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
                         domainName, auditDetails.toString());
 
+                // if the domain member expiry date has changed then we're going
+                // process all the members in the domain and update the expiration
+                // date accordingly
+
+                updateDomainMembersExpiration(ctx, con, domain, updatedDomain, auditRef, caller);
+
+                // if the domain user attribute expiry has changed we need to
+                // process all the members in the domain accordingly
+
+                updateDomainMembersUserAuthorityFilter(ctx, con, domain, updatedDomain, auditRef, caller);
+
                 return;
 
             } catch (ResourceException ex) {
@@ -2272,6 +2925,226 @@ public class DBService {
         }
     }
 
+    private boolean processDomainTags(ObjectStoreConnection con, Map<String, TagValueList> domainTags,
+            Domain originalDomain, final String domainName, boolean updateDomainLastModTimestamp) {
+
+        if (originalDomain == null || originalDomain.getTags() == null || originalDomain.getTags().isEmpty()) {
+            if (domainTags == null || domainTags.isEmpty()) {
+                // no tags to process..
+                return true;
+            }
+            if (!con.insertDomainTags(domainName, domainTags)) {
+                return false;
+            }
+            if (updateDomainLastModTimestamp) {
+                con.updateDomainModTimestamp(domainName);
+            }
+            return true;
+        }
+
+        if (domainTags == null) {
+            return true;
+        }
+
+        Map<String, TagValueList> originalDomainTags = originalDomain.getTags();
+
+        Set<String> tagsToRemove = originalDomainTags.entrySet().stream()
+            .filter(curTag -> domainTags.get(curTag.getKey()) == null
+                || !domainTags.get(curTag.getKey()).equals(curTag.getValue()))
+            .map(Map.Entry::getKey)
+            .collect(Collectors.toSet());
+
+        boolean tagsChanged = false;
+        if (tagsToRemove != null && !tagsToRemove.isEmpty()) {
+            if (!con.deleteDomainTags(originalDomain.getName(), tagsToRemove)) {
+                return false;
+            }
+            tagsChanged = true;
+        }
+
+        Map<String, TagValueList> tagsToAdd = domainTags.entrySet().stream()
+            .filter(curTag -> originalDomainTags.get(curTag.getKey()) == null
+                || !originalDomainTags.get(curTag.getKey()).equals(curTag.getValue()))
+            .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+
+        if (tagsToAdd != null && !tagsToAdd.isEmpty()) {
+            if (!con.insertDomainTags(originalDomain.getName(), tagsToAdd)) {
+                return false;
+            }
+            tagsChanged = true;
+        }
+
+        if (tagsChanged && updateDomainLastModTimestamp) {
+            con.updateDomainModTimestamp(domainName);
+        }
+        return true;
+    }
+
+    void updateDomainMembersUserAuthorityFilter(ResourceContext ctx, ObjectStoreConnection con, Domain domain,
+                                               Domain updatedDomain, String auditRef, String caller) {
+
+        // check if the authority filter has changed otherwise we have
+        // nothing to do
+
+        if (!isUserAuthorityFilterChanged(domain.getUserAuthorityFilter(), updatedDomain.getUserAuthorityFilter())) {
+            return;
+        }
+
+        final String domainName = domain.getName();
+        AthenzDomain athenzDomain;
+        try {
+            athenzDomain = getAthenzDomain(con, domainName);
+        } catch (ResourceException ex) {
+            LOG.error("unable to fetch domain {}: {}", domainName, ex.getMessage());
+            return;
+        }
+
+        final String principal = getPrincipalName(ctx);
+        for (Role role : athenzDomain.getRoles()) {
+
+            // if it's a delegated role then we have nothing to do
+
+            if (role.getTrust() != null && !role.getTrust().isEmpty()) {
+                continue;
+            }
+
+            // if no role members, then there is nothing to do
+
+            final List<RoleMember> roleMembers = role.getRoleMembers();
+            if (roleMembers == null || roleMembers.isEmpty()) {
+                continue;
+            }
+
+            // process our role members and if there were any changes processed then update
+            // our role and domain time-stamps, and invalidate local cache entry
+
+            final String roleName = AthenzUtils.extractRoleName(role.getName());
+            List<RoleMember> roleMembersWithUpdatedDisabledState = getRoleMembersWithUpdatedDisabledState(roleMembers,
+                    role.getUserAuthorityFilter(), updatedDomain.getUserAuthorityFilter());
+            if (updateRoleMemberDisabledState(ctx, con, roleMembersWithUpdatedDisabledState, domainName,
+                    roleName, principal, auditRef, caller)) {
+
+                // update our role and domain time-stamps, and invalidate local cache entry
+
+                con.updateRoleModTimestamp(domainName, roleName);
+                con.updateDomainModTimestamp(domainName);
+                cacheStore.invalidate(domainName);
+            }
+        }
+    }
+
+    void updateDomainMembersExpiration(ResourceContext ctx, ObjectStoreConnection con, Domain domain,
+            Domain updatedDomain, String auditRef, String caller) {
+
+        // we only need to process the domain role members if the new expiration
+        // is more restrictive than what we had before
+
+        boolean userMemberExpiryDayReduced = isNumOfDaysReduced(domain.getMemberExpiryDays(),
+                updatedDomain.getMemberExpiryDays());
+        boolean serviceMemberExpiryDayReduced = isNumOfDaysReduced(domain.getServiceExpiryDays(),
+                updatedDomain.getServiceExpiryDays());
+        boolean groupMemberExpiryDayReduced = isNumOfDaysReduced(domain.getGroupExpiryDays(),
+                updatedDomain.getGroupExpiryDays());
+
+        if (!userMemberExpiryDayReduced && !serviceMemberExpiryDayReduced && !groupMemberExpiryDayReduced) {
+            return;
+        }
+
+        AthenzDomain athenzDomain;
+        try {
+            athenzDomain = getAthenzDomain(con, domain.getName());
+        } catch (ResourceException ex) {
+            LOG.error("unable to fetch domain {}: {}", domain.getName(), ex.getMessage());
+            return;
+        }
+
+        long userExpiryMillis = userMemberExpiryDayReduced ? System.currentTimeMillis()
+                + TimeUnit.MILLISECONDS.convert(updatedDomain.getMemberExpiryDays(), TimeUnit.DAYS) : 0;
+        long serviceExpiryMillis = serviceMemberExpiryDayReduced ? System.currentTimeMillis()
+                + TimeUnit.MILLISECONDS.convert(updatedDomain.getServiceExpiryDays(), TimeUnit.DAYS) : 0;
+        long groupExpiryMillis = groupMemberExpiryDayReduced ? System.currentTimeMillis()
+                + TimeUnit.MILLISECONDS.convert(updatedDomain.getGroupExpiryDays(), TimeUnit.DAYS) : 0;
+        Timestamp userExpiration = Timestamp.fromMillis(userExpiryMillis);
+        Timestamp serviceExpiration = Timestamp.fromMillis(serviceExpiryMillis);
+        Timestamp groupExpiration = Timestamp.fromMillis(groupExpiryMillis);
+
+        final String principal = getPrincipalName(ctx);
+        boolean domainModified = false;
+        for (Role role : athenzDomain.getRoles()) {
+            // if the role already has a specific expiry date set then we
+            // will automatically skip this role
+
+            if (role.getMemberExpiryDays() != null || role.getServiceExpiryDays() != null || role.getGroupExpiryDays() != null) {
+                continue;
+            }
+
+            // if it's a delegated role then we have nothing to do
+
+            if (role.getTrust() != null && !role.getTrust().isEmpty()) {
+                continue;
+            }
+
+            // if no role members, then there is nothing to do
+
+            final List<RoleMember> roleMembers = role.getRoleMembers();
+            if (roleMembers == null || roleMembers.isEmpty()) {
+                continue;
+            }
+
+            // process our role members and if there were any changes processed then update
+            // our role and domain time-stamps, and invalidate local cache entry
+
+            final String roleName = AthenzUtils.extractRoleName(role.getName());
+            List<RoleMember> roleMembersWithUpdatedDueDates = getRoleMembersWithUpdatedDueDates(roleMembers,
+                    userExpiration, userExpiryMillis, serviceExpiration, serviceExpiryMillis,
+                    groupExpiration, groupExpiryMillis, null, 0,
+                    null, 0, null, null, 0);
+            if (insertRoleMembers(ctx, con, roleMembersWithUpdatedDueDates, domain.getName(),
+                    roleName, principal, auditRef, caller)) {
+
+                // update our role and domain time-stamps, and invalidate local cache entry
+
+                con.updateRoleModTimestamp(domain.getName(), roleName);
+                domainModified = true;
+            }
+        }
+        for (Group group : athenzDomain.getGroups()) {
+
+            // if the group already has a specific expiry date set then we
+            // will automatically skip this group
+
+            if (group.getMemberExpiryDays() != null || group.getServiceExpiryDays() != null) {
+                continue;
+            }
+
+            // if no group members, then there is nothing to do
+
+            final List<GroupMember> groupMembers = group.getGroupMembers();
+            if (groupMembers == null || groupMembers.isEmpty()) {
+                continue;
+            }
+
+            // process our group members and if there were any changes processed then update
+            // our group and domain time-stamps, and invalidate local cache entry
+
+            final String groupName = AthenzUtils.extractGroupName(group.getName());
+            List<GroupMember> groupMembersWithUpdatedDueDates = getGroupMembersWithUpdatedDueDates(groupMembers,
+                    userExpiration, userExpiryMillis, serviceExpiration, serviceExpiryMillis, null);
+            if (insertGroupMembers(ctx, con, groupMembersWithUpdatedDueDates, domain.getName(),
+                    groupName, principal, auditRef, caller)) {
+
+                // update our group and domain time-stamps, and invalidate local cache entry
+
+                con.updateGroupModTimestamp(domain.getName(), groupName);
+                domainModified = true;
+            }
+        }
+        if (domainModified) {
+            con.updateDomainModTimestamp(domain.getName());
+            cacheStore.invalidate(domain.getName());
+        }
+    }
+
     void updateDomainMetaFields(Domain domain, DomainMeta meta) {
 
         domain.setApplicationId(meta.getApplicationId());
@@ -2279,21 +3152,60 @@ public class DBService {
         if (meta.getMemberExpiryDays() != null) {
             domain.setMemberExpiryDays(meta.getMemberExpiryDays());
         }
+        if (meta.getServiceExpiryDays() != null) {
+            domain.setServiceExpiryDays(meta.getServiceExpiryDays());
+        }
+        if (meta.getGroupExpiryDays() != null) {
+            domain.setGroupExpiryDays(meta.getGroupExpiryDays());
+        }
+        if (meta.getRoleCertExpiryMins() != null) {
+            domain.setRoleCertExpiryMins(meta.getRoleCertExpiryMins());
+        }
+        if (meta.getServiceCertExpiryMins() != null) {
+            domain.setServiceCertExpiryMins(meta.getServiceCertExpiryMins());
+        }
+        if (meta.getTokenExpiryMins() != null) {
+            domain.setTokenExpiryMins(meta.getTokenExpiryMins());
+        }
+        if (meta.getSignAlgorithm() != null) {
+            domain.setSignAlgorithm(meta.getSignAlgorithm());
+        }
+        if (meta.getBusinessService() != null) {
+            domain.setBusinessService(meta.getBusinessService());
+        }
+        if (meta.getTags() != null) {
+            domain.setTags(meta.getTags());
+        }
     }
 
-    boolean isDeleteSystemMetaAllowed(boolean deleteAllowed, Object oldValue, Object newValue) {
+    boolean isDeleteSystemMetaAllowed(boolean deleteAllowed, final String oldValue, final String newValue) {
 
         // if authorized or old value is not set, then there is
         // no need to check any value
 
-        if (deleteAllowed || oldValue == null) {
+        if (deleteAllowed || oldValue == null || oldValue.isEmpty()) {
             return true;
         }
 
         // since our old value is not null then we will only
         // allow if the new value is identical
 
-        return (newValue != null) ? oldValue.equals(newValue) : false;
+        return oldValue.equals(newValue);
+    }
+
+    boolean isDeleteSystemMetaAllowed(boolean deleteAllowed, Integer oldValue, Integer newValue) {
+
+        // if authorized or old value is not set, then there is
+        // no need to check any value
+
+        if (deleteAllowed || oldValue == null || oldValue == 0) {
+            return true;
+        }
+
+        // since our old value is not null then we will only
+        // allow if the new value is identical
+
+        return newValue != null && newValue.intValue() == oldValue.intValue();
     }
 
     void updateSystemMetaFields(Domain domain, final String attribute, boolean deleteAllowed,
@@ -2310,6 +3222,12 @@ public class DBService {
                     throw ZMSUtils.forbiddenError("unauthorized to reset system meta attribute: " + attribute, caller);
                 }
                 domain.setAccount(meta.getAccount());
+                break;
+            case ZMSConsts.SYSTEM_META_AZURE_SUBSCRIPTION:
+                if (!isDeleteSystemMetaAllowed(deleteAllowed, domain.getAzureSubscription(), meta.getAzureSubscription())) {
+                    throw ZMSUtils.forbiddenError("unauthorized to reset system meta attribute: " + attribute, caller);
+                }
+                domain.setAzureSubscription(meta.getAzureSubscription());
                 break;
             case ZMSConsts.SYSTEM_META_PRODUCT_ID:
                 if (!isDeleteSystemMetaAllowed(deleteAllowed, domain.getYpmId(), meta.getYpmId())) {
@@ -2332,27 +3250,79 @@ public class DBService {
             case ZMSConsts.SYSTEM_META_AUDIT_ENABLED:
                 domain.setAuditEnabled(meta.getAuditEnabled());
                 break;
+            case ZMSConsts.SYSTEM_META_USER_AUTH_FILTER:
+                domain.setUserAuthorityFilter(meta.getUserAuthorityFilter());
+                break;
             case ZMSConsts.SYSTEM_META_ENABLED:
                 domain.setEnabled(meta.getEnabled());
+                break;
+            case ZMSConsts.SYSTEM_META_BUSINESS_SERVICE:
+                domain.setBusinessService(meta.getBusinessService());
                 break;
             default:
                 throw ZMSUtils.requestError("unknown system meta attribute: " + attribute, caller);
         }
     }
 
-    void updateRoleSystemMetaFields(Role role, final String attribute, boolean deleteAllowed, RoleSystemMeta meta) {
-
-        final String caller = "putrolesystemmeta";
+    void updateRoleSystemMetaFields(ObjectStoreConnection con, Role updatedRole, Role originalRole,
+                                    final String attribute, RoleSystemMeta meta, final String caller) {
 
         // system attributes we'll only set if they're available
         // in the given object
 
-        switch (attribute) {
-            case ZMSConsts.SYSTEM_META_AUDIT_ENABLED:
-                role.setAuditEnabled(meta.getAuditEnabled());
-                break;
-            default:
-                throw ZMSUtils.requestError("unknown role system meta attribute: " + attribute, caller);
+        if (ZMSConsts.SYSTEM_META_AUDIT_ENABLED.equals(attribute)) {
+            updatedRole.setAuditEnabled(meta.getAuditEnabled());
+
+            // we also need to verify that if we have any group members
+            // then those groups have the audit enabled flag as well
+
+            if (updatedRole.getAuditEnabled() == Boolean.TRUE && originalRole.getRoleMembers() != null) {
+                for (RoleMember roleMember : originalRole.getRoleMembers()) {
+                    final String memberName = roleMember.getMemberName();
+                    if (ZMSUtils.principalType(memberName, zmsConfig.getUserDomainPrefix(),
+                            zmsConfig.getAddlUserCheckDomainPrefixList()) != Principal.Type.GROUP) {
+                        continue;
+                    }
+
+                    int idx = memberName.indexOf(AuthorityConsts.GROUP_SEP);
+                    final String domainName = memberName.substring(0, idx);
+                    final String groupName = memberName.substring(idx + AuthorityConsts.GROUP_SEP.length());
+                    Group group = con.getGroup(domainName, groupName);
+                    if (group == null) {
+                        throw ZMSUtils.requestError("role has invalid group member: " + memberName, caller);
+                    }
+                    if (group.getAuditEnabled() != Boolean.TRUE) {
+                        throw ZMSUtils.requestError("role member: " + memberName + " must have audit flag enabled", caller);
+                    }
+                }
+            }
+        } else {
+            throw ZMSUtils.requestError("unknown role system meta attribute: " + attribute, caller);
+        }
+    }
+
+    void updateGroupSystemMetaFields(Group group, final String attribute, GroupSystemMeta meta, final String caller) {
+
+        // system attributes we'll only set if they're available
+        // in the given object
+
+        if (ZMSConsts.SYSTEM_META_AUDIT_ENABLED.equals(attribute)) {
+            group.setAuditEnabled(meta.getAuditEnabled());
+        } else {
+            throw ZMSUtils.requestError("unknown group system meta attribute: " + attribute, caller);
+        }
+    }
+
+    void updateServiceIdentitySystemMetaFields(ServiceIdentity service, final String attribute,
+            ServiceIdentitySystemMeta meta, final String caller) {
+
+        // system attributes we'll only set if they're available
+        // in the given object
+
+        if (ZMSConsts.SYSTEM_META_PROVIDER_ENDPOINT.equals(attribute)) {
+            service.setProviderEndpoint(meta.getProviderEndpoint());
+        } else {
+            throw ZMSUtils.requestError("unknown service system meta attribute: " + attribute, caller);
         }
     }
 
@@ -2406,7 +3376,7 @@ public class DBService {
             }
         }
     }
-    
+
     void executeDeleteDomainTemplate(ResourceContext ctx, String domainName, String templateName,
             String auditRef, String caller) {
 
@@ -2428,11 +3398,8 @@ public class DBService {
                 StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
                 auditDetails.append("{\"templates\": ");
 
-                Template template = ZMSImpl.serverSolutionTemplates.get(templateName);
-                if (!deleteSolutionTemplate(con, domainName, templateName, template, auditDetails)) {
-                    con.rollbackChanges();
-                    throw ZMSUtils.internalServerError("unable to delete domain template: " + domainName, caller);
-                }
+                Template template = zmsConfig.getServerSolutionTemplates().get(templateName);
+                deleteSolutionTemplate(con, domainName, templateName, template, auditDetails);
 
                 auditDetails.append("}");
 
@@ -2454,23 +3421,23 @@ public class DBService {
             }
         }
     }
-    
+
     boolean addSolutionTemplate(ObjectStoreConnection con, String domainName, String templateName,
             String admin, List<TemplateParam> templateParams, String auditRef, StringBuilder auditDetails) {
-        
+
         auditDetails.append("{\"name\": \"").append(templateName).append('\"');
-        
+
         // we have already verified that our template is valid but
         // we'll just double check to make sure it's not null
-        
-        Template template = ZMSImpl.serverSolutionTemplates.get(templateName);
+
+        Template template = zmsConfig.getServerSolutionTemplates().get(templateName);
         if (template == null) {
             auditDetails.append("}");
             return true;
         }
-        
+
         boolean firstEntry = true;
-        
+
         // iterate through roles in the list.
         // When adding a template, if the role does not exist in our domain
         // then insert it otherwise only apply the changes to the member list.
@@ -2485,11 +3452,18 @@ public class DBService {
                     domainName, ROLE_PREFIX);
 
                 // retrieve our original role
-                
+
                 Role originalRole = getRole(con, domainName, roleName, false, false, false);
 
+                // Merge original role with template role to handle role meta data
+                // if original role is null then it is an insert operation and no need of merging
+
+                if (originalRole != null) {
+                    mergeOriginalRoleAndMetaRoleAttributes(originalRole, templateRole);
+                }
+
                 // now process the request
-                
+
                 firstEntry = auditLogSeparator(auditDetails, firstEntry);
                 auditDetails.append(" \"add-role\": ");
                 if (!processRole(con, originalRole, domainName, roleName, templateRole,
@@ -2498,7 +3472,7 @@ public class DBService {
                 }
             }
         }
-        
+
         // iterate through policies in the list.
         // When adding a template, if the policy does not exist in our domain
         // then insert it otherwise only apply the changes to the assertions
@@ -2511,13 +3485,13 @@ public class DBService {
 
                 String policyName = ZMSUtils.removeDomainPrefix(templatePolicy.getName(),
                     domainName, POLICY_PREFIX);
-                
+
                 // retrieve our original policy
-                
+
                 Policy originalPolicy = getPolicy(con, domainName, policyName);
-                
+
                 // now process the request
-                
+
                 firstEntry = auditLogSeparator(auditDetails, firstEntry);
                 auditDetails.append(" \"add-policy\": ");
                 if (!processPolicy(con, originalPolicy, domainName, policyName, templatePolicy,
@@ -2526,7 +3500,7 @@ public class DBService {
                 }
             }
         }
-        
+
         // iterate through service identities in the list.
         // When adding a template, if the service identity does not exist in our domain
         // then insert it otherwise only apply the changes
@@ -2540,14 +3514,14 @@ public class DBService {
 
                 String serviceIdentityName = ZMSUtils.removeDomainPrefixForService(
                         templateServiceIdentity.getName(), domainName);
-                
+
                 // retrieve our original service
-                
+
                 ServiceIdentity originalServiceIdentity = getServiceIdentity(con, domainName,
                         serviceIdentityName, false);
-                
+
                 // now process the request
-                
+
                 firstEntry = auditLogSeparator(auditDetails, firstEntry);
                 auditDetails.append(" \"add-service\": ");
                 if (!processServiceIdentity(con, originalServiceIdentity, domainName,
@@ -2556,39 +3530,44 @@ public class DBService {
                 }
             }
         }
-        
+
         // if adding a template, only add if it is not in our current list
         // check to see if the template is already listed for the domain
-            
+
         List<String> currentTemplateList = con.listDomainTemplates(domainName);
         if (!currentTemplateList.contains(templateName)) {
             con.insertDomainTemplate(domainName, templateName, null);
         }
-        
+
+        //on both insert and update templates, bump up the version of the template to latest version.
+        if (template.getMetadata().getLatestVersion() != null) {
+            con.updateDomainTemplate(domainName, templateName, template.getMetadata());
+        }
+
         auditDetails.append("}");
         return true;
     }
-    
-    boolean deleteSolutionTemplate(ObjectStoreConnection con, String domainName, String templateName,
+
+    void deleteSolutionTemplate(ObjectStoreConnection con, String domainName, String templateName,
             Template template, StringBuilder auditDetails) {
 
         // currently there is no support for dynamic templates since the
         // DELETE request has no payload and we can't pass our parameters
 
         auditDetails.append("{\"name\": \"").append(templateName).append('\"');
-        
+
         // we have already verified that our template is valid but
         // we'll just double check to make sure it's not null
-        
+
         if (template == null) {
             auditDetails.append("}");
-            return true;
+            return;
         }
-        
+
         boolean firstEntry = true;
-        
+
         // iterate through roles in the list and delete the role
-        
+
         List<Role> templateRoles = template.getRoles();
         if (templateRoles != null) {
             for (Role role : templateRoles) {
@@ -2600,7 +3579,7 @@ public class DBService {
                 auditDetails.append(" \"delete-role\": \"").append(roleName).append('\"');
             }
         }
-        
+
         // iterate through policies in the list and delete the policy
 
         List<Policy> templatePolicies = template.getPolicies();
@@ -2614,7 +3593,7 @@ public class DBService {
                 auditDetails.append(" \"delete-policy\": \"").append(policyName).append('\"');
             }
         }
-        
+
         // iterate through services in the list and delete the service
 
         List<ServiceIdentity> templateServices = template.getServices();
@@ -2627,20 +3606,18 @@ public class DBService {
                 auditDetails.append(" \"delete-service\": \"").append(serviceName).append('\"');
             }
         }
-        
+
         // delete the template from the current list
-        
+
         con.deleteDomainTemplate(domainName, templateName, null);
-        
         auditDetails.append("}");
-        return true;
     }
-    
+
     Role updateTemplateRole(Role role, String domainName, List<TemplateParam> params) {
-        
+
         // first process our given role name and carry out any
         // requested substitutions
-        
+
         String templateRoleName = role.getName().replace(TEMPLATE_DOMAIN_NAME, domainName);
         if (params != null) {
             for (TemplateParam param : params) {
@@ -2650,16 +3627,31 @@ public class DBService {
         }
         Role templateRole = new Role()
                 .setName(templateRoleName)
-                .setTrust(role.getTrust());
-        
+                .setTrust(role.getTrust())
+                //adding additional role meta attributes if present in template->roles
+                .setCertExpiryMins(role.getCertExpiryMins())
+                .setSelfServe(role.getSelfServe())
+                .setMemberExpiryDays(role.getMemberExpiryDays())
+                .setTokenExpiryMins(role.getTokenExpiryMins())
+                .setSignAlgorithm(role.getSignAlgorithm())
+                .setServiceExpiryDays(role.getServiceExpiryDays())
+                .setGroupExpiryDays(role.getGroupExpiryDays())
+                .setGroupReviewDays(role.getGroupReviewDays())
+                .setMemberReviewDays(role.getMemberReviewDays())
+                .setServiceReviewDays(role.getServiceReviewDays())
+                .setReviewEnabled(role.getReviewEnabled())
+                .setNotifyRoles(role.getNotifyRoles())
+                .setUserAuthorityFilter(role.getUserAuthorityFilter())
+                .setUserAuthorityExpiration(role.getUserAuthorityExpiration());
+
         List<RoleMember> roleMembers = role.getRoleMembers();
         List<RoleMember> newMembers = new ArrayList<>();
         if (roleMembers != null && !roleMembers.isEmpty()) {
             for (RoleMember roleMember : roleMembers) {
                 RoleMember newRoleMember = new RoleMember();
-                
+
                 // process our role members for any requested substitutions
-                
+
                 String memberName = roleMember.getMemberName().replace(TEMPLATE_DOMAIN_NAME, domainName);
                 if (params != null) {
                     for (TemplateParam param : params) {
@@ -2669,18 +3661,19 @@ public class DBService {
                 }
                 newRoleMember.setMemberName(memberName);
                 newRoleMember.setExpiration(roleMember.getExpiration());
+                newRoleMember.setReviewReminder(roleMember.getReviewReminder());
                 newMembers.add(newRoleMember);
             }
         }
         templateRole.setRoleMembers(newMembers);
         return templateRole;
     }
-    
+
     Policy updateTemplatePolicy(Policy policy, String domainName, List<TemplateParam> params) {
-        
+
         // first process our given role name and carry out any
         // requested substitutions
-        
+
         String templatePolicyName = policy.getName().replace(TEMPLATE_DOMAIN_NAME, domainName);
         if (params != null) {
             for (TemplateParam param : params) {
@@ -2688,7 +3681,7 @@ public class DBService {
                 templatePolicyName = templatePolicyName.replace(paramKey, param.getValue());
             }
         }
-        
+
         Policy templatePolicy = new Policy().setName(templatePolicyName);
         List<Assertion> assertions = policy.getAssertions();
         List<Assertion> newAssertions = new ArrayList<>();
@@ -2697,9 +3690,9 @@ public class DBService {
                 Assertion newAssertion = new Assertion();
                 newAssertion.setAction(assertion.getAction());
                 newAssertion.setEffect(assertion.getEffect());
-                
+
                 // process our assertion resource and role for any requested substitutions
-                
+
                 String resource = assertion.getResource().replace(TEMPLATE_DOMAIN_NAME, domainName);
                 String role = assertion.getRole().replace(TEMPLATE_DOMAIN_NAME, domainName);
                 if (params != null) {
@@ -2717,10 +3710,10 @@ public class DBService {
         templatePolicy.setAssertions(newAssertions);
         return templatePolicy;
     }
-    
+
     ServiceIdentity updateTemplateServiceIdentity(ServiceIdentity serviceIdentity,
             String domainName, List<TemplateParam> params) {
-        
+
         String templateServiceName = serviceIdentity.getName().replace(TEMPLATE_DOMAIN_NAME, domainName);
         if (params != null) {
             for (TemplateParam param : params) {
@@ -2728,15 +3721,15 @@ public class DBService {
                 templateServiceName = templateServiceName.replace(paramKey, param.getValue());
             }
         }
-        
+
         ServiceIdentity templateServiceIdentity = new ServiceIdentity().setName(templateServiceName);
-        
+
         templateServiceIdentity.setDescription(serviceIdentity.getDescription());
         templateServiceIdentity.setExecutable(serviceIdentity.getExecutable());
         templateServiceIdentity.setGroup(serviceIdentity.getGroup());
         templateServiceIdentity.setUser(serviceIdentity.getUser());
         templateServiceIdentity.setProviderEndpoint(serviceIdentity.getProviderEndpoint());
-        
+
         List<PublicKeyEntry> publicKeyEntries = serviceIdentity.getPublicKeys();
         List<PublicKeyEntry> newPublicKeyEntries = new ArrayList<>();
         if (publicKeyEntries != null && !publicKeyEntries.isEmpty()) {
@@ -2748,16 +3741,16 @@ public class DBService {
             }
         }
         templateServiceIdentity.setPublicKeys(newPublicKeyEntries);
-        
+
         List<String> hosts = serviceIdentity.getHosts();
-        
+
         if (hosts != null) {
             templateServiceIdentity.setHosts(new ArrayList<>(hosts));
         }
-        
+
         return templateServiceIdentity;
     }
-    
+
     void setupTenantAdminPolicy(String tenantDomain, String provSvcDomain,
             String provSvcName, String auditRef, String caller) {
 
@@ -2773,7 +3766,7 @@ public class DBService {
 
                 checkDomainAuditEnabled(con, tenantDomain, auditRef, caller, provSvcDomain + "." + provSvcName, AUDIT_TYPE_TENANCY);
 
-                String domainAdminRole = ZMSUtils.roleResourceName(tenantDomain, ZMSConsts.ADMIN_ROLE_NAME);
+                String domainAdminRole = ResourceUtils.roleResourceName(tenantDomain, ZMSConsts.ADMIN_ROLE_NAME);
                 String serviceRoleResourceName = ZMSUtils.getTrustedResourceGroupRolePrefix(provSvcDomain,
                         provSvcName, tenantDomain, null) + ZMSConsts.ADMIN_ROLE_NAME;
 
@@ -2782,7 +3775,7 @@ public class DBService {
                 final String tenancyResource = "tenancy." + provSvcDomain + '.' + provSvcName;
 
                 String adminName = tenancyResource + ".admin";
-                String tenantAdminRole = ZMSUtils.roleResourceName(tenantDomain, adminName);
+                String tenantAdminRole = ResourceUtils.roleResourceName(tenantDomain, adminName);
 
                 // tenant admin role - if it already exists then we skip it
                 // by default it has no members.
@@ -2796,7 +3789,7 @@ public class DBService {
 
                 if (con.getPolicy(tenantDomain, adminName) == null) {
 
-                    Policy adminPolicy = new Policy().setName(ZMSUtils.policyResourceName(tenantDomain, adminName));
+                    Policy adminPolicy = new Policy().setName(ResourceUtils.policyResourceName(tenantDomain, adminName));
                     con.insertPolicy(tenantDomain, adminPolicy);
 
                     // we are going to create 2 assertions - one for the domain admin role
@@ -2836,9 +3829,9 @@ public class DBService {
             }
         }
     }
-    
+
     void executePutTenantRoles(ResourceContext ctx, String provSvcDomain, String provSvcName, String tenantDomain,
-            String resourceGroup, List<TenantRoleAction> roles, String auditRef, String caller) {
+            String resourceGroup, List<TenantRoleAction> roles, boolean ignoreDeletes, String auditRef, String caller) {
 
         // our exception handling code does the check for retry count
         // and throws the exception it had received when the retry
@@ -2864,13 +3857,13 @@ public class DBService {
                     String tenantRole = ra.getRole();
                     String tenantAction = ra.getAction();
                     String trustedRole = trustedRolePrefix + tenantRole;
-                    String trustedName = trustedRole.substring((provSvcDomain + ":role.").length());
+                    String trustedName = trustedRole.substring((provSvcDomain + AuthorityConsts.ROLE_SEP).length());
 
                     Role role = new Role().setName(trustedRole).setTrust(tenantDomain);
 
                     if (LOG.isInfoEnabled()) {
-                        LOG.info(caller + ": add trusted Role to domain " + provSvcDomain +
-                                ": " + trustedRole + " -> " + role);
+                        LOG.info("{}: add trusted Role to domain {}: {} -> {}",
+                                caller, provSvcDomain, trustedRole, role);
                     }
 
                     // retrieve our original role in case one exists
@@ -2883,12 +3876,12 @@ public class DBService {
 
                     auditDetails.append("{\"role\": ");
                     if (!processRole(con, originalRole, provSvcDomain, trustedName, role,
-                            getPrincipalName(ctx), auditRef, false, auditDetails)) {
+                            getPrincipalName(ctx), auditRef, ignoreDeletes, auditDetails)) {
                         con.rollbackChanges();
                         throw ZMSUtils.internalServerError("unable to put role: " + trustedRole, caller);
                     }
 
-                    String policyResourceName = ZMSUtils.policyResourceName(provSvcDomain, trustedName);
+                    String policyResourceName = ResourceUtils.policyResourceName(provSvcDomain, trustedName);
                     final String resourceName = provSvcDomain + ":service." +
                             ZMSUtils.getTenantResourceGroupRolePrefix(provSvcName, tenantDomain, resourceGroup) + '*';
                     List<Assertion> assertions = Collections.singletonList(
@@ -2899,8 +3892,8 @@ public class DBService {
                     Policy policy = new Policy().setName(policyResourceName).setAssertions(assertions);
 
                     if (LOG.isInfoEnabled()) {
-                        LOG.info(caller + ": add trust policy to domain " + provSvcDomain +
-                                ": " + trustedRole + " -> " + policy);
+                        LOG.info("{}: add trust policy to domain {}: {} -> {}",
+                                caller, provSvcDomain, trustedRole, policy);
                     }
 
                     // retrieve our original policy
@@ -2910,7 +3903,7 @@ public class DBService {
                     // now process the request
 
                     auditDetails.append(", \"policy\": ");
-                    if (!processPolicy(con, originalPolicy, provSvcDomain, trustedName, policy, false, auditDetails)) {
+                    if (!processPolicy(con, originalPolicy, provSvcDomain, trustedName, policy, ignoreDeletes, auditDetails)) {
                         con.rollbackChanges();
                         throw ZMSUtils.internalServerError("unable to put policy: " + policy.getName(), caller);
                     }
@@ -2935,30 +3928,30 @@ public class DBService {
             }
         }
     }
-    
+
     void addAssumeRolePolicy(ObjectStoreConnection con, String rolePrefix,
             String trustedRolePrefix, String role, List<RoleMember> roleMembers,
             String tenantDomain, String admin, String auditRef,
             StringBuilder auditDetails, String caller) {
-        
+
         // first create the role in the domain. We're going to create it
         // only if the role does not already exist
-        
+
         String roleName = rolePrefix + role;
-        String roleResourceName = ZMSUtils.roleResourceName(tenantDomain, roleName);
-        
+        String roleResourceName = ResourceUtils.roleResourceName(tenantDomain, roleName);
+
         // retrieve our original role in case one exists
-        
+
         Role originalRole = getRole(con, tenantDomain, roleName, false, false, false);
 
         // we need to add the original role members to the new one
-        
+
         if (originalRole != null && originalRole.getRoleMembers() != null) {
             roleMembers.addAll(originalRole.getRoleMembers());
         }
-        
+
         // now process the request
-        
+
         Role roleObj = new Role().setName(roleResourceName).setRoleMembers(roleMembers);
         auditDetails.append("{\"role\": ");
         if (!processRole(con, originalRole, tenantDomain, roleName, roleObj,
@@ -2966,24 +3959,24 @@ public class DBService {
             con.rollbackChanges();
             throw ZMSUtils.internalServerError("unable to put role: " + roleName, caller);
         }
-        
+
         // now create the corresponding policy. We're going to create it
         // only if the policy does not exist otherwise we'll just
         // add a new assertion
-        
+
         String policyName = "tenancy." + roleName;
-        String policyResourceName = ZMSUtils.policyResourceName(tenantDomain, policyName);
+        String policyResourceName = ResourceUtils.policyResourceName(tenantDomain, policyName);
         String serviceRoleResourceName = trustedRolePrefix + role;
         Assertion assertion = new Assertion().setRole(roleResourceName)
                 .setResource(serviceRoleResourceName).setAction(ZMSConsts.ACTION_ASSUME_ROLE)
                 .setEffect(AssertionEffect.ALLOW);
-        
+
         if (LOG.isInfoEnabled()) {
-            LOG.info("executePutProviderRoles: ---- ASSUME_ROLE policyName is " + policyName);
+            LOG.info("executePutProviderRoles: ---- ASSUME_ROLE policyName is {}", policyName);
         }
-        
+
         // retrieve our original policy
-        
+
         Policy originalPolicy = getPolicy(con, tenantDomain, policyName);
 
         // we need to add the original policy assertions to the new one
@@ -2992,15 +3985,15 @@ public class DBService {
         if (originalPolicy != null && originalPolicy.getAssertions() != null) {
             newAssertions.addAll(originalPolicy.getAssertions());
         }
-        
+
         // if our new assertion is not already in the list then that will be added to
-        
+
         if (!newAssertions.contains(assertion)) {
             newAssertions.add(assertion);
         }
-        
+
         // now process the request
-        
+
         Policy assumeRolePolicy = new Policy().setName(policyResourceName).setAssertions(newAssertions);
 
         auditDetails.append(", \"policy\": ");
@@ -3012,7 +4005,7 @@ public class DBService {
         }
         auditDetails.append('}');
     }
-    
+
     void executePutProviderRoles(ResourceContext ctx, String tenantDomain, String provSvcDomain,
             String provSvcName, String resourceGroup, List<String> roles, String auditRef, String caller) {
 
@@ -3090,14 +4083,14 @@ public class DBService {
             }
         }
     }
-    
+
     void executeDeleteTenancy(ResourceContext ctx, String tenantDomain, String provSvcDomain,
             String provSvcName, String resourceGroup, String auditRef, String caller) {
-        
+
         // create list of policies and delete them from the tenant domain
         // have to get all policies that match "tenant.<provider>.*"
         // ex: tenancy.weather.storage.admin
-        
+
         String rnamePrefix = ZMSUtils.getProviderResourceGroupRolePrefix(provSvcDomain, provSvcName,
                 resourceGroup);
 
@@ -3124,13 +4117,13 @@ public class DBService {
 
                     if (!validResourceGroupObjectToDelete(pname, pnamePrefix)) {
                         if (LOG.isDebugEnabled()) {
-                            LOG.debug(caller + ": --ignore policy " + pname);
+                            LOG.debug("{}: --ignore policy {}", caller, pname);
                         }
                         continue;
                     }
 
                     if (LOG.isInfoEnabled()) {
-                        LOG.info(caller + ": --delete policy " + pname);
+                        LOG.info("{}: --delete policy {}", caller, pname);
                     }
 
                     con.deletePolicy(tenantDomain, pname);
@@ -3145,20 +4138,20 @@ public class DBService {
 
                     if (!validResourceGroupObjectToDelete(rname, rnamePrefix)) {
                         if (LOG.isDebugEnabled()) {
-                            LOG.debug(caller + ": --ignore role " + rname);
+                            LOG.debug("{}: --ignore role {}", caller, rname);
                         }
                         continue;
                     }
 
                     if (!con.listPolicies(tenantDomain, rname).isEmpty()) {
                         if (LOG.isDebugEnabled()) {
-                            LOG.debug(caller + ": --ignore role " + rname + " due to active references");
+                            LOG.debug("{}: --ignore role {} due to active references", caller, rname);
                         }
                         continue;
                     }
 
                     if (LOG.isInfoEnabled()) {
-                        LOG.info(caller + ": --delete role " + rname);
+                        LOG.info("{}: --delete role {}", caller, rname);
                     }
 
                     con.deleteRole(tenantDomain, rname);
@@ -3171,7 +4164,7 @@ public class DBService {
                 // audit log the request
 
                 auditLogRequest(ctx, tenantDomain, auditRef, caller, ZMSConsts.HTTP_DELETE,
-                        ZMSUtils.entityResourceName(provSvcDomain, provSvcName), null);
+                        ResourceUtils.entityResourceName(provSvcDomain, provSvcName), null);
 
                 return;
 
@@ -3184,25 +4177,25 @@ public class DBService {
     }
 
     boolean validResourceGroupObjectToDelete(String name, String prefix) {
-        
+
         if (!name.startsWith(prefix)) {
             return false;
         }
-        
+
         // the suffix must be the action which should only be
         // simple-name thus it cannot contain any more .'s
         // otherwise we don't want to make a mistake
         // and match substring resource groups - e.g:
         // system.engine and system.engine.test
-        
+
         return (name.indexOf('.', prefix.length()) == -1);
     }
-    
+
     void executeDeleteTenantRoles(ResourceContext ctx, String provSvcDomain, String provSvcName,
             String tenantDomain, String resourceGroup, String auditRef, String caller) {
 
         // look for this tenants roles, ex: storage.tenant.sports.reader
-        
+
         String rolePrefix = ZMSUtils.getTenantResourceGroupRolePrefix(provSvcName, tenantDomain, resourceGroup);
 
         // our exception handling code does the check for retry count
@@ -3255,23 +4248,23 @@ public class DBService {
             }
         }
     }
-    
+
     boolean isTrustRoleForTenant(ObjectStoreConnection con, String provSvcDomain, String roleName,
             String rolePrefix, String resourceGroup, String tenantDomain) {
-        
+
         // first make sure the role name starts with the given prefix
-        
+
         if (!isTenantRolePrefixMatch(con, roleName, rolePrefix, resourceGroup, tenantDomain)) {
             return false;
         }
-        
+
         Role role = con.getRole(provSvcDomain, roleName);
         if (role == null) {
             return false;
         }
-        
+
         // ensure it is a trust role for the tenant
-        
+
         String trustDom = role.getTrust();
         return trustDom != null && trustDom.equals(tenantDomain);
 
@@ -3292,17 +4285,17 @@ public class DBService {
             return isTenantRolePrefixMatch(con, roleName, rolePrefix, resourceGroup, tenantDomain);
         }
     }
-    
+
     boolean isTenantRolePrefixMatch(ObjectStoreConnection con, String roleName, String rolePrefix,
             String resourceGroup, String tenantDomain) {
-        
+
         if (LOG.isDebugEnabled()) {
-            LOG.debug("isTenantRolePrefixMatch: role-name=" + roleName + ", role-prefix=" +
-                    rolePrefix + ", reosurce-group=" + resourceGroup + ", tenant-domain=" + tenantDomain);
+            LOG.debug("isTenantRolePrefixMatch: role-name={}, role-prefix={}, resource-group={}, tenant-domain={}",
+                    roleName, rolePrefix, resourceGroup, tenantDomain);
         }
-        
+
         // first make sure the role name starts with the given prefix
-        
+
         if (!roleName.startsWith(rolePrefix)) {
             return false;
         }
@@ -3313,28 +4306,28 @@ public class DBService {
         // action after the name, if we get another '.' then
         // we're dealing with a substring so the role does
         // match the expected format
-        
+
         if (resourceGroup != null) {
             return (roleName.indexOf('.', rolePrefix.length()) == -1);
         }
-        
+
         // otherwise we're going to split the remaining value
         // into components. If we have 2 components then we'll
         // check if we have a domain for the first component
         // if we don't then it's a resource group and as such
         // it can be removed otherwise, we'll leave it alone
-            
+
         String[] comps = roleName.substring(rolePrefix.length()).split("\\.");
         if (comps.length == 2) {
-            
+
             // check to see if we have a subdomain - if we do then
             // we're not going to include this role as we don't know
             // for sure if this for a resource group or not
-            
+
             String subDomain = tenantDomain + "." + comps[0];
-            
+
             if (LOG.isDebugEnabled()) {
-                LOG.debug("isTenantRolePrefixMatch: verifying tenant subdomain: " + subDomain);
+                LOG.debug("isTenantRolePrefixMatch: verifying tenant subdomain: {}", subDomain);
             }
 
             return con.getDomain(subDomain) == null;
@@ -3348,59 +4341,45 @@ public class DBService {
         }
 
     }
-    
-    AthenzDomain getAthenzDomain(String domainName, boolean masterCopy) {
-        
+
+    public AthenzDomain getAthenzDomain(final String domainName, boolean masterCopy) {
+
+        try (ObjectStoreConnection con = store.getConnection(true, masterCopy)) {
+            return getAthenzDomain(con, domainName);
+        }
+    }
+
+    AthenzDomain getAthenzDomain(ObjectStoreConnection con, final String domainName) {
+
         // first check to see if we our data is in the cache
-        
-        AthenzDomain athenzDomain = getAthenzDomainFromCache(domainName, masterCopy);
+
+        AthenzDomain athenzDomain = getAthenzDomainFromCache(con, domainName);
         if (athenzDomain != null) {
             return athenzDomain;
         }
-        
-        try (ObjectStoreConnection con = store.getConnection(true, masterCopy)) {
-            athenzDomain = con.getAthenzDomain(domainName);
-            setMembersInDomain(athenzDomain);
-        }
+
+        athenzDomain = con.getAthenzDomain(domainName);
+        athenzDomain.setRoleMemberPrincipalTypes(zmsConfig.getUserDomainPrefix(), zmsConfig.getAddlUserCheckDomainPrefixList());
 
         DataCache dataCache = new DataCache(athenzDomain,
                 athenzDomain.getDomain().getModified().millis());
         cacheStore.put(domainName, dataCache);
-        
+
         return athenzDomain;
     }
-    
-    private void setMembersInDomain(AthenzDomain athenzDomain) {
-        List<Role> roleList = athenzDomain.getRoles();
-        if (roleList != null) {
-            for (Role role: roleList) {
-                List<RoleMember> roleMembers = role.getRoleMembers();
-                if (roleMembers != null) {
-                    List<String> members = role.getMembers();
-                    if (members  == null) {
-                        members = new ArrayList<>();
-                        role.setMembers(members);
-                    }
-                    for (RoleMember roleMember: roleMembers) {
-                        members.add(roleMember.getMemberName());
-                    }
-                }
-            }
-        }
-    }
-    
-    DomainModifiedList listModifiedDomains(long modifiedSince) {
-        
+
+    DomainMetaList listModifiedDomains(long modifiedSince) {
+
         // since this is the operation executed by ZTS servers to
         // retrieve latest domain changes, we're going to use
         // the read-write store as oppose to read-only store to
         // get our up-to-date data
-        
+
         try (ObjectStoreConnection con = store.getConnection(true, true)) {
             return con.listModifiedDomains(modifiedSince);
         }
     }
-    
+
     boolean auditLogSeparator(StringBuilder auditDetails, boolean firstEntry) {
         if (!firstEntry) {
             auditDetails.append(',');
@@ -3409,7 +4388,7 @@ public class DBService {
         // longer the first entry so we return false
         return false;
     }
-    
+
     void auditLogStrings(StringBuilder auditDetails, String label, Collection<String> values) {
         auditDetails.append(", \"").append(label).append("\": [");
         boolean firstEntry = true;
@@ -3418,27 +4397,72 @@ public class DBService {
         }
         auditDetails.append(']');
     }
-    
+
     boolean auditLogString(StringBuilder auditDetails, String value, boolean firstEntry) {
         firstEntry = auditLogSeparator(auditDetails, firstEntry);
         auditDetails.append('\"').append(value).append('\"');
         return firstEntry;
     }
-    
+
     void auditLogRoleMembers(StringBuilder auditDetails, String label,
             Collection<RoleMember> values) {
         auditDetails.append(", \"").append(label).append("\": [");
         boolean firstEntry = true;
         for (RoleMember value : values) {
-            String entry = value.getMemberName();
-            if (value.getExpiration() != null) {
-                entry = entry + ":" + value.getExpiration().toString();
-            }
-            firstEntry = auditLogString(auditDetails, entry, firstEntry);
+            firstEntry = auditLogRoleMember(auditDetails, value, firstEntry);
         }
         auditDetails.append(']');
     }
-    
+
+    boolean auditLogRoleMember(StringBuilder auditDetails, RoleMember roleMember, boolean firstEntry) {
+        firstEntry = auditLogSeparator(auditDetails, firstEntry);
+        auditDetails.append("{\"member\": \"").append(roleMember.getMemberName()).append('"');
+        if (roleMember.getExpiration() != null) {
+            auditDetails.append(", \"expiration\": \"").append(roleMember.getExpiration().toString()).append('"');
+        }
+        if (roleMember.getReviewReminder() != null) {
+            auditDetails.append(", \"reminder\": \"").append(roleMember.getReviewReminder().toString()).append('"');
+        }
+        auditDetails.append(", \"approved\": ");
+        auditDetails.append(roleMember.getApproved() == Boolean.FALSE ? "false" : "true");
+        auditDetails.append(", \"system-disabled\": ");
+        auditDetails.append(roleMember.getSystemDisabled() == null ? 0 : roleMember.getSystemDisabled());
+        auditDetails.append("}");
+        return firstEntry;
+    }
+
+    void auditLogGroupMembers(StringBuilder auditDetails, String label,
+                             Collection<GroupMember> values) {
+        auditDetails.append(", \"").append(label).append("\": [");
+        boolean firstEntry = true;
+        for (GroupMember value : values) {
+            firstEntry = auditLogGroupMember(auditDetails, value, firstEntry);
+        }
+        auditDetails.append(']');
+    }
+
+    boolean auditLogGroupMember(StringBuilder auditDetails, GroupMember groupMember, boolean firstEntry) {
+        firstEntry = auditLogSeparator(auditDetails, firstEntry);
+        auditDetails.append("{\"member\": \"").append(groupMember.getMemberName()).append('"');
+        if (groupMember.getExpiration() != null) {
+            auditDetails.append(", \"expiration\": \"").append(groupMember.getExpiration().toString()).append('"');
+        }
+        auditDetails.append(", \"approved\": ");
+        auditDetails.append(auditLogBooleanDefault(groupMember.getApproved(), Boolean.FALSE));
+        auditDetails.append(", \"system-disabled\": ");
+        auditDetails.append(groupMember.getSystemDisabled() == null ? 0 : groupMember.getSystemDisabled());
+        auditDetails.append("}");
+        return firstEntry;
+    }
+
+    String auditLogBooleanDefault(Boolean value, Boolean checkValue) {
+        if (checkValue == Boolean.TRUE) {
+            return value == Boolean.TRUE ? "true" : "false";
+        } else {
+            return value == Boolean.FALSE ? "false" : "true";
+        }
+    }
+
     void auditLogPublicKeyEntries(StringBuilder auditDetails, String label,
             List<PublicKeyEntry> values) {
         auditDetails.append(", \"").append(label).append("\": [");
@@ -3448,7 +4472,7 @@ public class DBService {
         }
         auditDetails.append(']');
     }
-    
+
     void auditLogPublicKeyEntries(StringBuilder auditDetails, String label, Set<String> values,
             Map<String, PublicKeyEntry> publicKeysMap) {
         auditDetails.append(", \"").append(label).append("\": [");
@@ -3458,7 +4482,7 @@ public class DBService {
         }
         auditDetails.append(']');
     }
-    
+
     void auditLogPublicKeyEntries(StringBuilder auditDetails, String label, Set<String> values) {
         auditDetails.append(", \"").append(label).append("\": [");
         boolean firstEntry = true;
@@ -3467,20 +4491,29 @@ public class DBService {
         }
         auditDetails.append(']');
     }
-    
+
     boolean auditLogPublicKeyEntry(StringBuilder auditDetails, PublicKeyEntry publicKey, boolean firstEntry) {
         firstEntry = auditLogSeparator(auditDetails, firstEntry);
         auditDetails.append("{\"key\": \"").append(publicKey.getKey())
             .append("\", \"id\": \"").append(publicKey.getId()).append("\"}");
         return firstEntry;
     }
-    
+
     boolean auditLogPublicKeyEntry(StringBuilder auditDetails, String publicKeyId, boolean firstEntry) {
         firstEntry = auditLogSeparator(auditDetails, firstEntry);
         auditDetails.append("{\"id\": \"").append(publicKeyId).append("\"}");
         return firstEntry;
     }
-    
+
+    void auditLogPolicy(StringBuilder auditDetails, Policy policy, String label)  {
+        auditDetails.append("{\"name\": \"").append(policy.getName())
+                .append("\", \"modified\": \"").append(policy.getModified()).append('"');
+        if (policy.getAssertions() != null) {
+            auditLogAssertions(auditDetails, label, policy.getAssertions());
+        }
+        auditDetails.append("}");
+    }
+
     void auditLogAssertions(StringBuilder auditDetails, String label, Collection<Assertion> values) {
         auditDetails.append(", \"").append(label).append("\": [");
         boolean firstEntry = true;
@@ -3489,7 +4522,7 @@ public class DBService {
         }
         auditDetails.append(']');
     }
-    
+
     boolean auditLogAssertion(StringBuilder auditDetails, Assertion assertion, boolean firstEntry) {
         firstEntry = auditLogSeparator(auditDetails, firstEntry);
         String assertionEffect = "ALLOW";
@@ -3503,7 +4536,7 @@ public class DBService {
                 .append("\"}");
         return firstEntry;
     }
-    
+
     void auditLogDomain(StringBuilder auditDetails, Domain domain) {
         auditDetails.append("{\"description\": \"").append(domain.getDescription())
                 .append("\", \"org\": \"").append(domain.getOrg())
@@ -3514,6 +4547,13 @@ public class DBService {
                 .append("\", \"ypmid\": \"").append(domain.getYpmId())
                 .append("\", \"id\": \"").append(domain.getId())
                 .append("\", \"memberExpiryDays\": \"").append(domain.getMemberExpiryDays())
+                .append("\", \"serviceExpiryDays\": \"").append(domain.getServiceExpiryDays())
+                .append("\", \"tokenExpiryMins\": \"").append(domain.getTokenExpiryMins())
+                .append("\", \"serviceCertExpiryMins\": \"").append(domain.getServiceCertExpiryMins())
+                .append("\", \"roleCertExpiryMins\": \"").append(domain.getRoleCertExpiryMins())
+                .append("\", \"signAlgorithm\": \"").append(domain.getSignAlgorithm())
+                .append("\", \"userAuthorityFilter\": \"").append(domain.getUserAuthorityFilter())
+                .append("\", \"businessService\": \"").append(domain.getBusinessService())
                 .append("\"}");
     }
 
@@ -3523,11 +4563,78 @@ public class DBService {
                 .append("\"}");
     }
 
+    void auditLogGroupSystemMeta(StringBuilder auditDetails, Group group, final String groupName) {
+        auditDetails.append("{\"name\": \"").append(groupName)
+                .append("\", \"auditEnabled\": \"").append(group.getAuditEnabled())
+                .append("\"}");
+    }
+
+    void auditLogServiceIdentitySystemMeta(StringBuilder auditDetails, ServiceIdentity service, String serviceName) {
+        auditDetails.append("{\"name\": \"").append(serviceName)
+                .append("\", \"providerEndpoint\": \"").append(service.getProviderEndpoint())
+                .append("\"}");
+    }
+
     void auditLogRoleMeta(StringBuilder auditDetails, Role role, String roleName) {
         auditDetails.append("{\"name\": \"").append(roleName)
-                .append("\", \"selfserve\": \"").append(role.getSelfServe())
+                .append("\", \"selfServe\": \"").append(role.getSelfServe())
                 .append("\", \"memberExpiryDays\": \"").append(role.getMemberExpiryDays())
+                .append("\", \"serviceExpiryDays\": \"").append(role.getServiceExpiryDays())
+                .append("\", \"groupExpiryDays\": \"").append(role.getGroupExpiryDays())
+                .append("\", \"tokenExpiryMins\": \"").append(role.getTokenExpiryMins())
+                .append("\", \"certExpiryMins\": \"").append(role.getCertExpiryMins())
+                .append("\", \"memberReviewDays\": \"").append(role.getMemberReviewDays())
+                .append("\", \"serviceReviewDays\": \"").append(role.getServiceReviewDays())
+                .append("\", \"groupReviewDays\": \"").append(role.getGroupReviewDays())
+                .append("\", \"reviewEnabled\": \"").append(role.getReviewEnabled())
+                .append("\", \"notifyRoles\": \"").append(role.getNotifyRoles())
+                .append("\", \"signAlgorithm\": \"").append(role.getSignAlgorithm())
+                .append("\", \"userAuthorityFilter\": \"").append(role.getUserAuthorityFilter())
+                .append("\", \"userAuthorityExpiration\": \"").append(role.getUserAuthorityExpiration())
                 .append("\"}");
+    }
+
+    void auditLogGroupMeta(StringBuilder auditDetails, Group group, final String groupName) {
+        auditDetails.append("{\"name\": \"").append(groupName)
+                .append("\", \"selfServe\": \"").append(group.getSelfServe())
+                .append("\", \"memberExpiryDays\": \"").append(group.getMemberExpiryDays())
+                .append("\", \"serviceExpiryDays\": \"").append(group.getServiceExpiryDays())
+                .append("\", \"reviewEnabled\": \"").append(group.getReviewEnabled())
+                .append("\", \"notifyRoles\": \"").append(group.getNotifyRoles())
+                .append("\", \"userAuthorityFilter\": \"").append(group.getUserAuthorityFilter())
+                .append("\", \"userAuthorityExpiration\": \"").append(group.getUserAuthorityExpiration())
+                .append("\"}");
+    }
+
+    void auditLogAssertionConditions(StringBuilder auditDetails, List<AssertionCondition> assertionConditions, String label)  {
+        auditDetails.append("{\"").append(label).append("\": [");
+        boolean firstEntry = true;
+        for (AssertionCondition value : assertionConditions) {
+            firstEntry = auditLogAssertionCondition(auditDetails, value, firstEntry);
+        }
+        auditDetails.append("]}");
+    }
+
+    boolean auditLogAssertionCondition(StringBuilder auditDetails, AssertionCondition assertionCondition, boolean firstEntry) {
+
+        firstEntry = auditLogSeparator(auditDetails, firstEntry);
+        auditDetails.append("{\"conditionId\": ").append(assertionCondition.getId())
+                .append(", \"conditionsMap\": {");
+        boolean innerFirstEntry = true;
+        for (String key : assertionCondition.getConditionsMap().keySet()) {
+            innerFirstEntry = auditLogAssertionConditionData(auditDetails, assertionCondition.getConditionsMap().get(key), key, innerFirstEntry);
+        }
+        auditDetails.append("}}");
+        return firstEntry;
+    }
+
+    boolean auditLogAssertionConditionData(StringBuilder auditDetails, AssertionConditionData assertionConditionData, String conditionKey, boolean firstEntry) {
+        firstEntry = auditLogSeparator(auditDetails, firstEntry);
+        auditDetails.append("\"").append(conditionKey)
+                .append("\": {\"operator\": \"").append(assertionConditionData.getOperator().name())
+                .append("\", \"value\": \"").append(assertionConditionData.getValue())
+                .append("\"}");
+        return firstEntry;
     }
 
     void executePutQuota(ResourceContext ctx, String domainName, Quota quota,
@@ -3604,8 +4711,8 @@ public class DBService {
         }
     }
 
-    public void executePutRoleSystemMeta(ResourceContext ctx, String domainName, String roleName,
-           RoleSystemMeta meta, String attribute, boolean deleteAllowed, String auditRef, String caller) {
+    public void executePutRoleSystemMeta(ResourceContext ctx, final String domainName, final String roleName,
+           RoleSystemMeta meta, final String attribute, final String auditRef, final String caller) {
 
         // our exception handling code does the check for retry count
         // and throws the exception it had received when the retry
@@ -3637,12 +4744,24 @@ public class DBService {
                 Role updatedRole = new Role()
                         .setName(originalRole.getName())
                         .setAuditEnabled(originalRole.getAuditEnabled())
-                        .setTrust(originalRole.getTrust());
+                        .setTrust(originalRole.getTrust())
+                        .setSelfServe(originalRole.getSelfServe())
+                        .setMemberExpiryDays(originalRole.getMemberExpiryDays())
+                        .setServiceExpiryDays(originalRole.getServiceExpiryDays())
+                        .setGroupExpiryDays(originalRole.getGroupExpiryDays())
+                        .setGroupReviewDays(originalRole.getGroupReviewDays())
+                        .setTokenExpiryMins(originalRole.getTokenExpiryMins())
+                        .setCertExpiryMins(originalRole.getCertExpiryMins())
+                        .setMemberReviewDays(originalRole.getMemberReviewDays())
+                        .setServiceReviewDays(originalRole.getServiceReviewDays())
+                        .setSignAlgorithm(originalRole.getSignAlgorithm())
+                        .setReviewEnabled(originalRole.getReviewEnabled())
+                        .setNotifyRoles(originalRole.getNotifyRoles());
 
                 // then we're going to apply the updated fields
                 // from the given object
 
-                updateRoleSystemMetaFields(updatedRole, attribute, deleteAllowed, meta);
+                updateRoleSystemMetaFields(con, updatedRole, originalRole, attribute, meta, ctx.getApiName());
 
                 con.updateRole(domainName, updatedRole);
                 saveChanges(con, domainName);
@@ -3665,16 +4784,8 @@ public class DBService {
         }
     }
 
-    void updateRoleMetaFields(Role role, RoleMeta meta) {
-
-        role.setSelfServe(meta.getSelfServe());
-        if (meta.getMemberExpiryDays() != null) {
-            role.setMemberExpiryDays(meta.getMemberExpiryDays());
-        }
-    }
-
-    public void executePutRoleMeta(ResourceContext ctx, String domainName, String roleName, RoleMeta meta,
-            String auditRef, String caller) {
+    public void executePutGroupSystemMeta(ResourceContext ctx, final String domainName, final String groupName,
+                                          GroupSystemMeta meta, final String attribute, final String auditRef) {
 
         // our exception handling code does the check for retry count
         // and throws the exception it had received when the retry
@@ -3684,36 +4795,100 @@ public class DBService {
 
             try (ObjectStoreConnection con = store.getConnection(false, true)) {
 
-                Role originalRole = getRole(con, domainName, roleName, false, false, false);
-                if (originalRole == null) {
+                Domain domain = con.getDomain(domainName);
+                if (domain == null) {
                     con.rollbackChanges();
-                    throw ZMSUtils.notFoundError(caller + ": Unknown role: " + roleName, caller);
+                    throw ZMSUtils.notFoundError(": Unknown domain: " + domainName, ctx.getApiName());
                 }
 
-                checkRoleAuditEnabled(con, originalRole, auditRef, caller, getPrincipalName(ctx));
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domain, auditRef, ctx.getApiName(), getPrincipalName(ctx), AUDIT_TYPE_GROUP);
+
+                if (domain.getAuditEnabled() != Boolean.TRUE) {
+                    throw ZMSUtils.requestError("auditEnabled flag not set for domain: " + domainName +
+                            " to add it on the group: " + groupName, ctx.getApiName());
+                }
+
+                Group originalGroup = getGroup(con, domainName, groupName, false, false);
 
                 // now process the request. first we're going to make a
-                // copy of our role
+                // copy of our group
 
-                Role updatedRole = new Role()
-                        .setName(originalRole.getName())
-                        .setAuditEnabled(originalRole.getAuditEnabled())
-                        .setTrust(originalRole.getTrust())
-                        .setSelfServe(originalRole.getSelfServe())
-                        .setMemberExpiryDays(originalRole.getMemberExpiryDays());
+                Group updatedGroup = new Group()
+                        .setName(originalGroup.getName())
+                        .setAuditEnabled(originalGroup.getAuditEnabled())
+                        .setSelfServe(originalGroup.getSelfServe())
+                        .setReviewEnabled(originalGroup.getReviewEnabled())
+                        .setNotifyRoles(originalGroup.getNotifyRoles())
+                        .setUserAuthorityFilter(originalGroup.getUserAuthorityFilter())
+                        .setUserAuthorityExpiration(originalGroup.getUserAuthorityExpiration())
+                        .setMemberExpiryDays(originalGroup.getMemberExpiryDays())
+                        .setServiceExpiryDays(originalGroup.getServiceExpiryDays());
 
                 // then we're going to apply the updated fields
                 // from the given object
 
-                updateRoleMetaFields(updatedRole, meta);
+                updateGroupSystemMetaFields(updatedGroup, attribute, meta, ctx.getApiName());
 
-                con.updateRole(domainName, updatedRole);
+                con.updateGroup(domainName, updatedGroup);
                 saveChanges(con, domainName);
 
                 // audit log the request
 
                 StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
-                auditLogRoleMeta(auditDetails, updatedRole, roleName);
+                auditLogGroupSystemMeta(auditDetails, updatedGroup, groupName);
+
+                auditLogRequest(ctx, domainName, auditRef, ctx.getApiName(), ZMSConsts.HTTP_PUT,
+                        domainName, auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    public void executePutServiceIdentitySystemMeta(ResourceContext ctx, String domainName, String serviceName,
+            ServiceIdentitySystemMeta meta, String attribute, String auditRef, String caller) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                Domain domain = con.getDomain(domainName);
+                if (domain == null) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.notFoundError(caller + ": Unknown domain: " + domainName, caller);
+                }
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domain, auditRef, caller, getPrincipalName(ctx), AUDIT_TYPE_SERVICE);
+
+                // retrieve our original service identity object
+
+                ServiceIdentity serviceIdentity = getServiceIdentity(con, domainName, serviceName, false);
+
+                // then we're going to apply the updated fields
+                // from the given object
+
+                updateServiceIdentitySystemMetaFields(serviceIdentity, attribute, meta, ctx.getApiName());
+
+                con.updateServiceIdentity(domainName, serviceIdentity);
+                saveChanges(con, domainName);
+
+                // audit log the request
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditLogServiceIdentitySystemMeta(auditDetails, serviceIdentity, serviceName);
 
                 auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
                         domainName, auditDetails.toString());
@@ -3728,22 +4903,1074 @@ public class DBService {
         }
     }
 
+    void updateRoleMetaFields(Role role, RoleMeta meta) {
+
+        if (meta.getSelfServe() != null) {
+            role.setSelfServe(meta.getSelfServe());
+        }
+        if (meta.getMemberExpiryDays() != null) {
+            role.setMemberExpiryDays(meta.getMemberExpiryDays());
+        }
+        if (meta.getServiceExpiryDays() != null) {
+            role.setServiceExpiryDays(meta.getServiceExpiryDays());
+        }
+        if (meta.getGroupExpiryDays() != null) {
+            role.setGroupExpiryDays(meta.getGroupExpiryDays());
+        }
+        if (meta.getGroupReviewDays() != null) {
+            role.setGroupReviewDays(meta.getGroupReviewDays());
+        }
+        if (meta.getTokenExpiryMins() != null) {
+            role.setTokenExpiryMins(meta.getTokenExpiryMins());
+        }
+        if (meta.getCertExpiryMins() != null) {
+            role.setCertExpiryMins(meta.getCertExpiryMins());
+        }
+        if (meta.getSignAlgorithm() != null) {
+            role.setSignAlgorithm(meta.getSignAlgorithm());
+        }
+        if (meta.getReviewEnabled() != null) {
+            role.setReviewEnabled(meta.getReviewEnabled());
+        }
+        if (meta.getNotifyRoles() != null) {
+            role.setNotifyRoles(meta.getNotifyRoles());
+        }
+        if (meta.getMemberReviewDays() != null) {
+            role.setMemberReviewDays(meta.getMemberReviewDays());
+        }
+        if (meta.getServiceReviewDays() != null) {
+            role.setServiceReviewDays(meta.getServiceReviewDays());
+        }
+        if (meta.getUserAuthorityFilter() != null) {
+            role.setUserAuthorityFilter(meta.getUserAuthorityFilter());
+        }
+        if (meta.getUserAuthorityExpiration() != null) {
+            role.setUserAuthorityExpiration(meta.getUserAuthorityExpiration());
+        }
+        if (meta.getTags() != null) {
+            role.setTags(meta.getTags());
+        }
+    }
+
+    public void executePutRoleMeta(ResourceContext ctx, String domainName, String roleName, Role originalRole,
+                                   RoleMeta meta, String auditRef, String caller) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                checkObjectAuditEnabled(con, originalRole.getAuditEnabled(), originalRole.getName(),
+                        auditRef, caller, getPrincipalName(ctx));
+
+                // now process the request. first we're going to make a
+                // copy of our role
+
+                Role updatedRole = new Role()
+                        .setName(originalRole.getName())
+                        .setAuditEnabled(originalRole.getAuditEnabled())
+                        .setTrust(originalRole.getTrust())
+                        .setSelfServe(originalRole.getSelfServe())
+                        .setMemberExpiryDays(originalRole.getMemberExpiryDays())
+                        .setServiceExpiryDays(originalRole.getServiceExpiryDays())
+                        .setGroupExpiryDays(originalRole.getGroupExpiryDays())
+                        .setGroupReviewDays(originalRole.getGroupReviewDays())
+                        .setTokenExpiryMins(originalRole.getTokenExpiryMins())
+                        .setCertExpiryMins(originalRole.getCertExpiryMins())
+                        .setMemberReviewDays(originalRole.getMemberReviewDays())
+                        .setServiceReviewDays(originalRole.getServiceReviewDays())
+                        .setSignAlgorithm(originalRole.getSignAlgorithm())
+                        .setReviewEnabled(originalRole.getReviewEnabled())
+                        .setNotifyRoles(originalRole.getNotifyRoles())
+                        .setUserAuthorityFilter(originalRole.getUserAuthorityFilter())
+                        .setUserAuthorityExpiration(originalRole.getUserAuthorityExpiration())
+                        .setTags(originalRole.getTags());
+
+                // then we're going to apply the updated fields
+                // from the given object
+
+                updateRoleMetaFields(updatedRole, meta);
+
+                con.updateRole(domainName, updatedRole);
+
+                processUpdateRoleTags(updatedRole, originalRole, con, roleName, domainName);
+
+                saveChanges(con, domainName);
+
+                // audit log the request
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditLogRoleMeta(auditDetails, updatedRole, roleName);
+
+                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
+                        domainName, auditDetails.toString());
+
+                // if the role member expiry date or review date has changed then we're going
+                // process all the members in the role and update the expiration and review
+                // date accordingly
+
+                updateRoleMembersDueDates(ctx, con, domainName, roleName, originalRole,
+                        updatedRole, auditRef, caller);
+
+                // if there was a change in the role user attribute filter then we need
+                // to make the necessary changes as well.
+
+                updateRoleMembersSystemDisabledState(ctx, con, domainName, roleName, originalRole,
+                        updatedRole, auditRef, caller);
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    void updateGroupMetaFields(Group group, GroupMeta meta) {
+
+        // these two fields have default values so after validation
+        // we'll never have nulls
+
+        group.setSelfServe(meta.getSelfServe());
+        group.setReviewEnabled(meta.getReviewEnabled());
+
+        if (meta.getNotifyRoles() != null) {
+            group.setNotifyRoles(meta.getNotifyRoles());
+        }
+        if (meta.getUserAuthorityFilter() != null) {
+            group.setUserAuthorityFilter(meta.getUserAuthorityFilter());
+        }
+        if (meta.getUserAuthorityExpiration() != null) {
+            group.setUserAuthorityExpiration(meta.getUserAuthorityExpiration());
+        }
+        if (meta.getMemberExpiryDays() != null) {
+            group.setMemberExpiryDays(meta.getMemberExpiryDays());
+        }
+        if (meta.getServiceExpiryDays() != null) {
+            group.setServiceExpiryDays(meta.getServiceExpiryDays());
+        }
+    }
+
+    public void executePutGroupMeta(ResourceContext ctx, final String domainName, final String groupName,
+                                    GroupMeta meta, final String auditRef) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                Group originalGroup = getGroup(con, domainName, groupName, false, false);
+                if (originalGroup == null) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.notFoundError("Unknown group: " + groupName, ctx.getApiName());
+                }
+
+                checkObjectAuditEnabled(con, originalGroup.getAuditEnabled(), originalGroup.getName(),
+                        auditRef, ctx.getApiName(), getPrincipalName(ctx));
+
+                // now process the request. first we're going to make a
+                // copy of our group
+
+                Group updatedGroup = new Group()
+                        .setName(originalGroup.getName())
+                        .setAuditEnabled(originalGroup.getAuditEnabled())
+                        .setSelfServe(originalGroup.getSelfServe())
+                        .setMemberExpiryDays(originalGroup.getMemberExpiryDays())
+                        .setServiceExpiryDays(originalGroup.getServiceExpiryDays())
+                        .setReviewEnabled(originalGroup.getReviewEnabled())
+                        .setNotifyRoles(originalGroup.getNotifyRoles())
+                        .setUserAuthorityFilter(originalGroup.getUserAuthorityFilter())
+                        .setUserAuthorityExpiration(originalGroup.getUserAuthorityExpiration());
+
+                // then we're going to apply the updated fields
+                // from the given object
+
+                updateGroupMetaFields(updatedGroup, meta);
+
+                // if either the filter or the expiry has been removed we need to make
+                // sure the group is not a member in a role that requires it
+
+                validateGroupUserAuthorityAttrRequirements(con, originalGroup, updatedGroup, ctx.getApiName());
+
+                // update the group in the database
+
+                con.updateGroup(domainName, updatedGroup);
+                saveChanges(con, domainName);
+
+                // audit log the request
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditLogGroupMeta(auditDetails, updatedGroup, groupName);
+
+                auditLogRequest(ctx, domainName, auditRef, ctx.getApiName(), ZMSConsts.HTTP_PUT,
+                        domainName, auditDetails.toString());
+
+                // if the group user authority expiration attribute has changed, we're going
+                // process all the members in the group and update the expiration date accordingly
+
+                updateGroupMembersDueDates(ctx, con, domainName, groupName, originalGroup,
+                        updatedGroup, auditRef);
+
+                // if there was a change in the role user attribute filter then we need
+                // to make the necessary changes as well.
+
+                updateGroupMembersSystemDisabledState(ctx, con, domainName, groupName, originalGroup,
+                        updatedGroup, auditRef);
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    String getDomainUserAuthorityFilterFromMap(ObjectStoreConnection con, Map<String, String> domainFitlerMap, final String domainName) {
+        String domainUserAuthorityFilter = domainFitlerMap.get(domainName);
+        if (domainUserAuthorityFilter == null) {
+            final String domainFilter = getDomainUserAuthorityFilter(con, domainName);
+            domainUserAuthorityFilter = domainFilter == null ? "" : domainFilter;
+            domainFitlerMap.put(domainName, domainUserAuthorityFilter);
+        }
+        return domainUserAuthorityFilter;
+    }
+
+    void validateGroupUserAuthorityAttrRequirements(ObjectStoreConnection con, Group originalGroup, Group updatedGroup,
+                                                    final String caller)  {
+
+        // check to see if the attribute filter or expiration values have been removed
+
+        boolean filterRemoved = ZMSUtils.userAuthorityAttrMissing(originalGroup.getUserAuthorityFilter(),
+                updatedGroup.getUserAuthorityFilter());
+        boolean expiryRemoved = ZMSUtils.userAuthorityAttrMissing(originalGroup.getUserAuthorityExpiration(),
+                updatedGroup.getUserAuthorityExpiration());
+
+        // if nothing was removed then we're done with our checks
+
+        if (!filterRemoved && !expiryRemoved) {
+            return;
+        }
+
+        // obtain all the roles that have the given group as member
+        // if we get back 404 then the group is not a member of any
+        // role which is success otherwise we'll re-throw the exception
+
+        DomainRoleMember domainRoleMember;
+        try {
+            domainRoleMember = con.getPrincipalRoles(updatedGroup.getName(), null);
+        } catch (ResourceException ex) {
+            if (ex.getCode() == ResourceException.NOT_FOUND) {
+                return;
+            }
+            throw ex;
+        }
+
+        Map<String, String> domainFitlerMap = new HashMap<>();
+        for (MemberRole memberRole : domainRoleMember.getMemberRoles()) {
+
+            // first let's fetch the role and skip if it doesn't exist
+            // (e.g. got deleted right after we run the query)
+
+            Role role = con.getRole(memberRole.getDomainName(), memberRole.getRoleName());
+            if (role == null) {
+                continue;
+            }
+
+            // first process if the user attribute filter was removed
+
+            if (filterRemoved) {
+
+                // if the user attribute filter is removed, then we need to
+                // also obtain the domain level setting
+
+                String domainUserAuthorityFilter = getDomainUserAuthorityFilterFromMap(con, domainFitlerMap, memberRole.getDomainName());
+                final String roleUserAuthorityFilter = ZMSUtils.combineUserAuthorityFilters(role.getUserAuthorityFilter(),
+                        domainUserAuthorityFilter);
+                if (ZMSUtils.userAuthorityAttrMissing(roleUserAuthorityFilter, updatedGroup.getUserAuthorityFilter())) {
+                    throw ZMSUtils.requestError("Setting " + updatedGroup.getUserAuthorityFilter() +
+                            " user authority filter on the group will not satisfy "
+                            + ResourceUtils.roleResourceName(memberRole.getDomainName(), memberRole.getRoleName())
+                            + " role filter requirements", caller);
+                }
+            }
+
+            // now process if the expiry attribute was removed
+
+            if (expiryRemoved) {
+                if (ZMSUtils.userAuthorityAttrMissing(role.getUserAuthorityExpiration(), updatedGroup.getUserAuthorityExpiration())) {
+                    throw ZMSUtils.requestError("Setting " + updatedGroup.getUserAuthorityExpiration() +
+                            " user authority expiration on the group will not satisfy "
+                            + ResourceUtils.roleResourceName(memberRole.getDomainName(), memberRole.getRoleName())
+                            + " role expiration requirements", caller);
+                }
+            }
+        }
+    }
+
+    private boolean isEarlierDueDate(long newDueDateMillis, Timestamp currentDueDate) {
+        return newDueDateMillis != 0 && (currentDueDate == null || currentDueDate.millis() > newDueDateMillis);
+    }
+
+    int getMemberUserAuthorityState(final String roleMemberName, final String authorityFilter, int currentState) {
+
+        boolean bUser = ZMSUtils.isUserDomainPrincipal(roleMemberName, zmsConfig.getUserDomainPrefix(),
+                zmsConfig.getAddlUserCheckDomainPrefixList());
+
+        // if we have a user then we'll check if the filter is still valid
+        // for the user. for services, we just ignore from any checks
+
+        int newState;
+        if (bUser) {
+            if (ZMSUtils.isUserAuthorityFilterValid(zmsConfig.getUserAuthority(), authorityFilter, roleMemberName)) {
+                newState = currentState & ~ZMSConsts.ZMS_DISABLED_AUTHORITY_FILTER;
+            } else {
+                newState = currentState | ZMSConsts.ZMS_DISABLED_AUTHORITY_FILTER;
+            }
+        } else {
+            newState = currentState;
+        }
+        return newState;
+    }
+
+    boolean updateUserAuthorityFilter(RoleMember roleMember, final String userAuthorityFilter) {
+
+        int currentState = roleMember.getSystemDisabled() == null ? 0 : roleMember.getSystemDisabled();
+        int newState = getMemberUserAuthorityState(roleMember.getMemberName(), userAuthorityFilter, currentState);
+
+        if (newState != currentState) {
+            roleMember.setSystemDisabled(newState);
+            return true;
+        }
+        return false;
+    }
+
+    boolean updateUserAuthorityFilter(GroupMember groupMember, final String userAuthorityFilter) {
+
+        int currentState = groupMember.getSystemDisabled() == null ? 0 : groupMember.getSystemDisabled();
+        int newState = getMemberUserAuthorityState(groupMember.getMemberName(), userAuthorityFilter, currentState);
+
+        if (newState != currentState) {
+            groupMember.setSystemDisabled(newState);
+            return true;
+        }
+        return false;
+    }
+
+    <T> boolean updateUserAuthorityExpiry(T member, final String userAuthorityExpiry,
+                                          Function<T, Timestamp> expirationGetter,
+                                          BiConsumer<T, Timestamp> expirationSetter,
+                                          Function<T, String> nameGetter) {
+
+        // if we have a service then there is no processing taking place
+        // as the service is not managed by the user authority
+
+        if (!ZMSUtils.isUserDomainPrincipal(nameGetter.apply(member), zmsConfig.getUserDomainPrefix(),
+                zmsConfig.getAddlUserCheckDomainPrefixList())) {
+            return false;
+        }
+
+        Date authorityExpiry = zmsConfig.getUserAuthority().getDateAttribute(nameGetter.apply(member), userAuthorityExpiry);
+
+        // if we don't have a date then we'll expiry the user right away
+        // otherwise we'll set the date as imposed by the user authority
+
+        boolean expiryDateUpdated = false;
+        Timestamp memberExpiry = expirationGetter.apply(member);
+
+        if (authorityExpiry == null) {
+
+            // we'll update the expiration date to be the current time
+            // if the user doesn't have one or it's expires sometime
+            // in the future
+
+            if (memberExpiry == null || memberExpiry.millis() > System.currentTimeMillis()) {
+                expirationSetter.accept(member, Timestamp.fromCurrentTime());
+                expiryDateUpdated = true;
+            }
+        } else {
+
+            // update the expiration date if it does not match to the
+            // value specified by the user authority value
+
+            if (memberExpiry == null || memberExpiry.millis() != authorityExpiry.getTime()) {
+                expirationSetter.accept(member, Timestamp.fromDate(authorityExpiry));
+                expiryDateUpdated = true;
+            }
+        }
+        return expiryDateUpdated;
+    }
+
+    boolean updateUserAuthorityExpiry(RoleMember roleMember, final String userAuthorityExpiry) {
+        return updateUserAuthorityExpiry(roleMember,
+                userAuthorityExpiry,
+                member -> member.getExpiration(),
+                (member, timestamp) -> member.setExpiration(timestamp),
+                member -> member.getMemberName());
+    }
+
+    boolean updateUserAuthorityExpiry(GroupMember groupMember, final String userAuthorityExpiry) {
+        return updateUserAuthorityExpiry(groupMember,
+                userAuthorityExpiry,
+                member -> member.getExpiration(),
+                (member, timestamp) -> member.setExpiration(timestamp),
+                member -> member.getMemberName());
+    }
+
+    List<RoleMember> getRoleMembersWithUpdatedDisabledState(List<RoleMember> roleMembers, final String roleUserAuthorityFilter,
+                                                            final String domainUserAuthorityFilter) {
+
+        List<RoleMember> roleMembersWithUpdatedDisabledStates = new ArrayList<>();
+
+        // combine the user and domain authority lists to have a single value
+
+        final String userAuthorityFilter = ZMSUtils.combineUserAuthorityFilters(roleUserAuthorityFilter,
+                domainUserAuthorityFilter);
+
+        // if the authority filter is null or empty then we're going to go
+        // through all of the members and remove the system disabled bit
+        // set for user authority
+
+        for (RoleMember roleMember : roleMembers) {
+
+            int currentState = roleMember.getSystemDisabled() == null ? 0 : roleMember.getSystemDisabled();
+
+            // if the filter is disabled then we're going through the list and
+            // make sure the disabled bit for the filter is unset
+
+            int newState;
+            if (userAuthorityFilter == null) {
+                newState = currentState & ~ZMSConsts.ZMS_DISABLED_AUTHORITY_FILTER;
+            } else {
+                newState = getMemberUserAuthorityState(roleMember.getMemberName(), userAuthorityFilter, currentState);
+            }
+
+            if (newState != currentState) {
+                roleMember.setSystemDisabled(newState);
+                roleMembersWithUpdatedDisabledStates.add(roleMember);
+            }
+        }
+
+        return roleMembersWithUpdatedDisabledStates;
+    }
+
+    List<GroupMember> getGroupMembersWithUpdatedDisabledState(List<GroupMember> groupMembers,
+                                                              final String groupUserAuthorityFilter,
+                                                              final String domainUserAuthorityFilter) {
+
+        List<GroupMember> groupMembersWithUpdatedDisabledStates = new ArrayList<>();
+
+        // combine the user and domain authority lists to have a single value
+
+        final String userAuthorityFilter = ZMSUtils.combineUserAuthorityFilters(groupUserAuthorityFilter,
+                domainUserAuthorityFilter);
+
+        // if the authority filter is null or empty then we're going to go
+        // through all of the members and remove the system disabled bit
+        // set for user authority
+
+        for (GroupMember groupMember : groupMembers) {
+
+            int currentState = groupMember.getSystemDisabled() == null ? 0 : groupMember.getSystemDisabled();
+
+            // if the filter is disabled then we're going through the list and
+            // make sure the disabled bit for the filter is unset
+
+            int newState;
+            if (userAuthorityFilter == null) {
+                newState = currentState & ~ZMSConsts.ZMS_DISABLED_AUTHORITY_FILTER;
+            } else {
+                newState = getMemberUserAuthorityState(groupMember.getMemberName(), userAuthorityFilter, currentState);
+            }
+
+            if (newState != currentState) {
+                groupMember.setSystemDisabled(newState);
+                groupMembersWithUpdatedDisabledStates.add(groupMember);
+            }
+        }
+
+        return groupMembersWithUpdatedDisabledStates;
+    }
+
+    List<GroupMember> getGroupMembersWithUpdatedDueDates(List<GroupMember> groupMembers, Timestamp userExpiration,
+                                                         long userExpiryMillis, Timestamp serviceExpiration, long serviceExpiryMillis,
+                                                         final String userAuthorityExpiry) {
+
+        return getMembersWithUpdatedDueDates(
+                groupMembers,
+                userExpiration,
+                userExpiryMillis,
+                serviceExpiration,
+                serviceExpiryMillis,
+                null,
+                0,
+                null,
+                0,
+                null,
+                0,
+                userAuthorityExpiry,
+                null,
+                0,
+                member -> member.getExpiration(),
+                member -> null,
+                (member, timestamp) -> member.setExpiration(timestamp),
+                (member, timestamp) -> { },
+                member -> member.getMemberName());
+    }
+
+    <T> List<T> getMembersWithUpdatedDueDates(List<T> members, Timestamp userExpiration,
+                                          long userExpiryMillis, Timestamp serviceExpiration, long serviceExpiryMillis,
+                                          Timestamp groupExpiration, long groupExpiryMillis, Timestamp userReview,
+                                          long userReviewMillis, Timestamp serviceReview, long serviceReviewMillis,
+                                              final String userAuthorityExpiry, Timestamp groupReview, long groupReviewMillis,
+                                              Function<T, Timestamp> expirationGetter,
+                                              Function<T, Timestamp> reviewReminderGetter,
+                                              BiConsumer<T, Timestamp> expirationSetter,
+                                              BiConsumer<T, Timestamp> reviewReminderSetter,
+                                              Function<T, String> nameGetter) {
+        List<T> membersWithUpdatedDueDates = new ArrayList<>();
+        for (T member : members) {
+            Timestamp expiration = expirationGetter.apply(member);
+            Timestamp reviewDate = reviewReminderGetter.apply(member);
+            boolean dueDateUpdated = false;
+
+            switch (ZMSUtils.principalType(nameGetter.apply(member), zmsConfig.getUserDomainPrefix(),
+                    zmsConfig.getAddlUserCheckDomainPrefixList())) {
+
+                case USER:
+
+                    if (isEarlierDueDate(userExpiryMillis, expiration)) {
+                        expirationSetter.accept(member, userExpiration);
+                        dueDateUpdated = true;
+                    }
+                    if (isEarlierDueDate(userReviewMillis, reviewDate)) {
+                        reviewReminderSetter.accept(member, userReview);
+                        dueDateUpdated = true;
+                    }
+
+                    // if we have a user filter and/or expiry configured we need
+                    // to make sure that the user still satisfies the filter
+                    // otherwise we'll just expire the user right away
+
+                    if (userAuthorityExpiry != null && updateUserAuthorityExpiry(
+                            member,
+                            userAuthorityExpiry,
+                            expirationGetter,
+                            expirationSetter,
+                            nameGetter)) {
+                        dueDateUpdated = true;
+                    }
+
+                    break;
+
+                case GROUP:
+
+                    if (isEarlierDueDate(groupExpiryMillis, expiration)) {
+                        expirationSetter.accept(member, groupExpiration);
+                        dueDateUpdated = true;
+                    }
+                    if (isEarlierDueDate(groupReviewMillis, reviewDate)) {
+                        reviewReminderSetter.accept(member, groupReview);
+                        dueDateUpdated = true;
+                    }
+                    break;
+
+                case SERVICE:
+
+                    if (isEarlierDueDate(serviceExpiryMillis, expiration)) {
+                        expirationSetter.accept(member, serviceExpiration);
+                        dueDateUpdated = true;
+                    }
+                    if (isEarlierDueDate(serviceReviewMillis, reviewDate)) {
+                        reviewReminderSetter.accept(member, serviceReview);
+                        dueDateUpdated = true;
+                    }
+                    break;
+            }
+
+            if (dueDateUpdated) {
+                membersWithUpdatedDueDates.add(member);
+            }
+        }
+
+        return membersWithUpdatedDueDates;
+    }
+
+    List<RoleMember> getRoleMembersWithUpdatedDueDates(List<RoleMember> roleMembers, Timestamp userExpiration,
+            long userExpiryMillis, Timestamp serviceExpiration, long serviceExpiryMillis,
+            Timestamp groupExpiration, long groupExpiryMillis, Timestamp userReview,
+            long userReviewMillis, Timestamp serviceReview, long serviceReviewMillis,
+            final String userAuthorityExpiry, Timestamp groupReview, long groupReviewMillis) {
+
+        return getMembersWithUpdatedDueDates(
+                roleMembers,
+                userExpiration,
+                userExpiryMillis,
+                serviceExpiration,
+                serviceExpiryMillis,
+                groupExpiration,
+                groupExpiryMillis,
+                userReview,
+                userReviewMillis,
+                serviceReview,
+                serviceReviewMillis,
+                userAuthorityExpiry,
+                groupReview,
+                groupReviewMillis,
+                member -> member.getExpiration(),
+                member -> member.getReviewReminder(),
+                (member, timestamp) -> member.setExpiration(timestamp),
+                (member, timestamp) -> member.setReviewReminder(timestamp),
+                member -> member.getMemberName());
+    }
+
+    private boolean insertRoleMembers(ResourceContext ctx, ObjectStoreConnection con, List<RoleMember> roleMembers,
+                                      final String domainName, final String roleName, final String principal,
+                                      final String auditRef, final String caller) {
+
+        boolean bDataChanged = false;
+        for (RoleMember roleMember : roleMembers) {
+            try {
+                if (!con.insertRoleMember(domainName, roleName, roleMember, principal, auditRef)) {
+                    LOG.error("unable to update member {}", roleMember.getMemberName());
+                    continue;
+                }
+            } catch (Exception ex) {
+                LOG.error("unable to update member {} error: {}", roleMember.getMemberName(), ex.getMessage());
+                continue;
+            }
+
+            // audit log the request
+
+            StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+            auditLogRoleMember(auditDetails, roleMember, true);
+            auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT, roleName,
+                    auditDetails.toString());
+
+            bDataChanged = true;
+        }
+
+        return bDataChanged;
+    }
+
+    boolean insertGroupMembers(ResourceContext ctx, ObjectStoreConnection con, List<GroupMember> groupMembers,
+                               final String domainName, final String groupName, final String principal,
+                               final String auditRef, final String caller) {
+
+        boolean bDataChanged = false;
+        for (GroupMember groupMember : groupMembers) {
+            try {
+                if (!con.insertGroupMember(domainName, groupName, groupMember, principal, auditRef)) {
+                    LOG.error("unable to update group member {}", groupMember.getMemberName());
+                    continue;
+                }
+            } catch (Exception ex) {
+                LOG.error("unable to update member {} error: {}", groupMember.getMemberName(), ex.getMessage());
+                continue;
+            }
+
+            // audit log the request
+
+            StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+            auditLogGroupMember(auditDetails, groupMember, true);
+            auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT, groupName,
+                    auditDetails.toString());
+
+            bDataChanged = true;
+        }
+
+        return bDataChanged;
+    }
+
+    boolean updateRoleMemberDisabledState(ResourceContext ctx, ObjectStoreConnection con, List<RoleMember> roleMembers,
+                                          final String domainName, final String roleName, final String principal,
+                                          final String auditRef, final String caller) {
+
+        boolean bDataChanged = false;
+        for (RoleMember roleMember : roleMembers) {
+            try {
+                if (!con.updateRoleMemberDisabledState(domainName, roleName, roleMember.getMemberName(), principal,
+                        roleMember.getSystemDisabled(), auditRef)) {
+                    LOG.error("unable to update member {}", roleMember.getMemberName());
+                    continue;
+                }
+            } catch (Exception ex) {
+                LOG.error("unable to update member {} error: {}", roleMember.getMemberName(), ex.getMessage());
+                continue;
+            }
+
+            // audit log the request
+
+            StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+            auditLogRoleMember(auditDetails, roleMember, true);
+            auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT, roleName,
+                    auditDetails.toString());
+
+            bDataChanged = true;
+        }
+
+        return bDataChanged;
+    }
+
+    boolean updateGroupMemberDisabledState(ResourceContext ctx, ObjectStoreConnection con, List<GroupMember> groupMembers,
+                                           final String domainName, final String groupName, final String principal,
+                                           final String auditRef, final String caller) {
+
+        boolean bDataChanged = false;
+        for (GroupMember groupMember : groupMembers) {
+            try {
+                if (!con.updateGroupMemberDisabledState(domainName, groupName, groupMember.getMemberName(), principal,
+                        groupMember.getSystemDisabled(), auditRef)) {
+                    LOG.error("unable to update group member {}", groupMember.getMemberName());
+                    continue;
+                }
+            } catch (Exception ex) {
+                LOG.error("unable to update group member {} error: {}", groupMember.getMemberName(), ex.getMessage());
+                continue;
+            }
+
+            // audit log the request
+
+            StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+            auditLogGroupMember(auditDetails, groupMember, true);
+            auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT, groupName,
+                    auditDetails.toString());
+
+            bDataChanged = true;
+        }
+
+        return bDataChanged;
+    }
+
+    boolean isUserAuthorityExpiryChanged(String originalValue, String newValue) {
+
+        // if we don't have a user authority defined then
+        // we assume there are no changes
+
+        if (zmsConfig.getUserAuthority() == null) {
+            return false;
+        }
+
+        // first let's make sure if we're given empty strings
+        // we treat them as nulls
+
+        if (originalValue != null && originalValue.isEmpty()) {
+            originalValue = null;
+        }
+        if (newValue != null && newValue.isEmpty()) {
+            newValue = null;
+        }
+
+        // we're only concerned if the value was either set or changed
+        // if the value was set and now was unset, it has no impact
+        // on the existing members so we're going to treat that as
+        // if the setting was not changed
+
+        if (newValue == null) {
+            return false;
+        } else {
+            return originalValue == null || !originalValue.equalsIgnoreCase(newValue);
+        }
+    }
+
+    boolean isUserAuthorityFilterChanged(String originalValue, String newValue) {
+
+        // if we don't have a user authority defined then
+        // we assume there are no changes
+
+        if (zmsConfig.getUserAuthority() == null) {
+            return false;
+        }
+
+        // first let's make sure if we're given empty strings
+        // we treat them as nulls
+
+        if (originalValue != null && originalValue.isEmpty()) {
+            originalValue = null;
+        }
+        if (newValue != null && newValue.isEmpty()) {
+            newValue = null;
+        }
+
+        if (newValue == null && originalValue == null) {
+            return false;
+        } else if (newValue == null || originalValue == null) {
+            return true;
+        } else {
+            return !originalValue.equalsIgnoreCase(newValue);
+        }
+    }
+
+    void updateRoleMembersSystemDisabledState(ResourceContext ctx, ObjectStoreConnection con, final String domainName,
+                                              final String roleName, Role originalRole, Role updatedRole,
+                                              final String auditRef, final String caller) {
+
+        // if it's a delegated role then we have nothing to do
+
+        if (originalRole.getTrust() != null && !originalRole.getTrust().isEmpty()) {
+            return;
+        }
+
+        // if no role members, then there is nothing to do
+
+        final List<RoleMember> roleMembers = originalRole.getRoleMembers();
+        if (roleMembers == null || roleMembers.isEmpty()) {
+            return;
+        }
+
+        // check if the authority filter has changed otherwise we have
+        // nothing to do
+
+        if (!isUserAuthorityFilterChanged(originalRole.getUserAuthorityFilter(), updatedRole.getUserAuthorityFilter())) {
+            return;
+        }
+
+        final String principal = getPrincipalName(ctx);
+
+        // process our role members and if there were any changes processed then update
+        // our role and domain time-stamps, and invalidate local cache entry
+
+        List<RoleMember> roleMembersWithUpdatedDisabledState = getRoleMembersWithUpdatedDisabledState(roleMembers,
+                updatedRole.getUserAuthorityFilter(), getDomainUserAuthorityFilter(con, domainName));
+        if (updateRoleMemberDisabledState(ctx, con, roleMembersWithUpdatedDisabledState, domainName,
+                roleName, principal, auditRef, caller)) {
+
+            // update our role and domain time-stamps, and invalidate local cache entry
+
+            con.updateRoleModTimestamp(domainName, roleName);
+            con.updateDomainModTimestamp(domainName);
+            cacheStore.invalidate(domainName);
+        }
+    }
+
+    void updateGroupMembersSystemDisabledState(ResourceContext ctx, ObjectStoreConnection con, final String domainName,
+                                               final String groupName, Group originalGroup, Group updatedGroup, final String auditRef) {
+
+        // if no group members, then there is nothing to do
+
+        final List<GroupMember> groupMembers = originalGroup.getGroupMembers();
+        if (groupMembers == null || groupMembers.isEmpty()) {
+            return;
+        }
+
+        // check if the authority filter has changed otherwise we have
+        // nothing to do
+
+        if (!isUserAuthorityFilterChanged(originalGroup.getUserAuthorityFilter(), updatedGroup.getUserAuthorityFilter())) {
+            return;
+        }
+
+        final String principal = getPrincipalName(ctx);
+
+        // process our group members and if there were any changes processed then update
+        // our group and domain time-stamps, and invalidate local cache entry
+
+        List<GroupMember> groupMembersWithUpdatedDisabledState = getGroupMembersWithUpdatedDisabledState(groupMembers,
+                updatedGroup.getUserAuthorityFilter(), getDomainUserAuthorityFilter(con, domainName));
+        if (updateGroupMemberDisabledState(ctx, con, groupMembersWithUpdatedDisabledState, domainName,
+                groupName, principal, auditRef, ctx.getApiName())) {
+
+            // update our group and domain time-stamps, and invalidate local cache entry
+
+            con.updateGroupModTimestamp(domainName, groupName);
+            con.updateDomainModTimestamp(domainName);
+            cacheStore.invalidate(domainName);
+        }
+    }
+
+    String getDomainUserAuthorityFilter(ObjectStoreConnection con, final String domainName) {
+        Domain domain = con.getDomain(domainName);
+        if (domain == null) {
+            return null;
+        }
+        return domain.getUserAuthorityFilter();
+    }
+
+    void updateGroupMembersDueDates(ResourceContext ctx, ObjectStoreConnection con, final String domainName,
+                                    final String groupName, Group originalGroup, Group updatedGroup, final String auditRef) {
+
+        // if no group members, then there is nothing to do
+
+        final List<GroupMember> groupMembers = originalGroup.getGroupMembers();
+        if (groupMembers == null || groupMembers.isEmpty()) {
+            return;
+        }
+
+        // check if the user authority expiration attribute has been
+        // changed in which case we need to verify and update members
+        // accordingly
+
+        boolean userAuthorityExpiryChanged = isUserAuthorityExpiryChanged(originalGroup.getUserAuthorityExpiration(), updatedGroup.getUserAuthorityExpiration());
+
+        // we only need to process the group members if the new due date
+        // is more restrictive than what we had before
+
+        boolean userMemberExpiryDayReduced = isNumOfDaysReduced(originalGroup.getMemberExpiryDays(),
+                updatedGroup.getMemberExpiryDays());
+        boolean serviceMemberExpiryDayReduced = isNumOfDaysReduced(originalGroup.getServiceExpiryDays(),
+                updatedGroup.getServiceExpiryDays());
+
+        if (!userMemberExpiryDayReduced && !serviceMemberExpiryDayReduced && !userAuthorityExpiryChanged) {
+            return;
+        }
+
+        // we're only going to process those role members whose
+        // due date is either not set or longer than the new limit
+
+        long userExpiryMillis = userMemberExpiryDayReduced ? System.currentTimeMillis()
+                + TimeUnit.MILLISECONDS.convert(updatedGroup.getMemberExpiryDays(), TimeUnit.DAYS) : 0;
+        long serviceExpiryMillis = serviceMemberExpiryDayReduced ? System.currentTimeMillis()
+                + TimeUnit.MILLISECONDS.convert(updatedGroup.getServiceExpiryDays(), TimeUnit.DAYS) : 0;
+
+        Timestamp userExpiration = Timestamp.fromMillis(userExpiryMillis);
+        Timestamp serviceExpiration = Timestamp.fromMillis(serviceExpiryMillis);
+
+        final String principal = getPrincipalName(ctx);
+
+        // process our group members and if there were any changes processed then update
+        // our group and domain time-stamps, and invalidate local cache entry
+        final String userAuthorityExpiry = userAuthorityExpiryChanged ? updatedGroup.getUserAuthorityExpiration() : null;
+        List<GroupMember> groupMembersWithUpdatedDueDates = getGroupMembersWithUpdatedDueDates(groupMembers,
+                userExpiration, userExpiryMillis, serviceExpiration, serviceExpiryMillis, userAuthorityExpiry);
+        if (insertGroupMembers(ctx, con, groupMembersWithUpdatedDueDates, domainName,
+                groupName, principal, auditRef, ctx.getApiName())) {
+
+            // update our group and domain time-stamps, and invalidate local cache entry
+
+            con.updateGroupModTimestamp(domainName, groupName);
+            con.updateDomainModTimestamp(domainName);
+            cacheStore.invalidate(domainName);
+        }
+    }
+
+    void updateRoleMembersDueDates(ResourceContext ctx, ObjectStoreConnection con, final String domainName,
+            final String roleName, Role originalRole, Role updatedRole, final String auditRef, final String caller) {
+
+        // if it's a delegated role then we have nothing to do
+
+        if (originalRole.getTrust() != null && !originalRole.getTrust().isEmpty()) {
+            return;
+        }
+
+        // if no role members, then there is nothing to do
+
+        final List<RoleMember> roleMembers = originalRole.getRoleMembers();
+        if (roleMembers == null || roleMembers.isEmpty()) {
+            return;
+        }
+
+        // check if the user authority expiration attribute has been
+        // changed in which case we need to verify and update members
+        // accordingly
+
+        boolean userAuthorityExpiryChanged = isUserAuthorityExpiryChanged(originalRole.getUserAuthorityExpiration(),
+                updatedRole.getUserAuthorityExpiration());
+
+        // we only need to process the role members if the new due date
+        // is more restrictive than what we had before
+
+        boolean userMemberExpiryDayReduced = isNumOfDaysReduced(originalRole.getMemberExpiryDays(),
+                updatedRole.getMemberExpiryDays());
+        boolean serviceMemberExpiryDayReduced = isNumOfDaysReduced(originalRole.getServiceExpiryDays(),
+                updatedRole.getServiceExpiryDays());
+        boolean groupMemberExpiryDayReduced = isNumOfDaysReduced(originalRole.getGroupExpiryDays(),
+                updatedRole.getGroupExpiryDays());
+
+         boolean userMemberReviewDayReduced = isNumOfDaysReduced(originalRole.getMemberReviewDays(),
+                 updatedRole.getMemberReviewDays());
+         boolean serviceMemberReviewDayReduced = isNumOfDaysReduced(originalRole.getServiceReviewDays(),
+                 updatedRole.getServiceReviewDays());
+        boolean groupMemberReviewDayReduced = isNumOfDaysReduced(originalRole.getGroupReviewDays(),
+                updatedRole.getGroupReviewDays());
+
+        if (!userMemberExpiryDayReduced && !serviceMemberExpiryDayReduced &&
+                !groupMemberExpiryDayReduced && !userMemberReviewDayReduced &&
+                !serviceMemberReviewDayReduced && !userAuthorityExpiryChanged &&
+                !groupMemberReviewDayReduced) {
+            return;
+        }
+
+        // we're only going to process those role members whose
+        // due date is either not set or longer than the new limit
+
+        long userExpiryMillis = userMemberExpiryDayReduced ? System.currentTimeMillis()
+                + TimeUnit.MILLISECONDS.convert(updatedRole.getMemberExpiryDays(), TimeUnit.DAYS) : 0;
+        long serviceExpiryMillis = serviceMemberExpiryDayReduced ? System.currentTimeMillis()
+                + TimeUnit.MILLISECONDS.convert(updatedRole.getServiceExpiryDays(), TimeUnit.DAYS) : 0;
+        long groupExpiryMillis = groupMemberExpiryDayReduced ? System.currentTimeMillis()
+                + TimeUnit.MILLISECONDS.convert(updatedRole.getGroupExpiryDays(), TimeUnit.DAYS) : 0;
+
+         long userReviewMillis = userMemberReviewDayReduced ? System.currentTimeMillis()
+                 + TimeUnit.MILLISECONDS.convert(updatedRole.getMemberReviewDays(), TimeUnit.DAYS) : 0;
+         long serviceReviewMillis = serviceMemberReviewDayReduced ? System.currentTimeMillis()
+                 + TimeUnit.MILLISECONDS.convert(updatedRole.getServiceReviewDays(), TimeUnit.DAYS) : 0;
+        long groupReviewMillis = groupMemberReviewDayReduced ? System.currentTimeMillis()
+                + TimeUnit.MILLISECONDS.convert(updatedRole.getGroupReviewDays(), TimeUnit.DAYS) : 0;
+
+        Timestamp userExpiration = Timestamp.fromMillis(userExpiryMillis);
+        Timestamp serviceExpiration = Timestamp.fromMillis(serviceExpiryMillis);
+        Timestamp groupExpiration = Timestamp.fromMillis(groupExpiryMillis);
+
+        Timestamp userReview = Timestamp.fromMillis(userReviewMillis);
+        Timestamp serviceReview = Timestamp.fromMillis(serviceReviewMillis);
+        Timestamp groupReview = Timestamp.fromMillis(groupReviewMillis);
+
+        final String principal = getPrincipalName(ctx);
+
+        // process our role members and if there were any changes processed then update
+        // our role and domain time-stamps, and invalidate local cache entry
+
+        final String userAuthorityExpiry = userAuthorityExpiryChanged ? updatedRole.getUserAuthorityExpiration() : null;
+        List<RoleMember> roleMembersWithUpdatedDueDates = getRoleMembersWithUpdatedDueDates(roleMembers,
+                userExpiration, userExpiryMillis, serviceExpiration, serviceExpiryMillis, groupExpiration,
+                groupExpiryMillis, userReview, userReviewMillis, serviceReview, serviceReviewMillis,
+                userAuthorityExpiry, groupReview, groupReviewMillis);
+        if (insertRoleMembers(ctx, con, roleMembersWithUpdatedDueDates, domainName,
+                roleName, principal, auditRef, caller)) {
+
+            // update our role and domain time-stamps, and invalidate local cache entry
+
+            con.updateRoleModTimestamp(domainName, roleName);
+            con.updateDomainModTimestamp(domainName);
+            cacheStore.invalidate(domainName);
+        }
+    }
+
+    boolean isNumOfDaysReduced(Integer oldNumberOfDays, Integer newNumberOfDays) {
+        if (newNumberOfDays == null || newNumberOfDays <= 0) {
+            return false;
+        }
+        if (oldNumberOfDays == null || oldNumberOfDays <= 0) {
+            return true;
+        }
+        return newNumberOfDays < oldNumberOfDays;
+    }
+
     /**
      * If the role has audit enabled, and user did not provide the auditRef,
      * an exception will be thrown.
      **/
-    void checkRoleAuditEnabled(ObjectStoreConnection con, Role role, final String auditRef,
-            final String caller, final String principal) {
+    void checkObjectAuditEnabled(ObjectStoreConnection con, Boolean auditEnabled, final String objectName,
+                                 final String auditRef, final String caller, final String principal) {
 
-        if (role.getAuditEnabled() == Boolean.TRUE) {
+        if (auditEnabled == Boolean.TRUE) {
             if (auditRef == null || auditRef.length() == 0) {
                 con.rollbackChanges();
-                throw ZMSUtils.requestError(caller + ": Audit reference required for role: " + role.getName(), caller);
+                throw ZMSUtils.requestError(caller + ": Audit reference required for object: " + objectName, caller);
             }
 
             if (auditReferenceValidator != null && !auditReferenceValidator.validateReference(auditRef, principal, caller)) {
                 con.rollbackChanges();
-                throw ZMSUtils.requestError(caller + ": Audit reference validation failed for role: " + role.getName() +
+                throw ZMSUtils.requestError(caller + ": Audit reference validation failed for object: " + objectName +
                         ", auditRef: " + auditRef, caller);
             }
         }
@@ -3762,22 +5989,22 @@ public class DBService {
 
                 String principal = getPrincipalName(ctx);
 
-                // make sure the role auditing requires are bet
+                // make sure the role auditing requirements are met
 
                 Role originalRole = con.getRole(domainName, roleName);
                 if (originalRole == null) {
                     con.rollbackChanges();
-                    throw ZMSUtils.notFoundError(caller + ": Unknown role: " + roleName, caller);
+                    throw ZMSUtils.notFoundError("unknown role: " + roleName, caller);
                 }
 
-                checkRoleAuditEnabled(con, originalRole, auditRef, caller, principal);
+                checkObjectAuditEnabled(con, originalRole.getAuditEnabled(), originalRole.getName(),
+                        auditRef, caller, principal);
 
                 // process our confirm role member support
 
-                if (!con.confirmRoleMember(domainName, roleName, roleMember,
-                        principal, auditRef)) {
+                if (!con.confirmRoleMember(domainName, roleName, roleMember, principal, auditRef)) {
                     con.rollbackChanges();
-                    throw ZMSUtils.requestError(caller + ": unable to apply role membership decision for member: " +
+                    throw ZMSUtils.requestError("unable to apply role membership decision for member: " +
                             roleMember.getMemberName() + " and role: " + roleName, caller);
                 }
 
@@ -3788,17 +6015,64 @@ public class DBService {
 
                 // audit log the request
 
-                String status = roleMember.getApproved() == Boolean.TRUE ? "approved" : "rejected";
-
-                StringBuilder auditDetails = new StringBuilder("{\"member\": \"").append(roleMember.getMemberName())
-                        .append("\",\"decision\": \"").append(status).append("\"");
-                if (roleMember.getExpiration() != null) {
-                    auditDetails.append("\"expiry\": \"").append(roleMember.getExpiration()).append("\"");
-                }
-                auditDetails.append("}");
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditLogRoleMember(auditDetails, roleMember, true);
 
                 auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
                         roleName, auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+
+                // otherwise check if we need to retry or return failure
+
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    void executePutGroupMembershipDecision(ResourceContext ctx, final String domainName, Group group,
+                                           GroupMember groupMember, final String auditRef) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                String principal = getPrincipalName(ctx);
+
+                // make sure the role auditing requirements are met
+
+                checkObjectAuditEnabled(con, group.getAuditEnabled(), group.getName(),
+                        auditRef, ctx.getApiName(), principal);
+
+                // process our confirm group member support
+
+                final String groupName = ZMSUtils.extractGroupName(domainName, group.getName());
+                if (!con.confirmGroupMember(domainName, groupName, groupMember, principal, auditRef)) {
+                    con.rollbackChanges();
+                    throw ZMSUtils.requestError("unable to apply group membership decision for member: " +
+                            groupMember.getMemberName() + " and group: " + groupName, ctx.getApiName());
+                }
+
+                // update our domain time-stamp and save changes
+
+                con.updateGroupModTimestamp(domainName, groupName);
+                saveChanges(con, domainName);
+
+                // audit log the request
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditLogGroupMember(auditDetails, groupMember, true);
+
+                auditLogRequest(ctx, domainName, auditRef, ctx.getApiName(), ZMSConsts.HTTP_PUT,
+                        groupName, auditDetails.toString());
 
                 return;
 
@@ -3834,12 +6108,72 @@ public class DBService {
         return domainRoleMembership;
     }
 
-    public Set<String> getPendingMembershipApproverRoles() {
-        String server = ZMSImpl.serverHostName;
+    DomainGroupMembership getPendingDomainGroupMembers(final String principal) {
+
+        DomainGroupMembership domainGroupMembership = new DomainGroupMembership();
+        List<DomainGroupMembers> domainGroupMembersList = new ArrayList<>();
+        DomainGroupMembers domainGroupMembers;
+
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            Map<String, List<DomainGroupMember>> domainGroupMembersMap = con.getPendingDomainGroupMembers(principal);
+            if (domainGroupMembersMap != null) {
+                for (String domain : domainGroupMembersMap.keySet()) {
+                    domainGroupMembers = new DomainGroupMembers();
+                    domainGroupMembers.setDomainName(domain);
+                    domainGroupMembers.setMembers(domainGroupMembersMap.get(domain));
+                    domainGroupMembersList.add(domainGroupMembers);
+                }
+                domainGroupMembership.setDomainGroupMembersList(domainGroupMembersList);
+            }
+        }
+        return domainGroupMembership;
+    }
+
+    public Set<String> getPendingMembershipApproverRoles(int delayDays) {
         try (ObjectStoreConnection con = store.getConnection(true, true)) {
-            long updateTs = new Date().getTime();
-            if (con.updateLastNotifiedTimestamp(server, updateTs)) {
-                return con.getPendingMembershipApproverRoles(server, updateTs);
+            long updateTs = System.currentTimeMillis();
+            if (con.updatePendingRoleMembersNotificationTimestamp(zmsConfig.getServerHostName(), updateTs, delayDays)) {
+                return con.getPendingMembershipApproverRoles(zmsConfig.getServerHostName(), updateTs);
+            }
+        }
+        return null;
+    }
+
+    public Set<String> getPendingGroupMembershipApproverRoles(int delayDays) {
+        try (ObjectStoreConnection con = store.getConnection(true, true)) {
+            long updateTs = System.currentTimeMillis();
+            if (con.updatePendingGroupMembersNotificationTimestamp(zmsConfig.getServerHostName(), updateTs, delayDays)) {
+                return con.getPendingGroupMembershipApproverRoles(zmsConfig.getServerHostName(), updateTs);
+            }
+        }
+        return null;
+    }
+
+    public Map<String, DomainRoleMember> getRoleExpiryMembers(int delayDays) {
+        try (ObjectStoreConnection con = store.getConnection(true, true)) {
+            long updateTs = System.currentTimeMillis();
+            if (con.updateRoleMemberExpirationNotificationTimestamp(zmsConfig.getServerHostName(), updateTs, delayDays)) {
+                return con.getNotifyTemporaryRoleMembers(zmsConfig.getServerHostName(), updateTs);
+            }
+        }
+        return null;
+    }
+
+    public Map<String, DomainRoleMember> getRoleReviewMembers(int delayDays) {
+        try (ObjectStoreConnection con = store.getConnection(true, true)) {
+            long updateTs = System.currentTimeMillis();
+            if (con.updateRoleMemberReviewNotificationTimestamp(zmsConfig.getServerHostName(), updateTs, delayDays)) {
+                return con.getNotifyReviewRoleMembers(zmsConfig.getServerHostName(), updateTs);
+            }
+        }
+        return null;
+    }
+
+    public Map<String, DomainGroupMember> getGroupExpiryMembers(int delayDays) {
+        try (ObjectStoreConnection con = store.getConnection(true, true)) {
+            long updateTs = System.currentTimeMillis();
+            if (con.updateGroupMemberExpirationNotificationTimestamp(zmsConfig.getServerHostName(), updateTs, delayDays)) {
+                return con.getNotifyTemporaryGroupMembers(zmsConfig.getServerHostName(), updateTs);
             }
         }
         return null;
@@ -3871,6 +6205,1029 @@ public class DBService {
                     }
                 }
             }
+        }
+    }
+
+    public void processExpiredPendingGroupMembers(int pendingGroupMemberLifespan, final String monitorIdentity) {
+
+        final String auditRef = "Expired - auto reject";
+        final String caller = "processExpiredPendingGroupMembers";
+
+        Map<String, List<DomainGroupMember>> memberList;
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            memberList = con.getExpiredPendingDomainGroupMembers(pendingGroupMemberLifespan);
+        }
+
+        // delete each member and record each expired member in audit log in a transaction
+
+        for (String domainName : memberList.keySet()) {
+            for (DomainGroupMember domainGroupMember : memberList.get(domainName)) {
+                final String principalName = domainGroupMember.getMemberName();
+                for (GroupMember groupMember : domainGroupMember.getMemberGroups()) {
+                    try (ObjectStoreConnection con = store.getConnection(true, true)) {
+                        if (con.deletePendingGroupMember(domainName, groupMember.getGroupName(),
+                                principalName, monitorIdentity, auditRef)) {
+                            auditLogRequest(monitorIdentity, domainName, auditRef, caller,
+                                    "REJECT", groupMember.getGroupName(),
+                                    "{\"member\": \"" + principalName + "\"}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void executePutGroupReview(ResourceContext ctx, final String domainName, final String groupName,
+                               Group group, MemberDueDays memberExpiryDueDays, final String auditRef) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                final String principal = getPrincipalName(ctx);
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, ctx.getApiName(), principal, AUDIT_TYPE_GROUP);
+
+                // retrieve our original group
+
+                Group originalGroup = getGroup(con, domainName, groupName, false, false);
+
+                // now process the request. first we're going to make a copy of our group
+
+                Group updatedGroup = new Group().setName(originalGroup.getName());
+
+                // then we're going to apply the updated expiry and/or active status from the incoming group
+
+                List<GroupMember> noActionMembers = applyMembershipChangesGroup(updatedGroup, originalGroup,
+                        group, memberExpiryDueDays, auditRef);
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+
+                List<GroupMember> deletedMembers = new ArrayList<>();
+                List<GroupMember> extendedMembers = new ArrayList<>();
+
+                auditDetails.append("{\"name\": \"").append(groupName).append('\"')
+                        .append(", \"selfServe\": ").append(auditLogBooleanDefault(group.getSelfServe(), Boolean.TRUE))
+                        .append(", \"auditEnabled\": ").append(auditLogBooleanDefault(group.getAuditEnabled(), Boolean.TRUE));
+
+                for (GroupMember member : updatedGroup.getGroupMembers()) {
+
+                    // if active flag is coming as false for the member, that means it's flagged for deletion
+
+                    if (member.getActive() == Boolean.FALSE) {
+                        if (!con.deleteGroupMember(domainName, groupName, member.getMemberName(), principal, auditRef)) {
+                            con.rollbackChanges();
+                            throw ZMSUtils.notFoundError("unable to delete group member: " +
+                                    member.getMemberName() + " from group: " + groupName, ctx.getApiName());
+                        }
+                        deletedMembers.add(member);
+                    } else {
+                        // if not marked for deletion, then we are going to extend the member
+
+                        if (!con.insertGroupMember(domainName, groupName, member, principal, auditRef)) {
+                            con.rollbackChanges();
+                            throw ZMSUtils.notFoundError("unable to extend group member: " +
+                                    member.getMemberName() + " for the group: " + groupName, ctx.getApiName());
+                        }
+                        extendedMembers.add(member);
+                    }
+                }
+
+                // construct audit log details
+
+                auditLogGroupMembers(auditDetails, "deleted-members", deletedMembers);
+                auditLogGroupMembers(auditDetails, "extended-members", extendedMembers);
+                auditLogGroupMembers(auditDetails, "no-action-members", noActionMembers);
+
+                auditDetails.append("}");
+
+                if (!deletedMembers.isEmpty() || !extendedMembers.isEmpty()) {
+                    // we have one or more changes to the group. We should update
+                    // both lastReviewed as well as modified timestamps
+                    con.updateGroupModTimestamp(domainName, groupName);
+                }
+
+                con.updateGroupReviewTimestamp(domainName, groupName);
+                saveChanges(con, domainName);
+
+                // audit log the request
+
+                auditLogRequest(ctx, domainName, auditRef, ctx.getApiName(), "REVIEW", groupName, auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    void executePutRoleReview(ResourceContext ctx, String domainName, String roleName, Role role,
+                              MemberDueDays memberExpiryDueDays, MemberDueDays memberReminderDueDays,
+                              String auditRef, String caller) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                final String principal = getPrincipalName(ctx);
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, caller, principal, AUDIT_TYPE_ROLE);
+
+                // retrieve our original role
+
+                Role originalRole = getRole(con, domainName, roleName, false, false, false);
+
+                if (originalRole.getTrust() != null && !originalRole.getTrust().isEmpty()) {
+                    throw ZMSUtils.requestError(caller + ": role " + roleName + " is delegated. Review should happen on the trusted role. ", caller);
+                }
+
+                // now process the request. first we're going to make a copy of our role
+
+                Role updatedRole = new Role().setName(originalRole.getName());
+
+                // then we're going to apply the updated expiry and/or active status from the incoming role
+
+                List<RoleMember> noActionMembers = applyMembershipChanges(updatedRole, originalRole, role,
+                        memberExpiryDueDays, memberReminderDueDays, auditRef);
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+
+                List<RoleMember> deletedMembers = new ArrayList<>();
+                List<RoleMember> extendedMembers = new ArrayList<>();
+
+                auditDetails.append("{\"name\": \"").append(roleName).append('\"')
+                        .append(", \"selfServe\": ").append(auditLogBooleanDefault(originalRole.getSelfServe(), Boolean.TRUE))
+                        .append(", \"auditEnabled\": ").append(auditLogBooleanDefault(originalRole.getAuditEnabled(), Boolean.TRUE));
+
+                for (RoleMember member : updatedRole.getRoleMembers()) {
+
+                    // if active flag is coming as false for the member, that means it's flagged for deletion
+
+                    if (member.getActive() == Boolean.FALSE) {
+                        if (!con.deleteRoleMember(domainName, roleName, member.getMemberName(), principal, auditRef)) {
+                            con.rollbackChanges();
+                            throw ZMSUtils.notFoundError(caller + ": unable to delete role member: " +
+                                    member.getMemberName() + " from role: " + roleName, caller);
+                        }
+                        deletedMembers.add(member);
+
+                    } else {
+                        // if not marked for deletion, then we are going to extend the member
+
+                        if (!con.insertRoleMember(domainName, roleName, member, principal, auditRef)) {
+                            con.rollbackChanges();
+                            throw ZMSUtils.notFoundError(caller + ": unable to extend role member: " +
+                                    member.getMemberName() + " for the role: " + roleName, caller);
+                        }
+                        extendedMembers.add(member);
+                    }
+                }
+
+                // construct audit log details
+
+                auditLogRoleMembers(auditDetails, "deleted-members", deletedMembers);
+                auditLogRoleMembers(auditDetails, "extended-members", extendedMembers);
+                auditLogRoleMembers(auditDetails, "no-action-members", noActionMembers);
+
+                auditDetails.append("}");
+
+                if (!deletedMembers.isEmpty() || !extendedMembers.isEmpty()) {
+                    // we have one or more changes to the role. We should update
+                    // both lastReviewed as well as modified timestamps
+                    con.updateRoleModTimestamp(domainName, roleName);
+                }
+
+                con.updateRoleReviewTimestamp(domainName, roleName);
+                saveChanges(con, domainName);
+
+                // audit log the request
+
+                auditLogRequest(ctx, domainName, auditRef, caller, "REVIEW", roleName, auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    /**
+     * This method takes the input role, creates a map using memberName as key,
+     * copies members from original role from DB and only adds deleted / extended members to the updatedRole.
+     * @param updatedRole updated role to be sent to DB to record changes
+     * @param originalRole original role from DB
+     * @param role incoming role containing changes from domain admin
+     * @param auditRef audit ref for the change
+     * @return List of rolemember where no action was taken
+     */
+    List<RoleMember> applyMembershipChanges(Role updatedRole, Role originalRole, Role role,
+                MemberDueDays memberExpiryDueDays, MemberDueDays memberReminderDueDays, String auditRef) {
+
+        Map<String, RoleMember> incomingMemberMap =
+                role.getRoleMembers().stream().collect(Collectors.toMap(RoleMember::getMemberName, item -> item));
+
+        List<RoleMember> noActionMembers = new ArrayList<>(originalRole.getRoleMembers().size());
+
+        // updatedMembers size is driven by input
+
+        List<RoleMember> updatedMembers = new ArrayList<>(incomingMemberMap.size());
+        updatedRole.setRoleMembers(updatedMembers);
+        RoleMember updatedMember;
+
+        // if original role is auditEnabled then all the extensions should be sent for approval again.
+
+        boolean approvalStatus = originalRole.getAuditEnabled() != Boolean.TRUE;
+        RoleMember tempMemberFromMap;
+
+        for (RoleMember originalMember : originalRole.getRoleMembers()) {
+
+            // we are only going to update the changed members
+
+            if (incomingMemberMap.containsKey(originalMember.getMemberName())) {
+
+                updatedMember = new RoleMember();
+                updatedMember.setMemberName(originalMember.getMemberName());
+
+                tempMemberFromMap = incomingMemberMap.get(updatedMember.getMemberName());
+
+                // member's approval status is determined by auditEnabled flag set on original role
+
+                updatedMember.setApproved(approvalStatus);
+
+                // member's active status is determined by action taken in UI
+
+                updatedMember.setActive(tempMemberFromMap.getActive());
+
+                // member's new expiration/review reminder date is set by
+                // role / domain level expiration setting
+
+                updatedMember.setExpiration(memberDueDateUpdateRequired(memberExpiryDueDays, tempMemberFromMap.getPrincipalType()) ?
+                        tempMemberFromMap.getExpiration() : originalMember.getExpiration());
+
+                updatedMember.setReviewReminder(memberDueDateUpdateRequired(memberReminderDueDays, tempMemberFromMap.getPrincipalType()) ?
+                        tempMemberFromMap.getReviewReminder() : originalMember.getReviewReminder());
+
+                updatedMember.setAuditRef(auditRef);
+                updatedMembers.add(updatedMember);
+            } else {
+                noActionMembers.add(originalMember);
+            }
+        }
+
+        return noActionMembers;
+    }
+
+    boolean memberDueDateUpdateRequired(MemberDueDays memberDueDays, Integer principalType) {
+        long dueDateMills = 0;
+        switch (Principal.Type.getType(principalType)) {
+            case USER:
+                dueDateMills = memberDueDays.getUserDueDateMillis();
+                break;
+            case SERVICE:
+                dueDateMills = memberDueDays.getServiceDueDateMillis();
+                break;
+            case GROUP:
+                dueDateMills = memberDueDays.getGroupDueDateMillis();
+                break;
+        }
+        return dueDateMills != 0;
+    }
+
+    /**
+     * This method takes the input group, creates a map using memberName as key,
+     * copies members from original group from DB and only adds deleted / extended members to the updatedGroup.
+     * @param updatedGroup updated group to be sent to DB to record changes
+     * @param originalGroup original group from DB
+     * @param group incoming group containing changes from domain admin
+     * @param auditRef audit ref for the change
+     * @return List of rolemember where no action was taken
+     */
+    List<GroupMember> applyMembershipChangesGroup(Group updatedGroup, Group originalGroup, Group group,
+                                                  MemberDueDays memberExpiryDueDays, String auditRef) {
+
+        Map<String, GroupMember> incomingMemberMap =
+                group.getGroupMembers().stream().collect(Collectors.toMap(GroupMember::getMemberName, item -> item));
+
+        List<GroupMember> noActionMembers = new ArrayList<>(originalGroup.getGroupMembers().size());
+
+        // updatedMembers size is driven by input
+
+        List<GroupMember> updatedMembers = new ArrayList<>(incomingMemberMap.size());
+        updatedGroup.setGroupMembers(updatedMembers);
+        GroupMember updatedMember;
+
+        // if original group is auditEnabled then all the extensions should be sent for approval again.
+
+        boolean approvalStatus = originalGroup.getAuditEnabled() != Boolean.TRUE;
+        GroupMember tempMemberFromMap;
+
+        for (GroupMember originalMember : originalGroup.getGroupMembers()) {
+
+            // we are only going to update the changed members
+
+            if (incomingMemberMap.containsKey(originalMember.getMemberName())) {
+
+                updatedMember = new GroupMember();
+                updatedMember.setMemberName(originalMember.getMemberName());
+
+                tempMemberFromMap = incomingMemberMap.get(updatedMember.getMemberName());
+
+                // member's approval status is determined by auditEnabled flag set on original role
+
+                updatedMember.setApproved(approvalStatus);
+
+                // member's active status is determined by action taken in UI
+
+                updatedMember.setActive(tempMemberFromMap.getActive());
+
+                // member's new expiration is set by role / domain level expiration setting
+
+                updatedMember.setExpiration(memberDueDateUpdateRequired(memberExpiryDueDays, tempMemberFromMap.getPrincipalType()) ?
+                        tempMemberFromMap.getExpiration() : originalMember.getExpiration());
+
+                updatedMember.setAuditRef(auditRef);
+                updatedMembers.add(updatedMember);
+            } else {
+                noActionMembers.add(originalMember);
+            }
+        }
+        return noActionMembers;
+    }
+
+    void updateDomainModTimestamp(final String domainName) {
+
+        try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+            // update domain time-stamps, and invalidate local cache entry
+
+            con.updateDomainModTimestamp(domainName);
+            cacheStore.invalidate(domainName);
+        }
+    }
+
+    List<TemplateMetaData> getDomainTemplates(String domainName) {
+
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            return con.getDomainTemplates(domainName);
+        }
+    }
+
+    void processRoleUserAuthorityRestrictions() {
+
+        // if we don't have a user authority defined then there
+        // is no work to be done
+
+        if (zmsConfig.getUserAuthority() == null) {
+            return;
+        }
+
+        // first we need to get all the roles that have the authority
+        // filter or date expiry attributes set
+
+        List<PrincipalRole> roles;
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            roles = con.listRolesWithUserAuthorityRestrictions();
+        }
+
+        if (roles == null) {
+            return;
+        }
+
+        // for each role catch any exception and ignore since we
+        // want to process all roles and not allow a single one
+        // prevent updating others
+
+        for (PrincipalRole role : roles) {
+            try {
+                enforceRoleUserAuthorityRestrictions(role.getDomainName(), role.getRoleName(),
+                        role.getDomainUserAuthorityFilter());
+            } catch (Exception ex) {
+                LOG.error("Unable to process user authority restrictions for {}:role.{} - {}",
+                        role.getDomainName(), role.getRoleName(), ex.getMessage());
+            }
+        }
+    }
+
+    void processGroupUserAuthorityRestrictions() {
+
+        // if we don't have a user authority defined then there
+        // is no work to be done
+
+        if (zmsConfig.getUserAuthority() == null) {
+            return;
+        }
+
+        // first we need to get all the groups that have the authority
+        // filter or date expiry attributes set
+
+        List<PrincipalGroup> groups;
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+            groups = con.listGroupsWithUserAuthorityRestrictions();
+        }
+
+        if (groups == null) {
+            return;
+        }
+
+        // for each group catch any exception and ignore since we
+        // want to process all group and not allow a single one
+        // prevent updating others
+
+        for (PrincipalGroup group : groups) {
+            try {
+                enforceGroupUserAuthorityRestrictions(group.getDomainName(), group.getGroupName(),
+                        group.getDomainUserAuthorityFilter());
+            } catch (Exception ex) {
+                LOG.error("Unable to process user authority restrictions for {}:group.{} - {}",
+                        group.getDomainName(), group.getGroupName(), ex.getMessage());
+            }
+        }
+    }
+
+    Map<String, List<String>> applyTemplatesForListOfDomains(Map<String, Integer> templateDetails) {
+        final String caller = "applyTemplatesForListOfDomains";
+        final String auditRef = "AutoApplyTemplate";
+        Map<String, List<String>> domainTemplateListMap;
+        DomainTemplate domainTemplate = new DomainTemplate();
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+             domainTemplateListMap = con.getDomainFromTemplateName(templateDetails);
+        }
+
+        for (String domainName : domainTemplateListMap.keySet()) {
+            domainTemplate.setTemplateNames(domainTemplateListMap.get(domainName));
+            //Passing null context since it is an internal call during app start up
+            //executePutDomainTemplate can bulk apply templates given a domain hence sending domainName and templatelist
+            try {
+                this.executePutDomainTemplate(null, domainName, domainTemplate, auditRef, caller);
+            } catch (Exception ex) {
+                LOG.error("unable to apply template for domain {} and template {} error: {}",
+                        domainName, domainTemplate, ex.getMessage());
+            }
+        }
+        return domainTemplateListMap;
+    }
+
+    void enforceRoleUserAuthorityRestrictions(final String domainName, final String roleName,
+                                              final String domainUserAuthorityFilter) {
+
+        final String caller = "enforceRoleUserAuthorityRestrictions";
+        try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+            // get the role from the storage system
+
+            Role role = getRole(con, domainName, roleName, false, false, false);
+            if (role == null) {
+                return;
+            }
+
+            // update the role membership
+
+            List<RoleMember> roleMembers = role.getRoleMembers();
+            if (roleMembers == null) {
+                return;
+            }
+
+            // first process the authority expiration restriction
+
+            boolean expiryDBUpdated = false;
+            final String userAuthorityExpiry = role.getUserAuthorityExpiration();
+            if (userAuthorityExpiry != null) {
+                List<RoleMember> updatedMembers = new ArrayList<>();
+                for (RoleMember roleMember : roleMembers) {
+                    if (updateUserAuthorityExpiry(roleMember, userAuthorityExpiry)) {
+                        updatedMembers.add(roleMember);
+                    }
+                }
+
+                expiryDBUpdated = insertRoleMembers(null, con, updatedMembers, domainName, roleName,
+                        ZMSConsts.SYS_AUTH_MONITOR, AUDIT_REF, caller);
+            }
+
+            // now process authority filter restriction
+
+            boolean filterDBUpdated = false;
+            final String userAuthorityFilter = ZMSUtils.combineUserAuthorityFilters(role.getUserAuthorityFilter(),
+                    domainUserAuthorityFilter);
+            if (userAuthorityFilter != null) {
+                List<RoleMember> updatedMembers = new ArrayList<>();
+
+                for (RoleMember roleMember : roleMembers) {
+                    if (updateUserAuthorityFilter(roleMember, userAuthorityFilter)) {
+                        updatedMembers.add(roleMember);
+                    }
+                }
+
+                filterDBUpdated = updateRoleMemberDisabledState(null, con, updatedMembers, domainName,
+                        roleName, ZMSConsts.SYS_AUTH_MONITOR, AUDIT_REF, caller);
+            }
+
+            if (expiryDBUpdated || filterDBUpdated) {
+
+                // update our role and domain time-stamps, and invalidate local cache entry
+
+                con.updateRoleModTimestamp(domainName, roleName);
+                con.updateDomainModTimestamp(domainName);
+                cacheStore.invalidate(domainName);
+            }
+        }
+    }
+
+    void enforceGroupUserAuthorityRestrictions(final String domainName, final String groupName,
+                                               final String domainUserAuthorityFilter) {
+
+        final String caller = "enforceGroupUserAuthorityRestrictions";
+        try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+            // get the role from the storage system
+
+            Group group = getGroup(con, domainName, groupName, false, false);
+            if (group == null) {
+                return;
+            }
+
+            // update the group membership
+
+            List<GroupMember> groupMembers = group.getGroupMembers();
+            if (groupMembers == null) {
+                return;
+            }
+
+            // first process the authority expiration restriction
+
+            boolean expiryDBUpdated = false;
+            final String userAuthorityExpiry = group.getUserAuthorityExpiration();
+            if (userAuthorityExpiry != null) {
+                List<GroupMember> updatedMembers = new ArrayList<>();
+                for (GroupMember groupMember : groupMembers) {
+                    if (updateUserAuthorityExpiry(groupMember, userAuthorityExpiry)) {
+                        updatedMembers.add(groupMember);
+                    }
+                }
+
+                expiryDBUpdated = insertGroupMembers(null, con, updatedMembers, domainName, groupName,
+                        ZMSConsts.SYS_AUTH_MONITOR, AUDIT_REF, caller);
+            }
+
+            // now process authority filter restriction
+
+            boolean filterDBUpdated = false;
+            final String userAuthorityFilter = ZMSUtils.combineUserAuthorityFilters(group.getUserAuthorityFilter(),
+                    domainUserAuthorityFilter);
+            if (userAuthorityFilter != null) {
+                List<GroupMember> updatedMembers = new ArrayList<>();
+
+                for (GroupMember groupMember : groupMembers) {
+                    if (updateUserAuthorityFilter(groupMember, userAuthorityFilter)) {
+                        updatedMembers.add(groupMember);
+                    }
+                }
+
+                filterDBUpdated = updateGroupMemberDisabledState(null, con, updatedMembers, domainName,
+                        groupName, ZMSConsts.SYS_AUTH_MONITOR, AUDIT_REF, caller);
+            }
+
+            if (expiryDBUpdated || filterDBUpdated) {
+
+                // update our group and domain time-stamps, and invalidate local cache entry
+
+                con.updateGroupModTimestamp(domainName, groupName);
+                con.updateDomainModTimestamp(domainName);
+                cacheStore.invalidate(domainName);
+            }
+        }
+    }
+
+    /**
+     * This method returns list of Principals based on the state parameter supplied
+     * @param queriedState state of principal
+     * @return List of Principals from DB
+     */
+    List<Principal> getPrincipals(int queriedState) {
+        List<Principal> principals = new ArrayList<>();
+        Principal principal;
+        try (ObjectStoreConnection con = store.getConnection(true, false)) {
+           List<String> dbPrincipals = con.getPrincipals(queriedState);
+            Principal.State principalState = Principal.State.getState(queriedState);
+           for (String dbPrincipal : dbPrincipals) {
+               principal = ZMSUtils.createPrincipalForName(dbPrincipal, zmsConfig.getUserDomain(), null);
+               ((SimplePrincipal) principal).setState(principalState);
+               principals.add(principal);
+           }
+        }
+        return principals;
+    }
+
+    /**
+     * This method toggles state for supplied Principals based on the flag in DB
+     * as well as modifies memberships of all roles and groups of current principal(s)
+     * @param changedPrincipals List of Principals from User Authority
+     * @param suspended boolean indicating principal's state
+     */
+    void updatePrincipalByStateFromAuthority(List<Principal> changedPrincipals, boolean suspended) {
+
+        if (changedPrincipals.isEmpty()) {
+            return;
+        }
+
+        final String caller = "updatePrincipalByStateFromAuthority";
+        List<Principal> updatedUsers = new ArrayList<>();
+        int newPrincipalState = suspended ? Principal.State.AUTHORITY_SYSTEM_SUSPENDED.getValue() : Principal.State.ACTIVE.getValue();
+        try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+            // first lets update the new state in DB
+            for (Principal changedPrincipal : changedPrincipals) {
+                try {
+                    if (con.updatePrincipal(changedPrincipal.getFullName(), newPrincipalState)) {
+                        updatedUsers.add(changedPrincipal);
+                    }
+                } catch (ResourceException ex) {
+                    // log the exception and continue with remaining principals
+                    LOG.error("Exception in updating principal state from Authority {} Moving on.", ex.getMessage());
+                }
+            }
+            // if new state is updated successfully
+            // then we need to modify all roles and groups where given principal is member of
+            if (!updatedUsers.isEmpty()) {
+                for (Principal updatedUser : updatedUsers) {
+                    // separate try blocks to treat group and role membership 404s separately
+                    try {
+                        updateRoleMembershipsByPrincipalState(suspended, caller, con, updatedUser);
+                    } catch (ResourceException ex) {
+                        if (ex.getCode() == ResourceException.NOT_FOUND) {
+                            continue;
+                        }
+                        throw ex;
+                    }
+                    // separate try blocks to treat group and role membership 404s separately
+                    try {
+                        updateGroupMembershipByPrincipalState(suspended, caller, con, updatedUser);
+                    } catch (ResourceException ex) {
+                        if (ex.getCode() == ResourceException.NOT_FOUND) {
+                            continue;
+                        }
+                        throw ex;
+                    }
+                }
+            }
+        }
+    }
+
+    void executePutAssertionConditions(ResourceContext ctx, String domainName, String policyName, long assertionId,
+                                       AssertionConditions assertionConditions, String auditRef, String caller) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, caller, getPrincipalName(ctx), AUDIT_TYPE_POLICY);
+
+                // now we need verify our quota check
+
+                quotaCheck.checkAssertionConditionsQuota(con, assertionId, assertionConditions, caller);
+
+                // process our insert assertion condition.
+
+                if (!con.insertAssertionConditions(assertionId, assertionConditions)) {
+                    throw ZMSUtils.requestError(String.format("%s: unable to insert assertion conditions for policy=%s assertionId=%d", caller, policyName, assertionId), caller);
+                }
+
+                // update our policy and domain time-stamps, and invalidate local cache entry
+
+                saveChanges(con, domainName);
+                con.updatePolicyModTimestamp(domainName, policyName);
+
+                // audit log the request
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditDetails.append("{\"policy\": \"").append(policyName)
+                        .append("\", \"assertionId\": ").append(assertionId)
+                        .append(", ");
+                auditLogAssertionConditions(auditDetails, assertionConditions.getConditionsList(), "new-assertion-conditions");
+                auditDetails.append("}");
+
+                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
+                        policyName, auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+
+                // otherwise check if we need to retry or return failure
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    void executePutAssertionCondition(ResourceContext ctx, String domainName, String policyName, long assertionId,
+                                      AssertionCondition assertionCondition, String auditRef, String caller) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(false, true)) {
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, caller, getPrincipalName(ctx), AUDIT_TYPE_POLICY);
+
+                // process our insert assertion condition.
+
+                if (assertionCondition.getId() == null) {
+
+                    // now we need verify our quota check
+                    quotaCheck.checkAssertionConditionQuota(con, assertionId, assertionCondition, caller);
+
+                    // no condition id in the request. so we are going to generate the next condition id for
+                    // the given assertion id and then use it to insert given keys
+                    assertionCondition.setId(con.getNextConditionId(assertionId, caller));
+                    if (!con.insertAssertionCondition(assertionId, assertionCondition)) {
+                        throw ZMSUtils.requestError(String.format("%s: unable to insert new assertion condition for policy=%s assertionId=%d", caller, policyName, assertionId), caller);
+                    }
+                } else {
+
+                    // existing assertion condition keys found with given condition id. so delete existing keys from DB for the given condition id
+                    if (!con.deleteAssertionCondition(assertionId, assertionCondition.getId())) {
+                        throw ZMSUtils.notFoundError(String.format("%s: unable to delete assertion condition during putAssertionCondition for policy=%s assertionId=%d conditionId=%d"
+                                , caller, policyName, assertionId, assertionCondition.getId()), caller);
+                    }
+                    // now we need verify our quota check after deleting the old entries
+                    quotaCheck.checkAssertionConditionQuota(con, assertionId, assertionCondition, caller);
+
+                    // now insert the new keys against existing condition id
+                    if (!con.insertAssertionCondition(assertionId, assertionCondition)) {
+                        throw ZMSUtils.requestError(String.format("%s: unable to insert assertion condition for policy=%s assertionId=%d", caller, policyName, assertionId), caller);
+                    }
+                }
+
+                // update our policy and domain time-stamps, and invalidate local cache entry
+
+                saveChanges(con, domainName);
+                con.updatePolicyModTimestamp(domainName, policyName);
+
+                // audit log the request
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditDetails.append("{\"policy\": \"").append(policyName)
+                        .append("\", \"assertionId\": ").append(assertionId)
+                        .append(", \"new-assertion-condition\": ");
+                auditLogAssertionCondition(auditDetails, assertionCondition, true);
+                auditDetails.append("}");
+
+                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_PUT,
+                        policyName, auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+
+                // otherwise check if we need to retry or return failure
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    public void executeDeleteAssertionConditions(ResourceContext ctx, String domainName, String policyName, Long assertionId, String auditRef, String caller) {
+
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, caller, getPrincipalName(ctx), AUDIT_TYPE_POLICY);
+
+                // fetch the assertion for our audit log
+
+                List<AssertionCondition> assertionConditions = con.getAssertionConditions(assertionId);
+                if (assertionConditions == null) {
+                    throw ZMSUtils.notFoundError(String.format("%s: unable to read assertion conditions for policy=%s assertionId=%d", caller,
+                            policyName, assertionId), caller);
+                }
+
+                // process our delete assertion conditions. since this is a "single"
+                // operation, we are not using any transactions.
+
+                if (!con.deleteAssertionConditions(assertionId)) {
+                    throw ZMSUtils.notFoundError(String.format("%s: unable to delete assertion conditions for policy=%s assertionId=%d", caller,
+                            policyName, assertionId), caller);
+                }
+
+                // update our policy and domain time-stamps, and invalidate local cache entry
+
+                con.updatePolicyModTimestamp(domainName, policyName);
+                con.updateDomainModTimestamp(domainName);
+                cacheStore.invalidate(domainName);
+
+                // audit log the request
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditDetails.append("{\"policy\": \"").append(policyName)
+                        .append("\", \"assertionId\": ").append(assertionId)
+                        .append(", ");
+                auditLogAssertionConditions(auditDetails, assertionConditions, "deleted-assertion-conditions");
+                auditDetails.append("}");
+
+                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_DELETE,
+                        policyName, auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+
+                // otherwise check if we need to retry or return failure
+
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    public void executeDeleteAssertionCondition(ResourceContext ctx, String domainName, String policyName, Long assertionId, Integer conditionId, String auditRef, String caller) {
+        // our exception handling code does the check for retry count
+        // and throws the exception it had received when the retry
+        // count reaches 0
+
+        for (int retryCount = defaultRetryCount; ; retryCount--) {
+
+            try (ObjectStoreConnection con = store.getConnection(true, true)) {
+
+                // first verify that auditing requirements are met
+
+                checkDomainAuditEnabled(con, domainName, auditRef, caller, getPrincipalName(ctx), AUDIT_TYPE_POLICY);
+
+                // fetch the assertion for our audit log
+
+                AssertionCondition assertionCondition = con.getAssertionCondition(assertionId, conditionId);
+                if (assertionCondition == null) {
+                    throw ZMSUtils.notFoundError(String.format("%s: unable to read assertion condition for policy=%s assertionId=%d conditionId=%d"
+                            , caller, policyName, assertionId, conditionId), caller);
+                }
+
+                // process our delete assertion condition. since this is a "single"
+                // operation, we are not using any transactions.
+
+                if (!con.deleteAssertionCondition(assertionId, conditionId)) {
+                    throw ZMSUtils.notFoundError(String.format("%s: unable to delete assertion condition for policy=%s assertionId=%d conditionId=%d"
+                            , caller, policyName, assertionId, conditionId), caller);
+                }
+
+                // update our policy and domain time-stamps, and invalidate local cache entry
+
+                con.updatePolicyModTimestamp(domainName, policyName);
+                con.updateDomainModTimestamp(domainName);
+                cacheStore.invalidate(domainName);
+
+                // audit log the request
+
+                StringBuilder auditDetails = new StringBuilder(ZMSConsts.STRING_BLDR_SIZE_DEFAULT);
+                auditDetails.append("{\"policy\": \"").append(policyName)
+                        .append("\", \"assertionId\": ").append(assertionId)
+                        .append(", \"deleted-assertion-condition\": ");
+                auditLogAssertionCondition(auditDetails, assertionCondition, true);
+                auditDetails.append("}");
+
+                auditLogRequest(ctx, domainName, auditRef, caller, ZMSConsts.HTTP_DELETE,
+                        policyName, auditDetails.toString());
+
+                return;
+
+            } catch (ResourceException ex) {
+
+                // otherwise check if we need to retry or return failure
+
+                if (!shouldRetryOperation(ex, retryCount)) {
+                    throw ex;
+                }
+            }
+        }
+    }
+
+    private void updateGroupMembershipByPrincipalState(boolean suspended, String caller, ObjectStoreConnection con, Principal updatedUser) {
+        List<GroupMember> groupMembersWithUpdatedState;
+        GroupMember groupMember;
+        DomainGroupMember domainGroupMember;
+        int newState, oldState;
+        Set<String> updatedDomains = new HashSet<>();
+        domainGroupMember = con.getPrincipalGroups(updatedUser.getFullName(), null);
+        if (!domainGroupMember.getMemberGroups().isEmpty()) {
+            for (GroupMember currentGroup : domainGroupMember.getMemberGroups()) {
+                groupMember = new GroupMember();
+                groupMember.setMemberName(updatedUser.getFullName());
+                oldState = 0;
+                if (groupMember.getSystemDisabled() != null) {
+                    oldState = groupMember.getSystemDisabled();
+                }
+                newState = suspended ? oldState | Principal.State.AUTHORITY_SYSTEM_SUSPENDED.getValue() :
+                        oldState & ~Principal.State.AUTHORITY_SYSTEM_SUSPENDED.getValue();
+                groupMember.setSystemDisabled(newState);
+                groupMembersWithUpdatedState = Collections.singletonList(groupMember);
+                // Following method does Audit entry as well
+                if (updateGroupMemberDisabledState(null, con, groupMembersWithUpdatedState, currentGroup.getDomainName(),
+                        currentGroup.getGroupName(), ZMSConsts.SYS_AUTH_MONITOR, AUDIT_REF, caller)) {
+                    con.updateGroupModTimestamp(currentGroup.getDomainName(), currentGroup.getGroupName());
+                    updatedDomains.add(currentGroup.getDomainName());
+                }
+            }
+            updatedDomains.forEach(dom -> {
+                con.updateDomainModTimestamp(dom);
+                cacheStore.invalidate(dom);
+            });
+        }
+    }
+
+    private void updateRoleMembershipsByPrincipalState(boolean suspended, String caller, ObjectStoreConnection con, Principal updatedUser) {
+        RoleMember roleMember;
+        List<RoleMember> roleMembersWithUpdatedState;
+        DomainRoleMember domainRoleMember;
+        int newState, oldState;
+        Set<String> updatedDomains = new HashSet<>();
+        domainRoleMember = con.getPrincipalRoles(updatedUser.getFullName(), null);
+        if (!domainRoleMember.getMemberRoles().isEmpty()) {
+            for (MemberRole memberRole : domainRoleMember.getMemberRoles()) {
+                roleMember = new RoleMember();
+                roleMember.setMemberName(updatedUser.getFullName());
+                oldState = 0;
+                if (memberRole.getSystemDisabled() != null) {
+                    oldState = memberRole.getSystemDisabled();
+                }
+                newState = suspended ? oldState | Principal.State.AUTHORITY_SYSTEM_SUSPENDED.getValue() :
+                        oldState & ~Principal.State.AUTHORITY_SYSTEM_SUSPENDED.getValue();
+                roleMember.setSystemDisabled(newState);
+                roleMembersWithUpdatedState = Collections.singletonList(roleMember);
+
+                // Following method does Audit entry as well
+                if (updateRoleMemberDisabledState(null, con, roleMembersWithUpdatedState, memberRole.getDomainName(),
+                        memberRole.getRoleName(), ZMSConsts.SYS_AUTH_MONITOR, AUDIT_REF, caller)) {
+                    con.updateRoleModTimestamp(memberRole.getDomainName(), memberRole.getRoleName());
+                    updatedDomains.add(memberRole.getDomainName());
+                }
+            }
+            updatedDomains.forEach(dom -> {
+                con.updateDomainModTimestamp(dom);
+                cacheStore.invalidate(dom);
+            });
+        }
+    }
+
+    class UserAuthorityFilterEnforcer implements Runnable {
+
+        public UserAuthorityFilterEnforcer() {
+        }
+
+        @Override
+        public void run() {
+
+            LOG.info("UserAuthorityFilterEnforcer: Starting user authority filter enforcer thread...");
+
+            try {
+                processRoleUserAuthorityRestrictions();
+            } catch (Throwable t) {
+                LOG.error("UserAuthorityFilterEnforcer: unable to enforce role user authority restrictions: {}",
+                        t.getMessage());
+            }
+
+            try {
+                processGroupUserAuthorityRestrictions();
+            } catch (Throwable t) {
+                LOG.error("UserAuthorityFilterEnforcer: unable to enforce group user authority restrictions: {}",
+                        t.getMessage());
+            }
+
+            LOG.info("UserAuthorityFilterEnforcer: Completed user authority filter enforcer thread");
         }
     }
 }

@@ -49,13 +49,13 @@ public class TokenTest {
     @BeforeTest
     private void loadKeys() throws IOException {
 
-        Path path = Paths.get("./src/test/resources/fantasy_private_k0.key");
+        Path path = Paths.get("./src/test/resources/unit_test_fantasy_private_k0.key");
         servicePrivateKeyStringK0 = new String(Files.readAllBytes(path));
 
         path = Paths.get("./src/test/resources/fantasy_public_k0.key");
         servicePublicKeyStringK0 = new String(Files.readAllBytes(path));
         
-        path = Paths.get("./src/test/resources/fantasy_private_k1.key");
+        path = Paths.get("./src/test/resources/unit_test_fantasy_private_k1.key");
         servicePrivateKeyStringK1 = new String(Files.readAllBytes(path));
 
         path = Paths.get("./src/test/resources/fantasy_public_k1.key");
@@ -221,7 +221,6 @@ public class TokenTest {
         Token token = new Token();
         assertFalse(token.validate((PublicKey) null, 3600, false, null));
 
-
         long timestamp = System.currentTimeMillis() / 1000;
         long expiration = TimeUnit.SECONDS.convert(30, TimeUnit.DAYS) + 11;
         PrincipalToken token1 = new PrincipalToken.Builder(svcVersion, svcDomain, svcName)
@@ -232,8 +231,5 @@ public class TokenTest {
 
         assertFalse(spyToken.validate(servicePublicKeyStringK0, 5, false));
         assertFalse(spyToken.validate(servicePublicKeyStringK0, 20, false));
-
-
     }
-
 }

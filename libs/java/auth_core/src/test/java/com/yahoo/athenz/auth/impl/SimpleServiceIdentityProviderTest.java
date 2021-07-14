@@ -17,7 +17,6 @@ package com.yahoo.athenz.auth.impl;
 
 import com.yahoo.athenz.auth.Authority;
 import com.yahoo.athenz.auth.Principal;
-import com.yahoo.athenz.auth.impl.SimpleServiceIdentityProvider;
 import com.yahoo.athenz.auth.token.PrincipalToken;
 import com.yahoo.athenz.auth.util.Crypto;
 
@@ -48,13 +47,13 @@ public class SimpleServiceIdentityProviderTest {
         Path path = Paths.get("./src/test/resources/fantasy_public_k0.key");
         servicePublicKeyStringK0 = new String(Files.readAllBytes(path));
 
-        path = Paths.get("./src/test/resources/fantasy_private_k0.key");
+        path = Paths.get("./src/test/resources/unit_test_fantasy_private_k0.key");
         k0File = path.toFile();
         
         path = Paths.get("./src/test/resources/fantasy_public_k1.key");
         servicePublicKeyStringK1 = new String(Files.readAllBytes(path));
 
-        path = Paths.get("./src/test/resources/fantasy_private_k1.key");
+        path = Paths.get("./src/test/resources/unit_test_fantasy_private_k1.key");
         servicePrivateKeyStringK1 = new String(Files.readAllBytes(path));
     }
 

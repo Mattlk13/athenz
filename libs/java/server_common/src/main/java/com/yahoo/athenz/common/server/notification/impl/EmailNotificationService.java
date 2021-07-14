@@ -16,188 +16,155 @@
 
 package com.yahoo.athenz.common.server.notification.impl;
 
-import com.amazonaws.regions.Region;
-import com.amazonaws.regions.Regions;
-import com.amazonaws.services.simpleemail.AmazonSimpleEmailService;
-import com.amazonaws.services.simpleemail.AmazonSimpleEmailServiceClientBuilder;
-import com.amazonaws.services.simpleemail.model.*;
+import com.amazonaws.util.IOUtils;
+import com.yahoo.athenz.common.server.notification.EmailProvider;
 import com.yahoo.athenz.common.server.notification.Notification;
+import com.yahoo.athenz.common.server.notification.NotificationEmail;
 import com.yahoo.athenz.common.server.notification.NotificationService;
+import jakarta.mail.Part;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-
-import java.text.MessageFormat;
+import jakarta.mail.MessagingException;
+import jakarta.mail.Session;
+import jakarta.mail.internet.InternetAddress;
+import jakarta.mail.internet.MimeBodyPart;
+import jakarta.mail.internet.MimeMessage;
+import jakarta.mail.internet.MimeMultipart;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URL;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
+import static com.yahoo.athenz.common.server.notification.NotificationServiceConstants.*;
+
 /*
- * This is a reference implementation using AWS SES.
+ * Email based notification service.
  */
 public class EmailNotificationService implements NotificationService {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(EmailNotificationService.class);
 
-    private static final String AT = "@";
-    private static final String CHARSET_UTF_8 = "UTF-8";
-    private static final String USER_DOMAIN_DEFAULT = "user";
-    private static final String PROP_USER_DOMAIN = "athenz.user_domain";
-    private static final String PROP_NOTIFICATION_EMAIL_DOMAIN_FROM = "athenz.notification_email_domain_from";
-    private static final String PROP_NOTIFICATION_EMAIL_DOMAIN_TO = "athenz.notification_email_domain_to";
-    private static final String PROP_NOTIFICATION_WORKFLOW_URL = "athenz.notification_workflow_url";
-    private static final String PROP_NOTIFICATION_EMAIL_FROM = "athenz.notification_email_from";
-
-    private static final String MEMBERSHIP_APPROVAL_SUBJECT = "athenz.notification.email.membership.approval.subject";
-    private static final String MEMBERSHIP_APPROVAL_REMINDER_SUBJECT = "athenz.notification.email.membership.reminder.subject";
-    private static final String MEMBERSHIP_APPROVAL_BODY = "athenz.notification.email.membership.approval.body";
-    private static final String MEMBERSHIP_APPROVAL_REMINDER_BODY = "athenz.notification.email.membership.reminder.body";
-
-    private static final String MEMBERSHIP_APPROVAL_FOOTER = "athenz.notification.email.membership.footer";
-
     private static final int SES_RECIPIENTS_LIMIT_PER_MESSAGE = 50;
 
-    // can be moved to constructor which can take Locale as input parameter and return appropriate resource bundle
-    private static final ResourceBundle RB = ResourceBundle.getBundle("messages/ServerCommon");
+    private static final String EMAIL_TEMPLATE_ATHENZ_LOGO = "emails/athenz-logo-white.png";
+    private static final String PROP_NOTIFICATION_EMAIL_DOMAIN_FROM = "athenz.notification_email_domain_from";
+    private static final String PROP_NOTIFICATION_EMAIL_FROM = "athenz.notification_email_from";
+    private static final String AT = "@";
 
-    private final AmazonSimpleEmailService ses;
+    private final EmailProvider emailProvider;
+    private final String emailDomainFrom;
+    private final String from;
 
-    private String userDomainPrefix;
-    private String emailDomainFrom;
-    private String emailDomainTo;
-    private String workflowUrl;
-    private String from;
+    private byte[] logoImage;
 
-    EmailNotificationService() {
-        this(initSES());
-    }
-
-    EmailNotificationService(AmazonSimpleEmailService ses) {
-        this.ses = ses;
-        String userDomain = System.getProperty(PROP_USER_DOMAIN, USER_DOMAIN_DEFAULT);
-        userDomainPrefix = userDomain + "\\.";
+    public EmailNotificationService(EmailProvider emailProvider) {
+        this.emailProvider = emailProvider;
         emailDomainFrom = System.getProperty(PROP_NOTIFICATION_EMAIL_DOMAIN_FROM);
-        emailDomainTo = System.getProperty(PROP_NOTIFICATION_EMAIL_DOMAIN_TO);
-        workflowUrl = System.getProperty(PROP_NOTIFICATION_WORKFLOW_URL);
         from = System.getProperty(PROP_NOTIFICATION_EMAIL_FROM);
+        logoImage = readBinaryFromFile(EMAIL_TEMPLATE_ATHENZ_LOGO);
     }
 
-    private static AmazonSimpleEmailService initSES() {
-        ///CLOVER:OFF
-        Region region = Regions.getCurrentRegion();
-        if (region == null) {
-            region = Region.getRegion(Regions.US_EAST_1);
+    byte[] readBinaryFromFile(String fileName) {
+
+        byte[] fileByteArray = null;
+        URL resource = getClass().getClassLoader().getResource(fileName);
+        if (resource != null) {
+            try (InputStream fileStream = resource.openStream()) {
+                //convert to byte array
+                fileByteArray = IOUtils.toByteArray(fileStream);
+
+            } catch (IOException ex) {
+                LOGGER.error("Could not read file: {}. Error message: {}", fileName, ex.getMessage());
+            }
         }
-        return AmazonSimpleEmailServiceClientBuilder.standard().withRegion(region.getName()).build();
-        ///CLOVER:ON
+        return fileByteArray;
     }
 
     @Override
     public boolean notify(Notification notification) {
-        if (notification != null) {
-            String subject = getSubject(notification.getType());
-            String body = getBody(notification.getType(), notification.getDetails());
-            Set<String> recipients = getFullyQualifiedEmailAddresses(notification.getRecipients());
-            return sendEmail(recipients, subject, body);
+        if (notification == null) {
+            return false;
         }
-        return false;
-    }
 
-    String getBody(String type, Map<String, String> details) {
+        NotificationEmail notificationAsEmail = notification.getNotificationAsEmail();
 
-        String body = "";
-        switch (type) {
-            case NOTIFICATION_TYPE_MEMBERSHIP_APPROVAL:
-                body = getMembershipApprovalBody(details);
-                break;
-
-            case NOTIFICATION_TYPE_MEMBERSHIP_APPROVAL_REMINDER:
-                body = getMembershipApprovalReminderBody();
-                break;
+        if (notificationAsEmail == null) {
+            return false;
         }
-        body = body + getFooter();
-        return body;
-    }
 
-    String getFooter() {
-        return RB.getString(MEMBERSHIP_APPROVAL_FOOTER);
-    }
-
-    String getSubject(String type) {
-        String subject = "";
-        switch (type) {
-            case NOTIFICATION_TYPE_MEMBERSHIP_APPROVAL:
-                subject = RB.getString(MEMBERSHIP_APPROVAL_SUBJECT);
-                break;
-
-            case NOTIFICATION_TYPE_MEMBERSHIP_APPROVAL_REMINDER:
-                subject = RB.getString(MEMBERSHIP_APPROVAL_REMINDER_SUBJECT);
-                break;
-        }
-        return subject;
-    }
-
-    Set<String> getFullyQualifiedEmailAddresses(Set<String> recipients) {
-        return recipients.stream()
-                .map(s -> s.replaceAll(userDomainPrefix, ""))
-                .map(r -> r + AT + emailDomainTo)
-                .collect(Collectors.toSet());
-    }
-
-
-    String getMembershipApprovalReminderBody() {
-        return MessageFormat.format(RB.getString(MEMBERSHIP_APPROVAL_REMINDER_BODY), workflowUrl);
-    }
-
-
-    String getMembershipApprovalBody(Map<String, String> metaDetails) {
-        return MessageFormat.format(RB.getString(MEMBERSHIP_APPROVAL_BODY), metaDetails.get(NotificationService.NOTIFICATION_DETAILS_DOMAIN),
-                metaDetails.get(NotificationService.NOTIFICATION_DETAILS_ROLE), metaDetails.get(NotificationService.NOTIFICATION_DETAILS_MEMBER),
-                metaDetails.get(NotificationService.NOTIFICATION_DETAILS_REASON), metaDetails.get(NotificationService.NOTIFICATION_DETAILS_REQUESTOR),
-                workflowUrl);
+        final String subject = notificationAsEmail.getSubject();
+        final String body = notificationAsEmail.getBody();
+        Set<String> recipients = notificationAsEmail.getFullyQualifiedRecipientsEmail();
+        return sendEmail(recipients, subject, body);
     }
 
     boolean sendEmail(Set<String> recipients, String subject, String body) {
         final AtomicInteger counter = new AtomicInteger();
-        boolean status = true;
         // SES imposes a limit of 50 recipients. So we convert the recipients into batches
         if (recipients.size() > SES_RECIPIENTS_LIMIT_PER_MESSAGE) {
             final Collection<List<String>> recipientsBatch = recipients.stream()
                     .collect(Collectors.groupingBy(it -> counter.getAndIncrement() / SES_RECIPIENTS_LIMIT_PER_MESSAGE))
                     .values();
+            boolean status = true;
             for (List<String> recipientsSegment : recipientsBatch) {
-                status = sendEmail(subject, body, status, recipientsSegment);
+                if (!sendEmailMIME(subject, body, recipientsSegment)) {
+                    status = false;
+                }
             }
+            return status;
         } else {
-            status = sendEmail(subject, body, status, new ArrayList<>(recipients));
+            return sendEmailMIME(subject, body, new ArrayList<>(recipients));
         }
-
-
-        return status;
     }
 
-    private boolean sendEmail(String subject, String body, boolean status, Collection<String> recipients) {
-            try {
-                SendEmailRequest request = new SendEmailRequest()
-                        .withDestination(new Destination()
-                                .withBccAddresses(recipients))
-                        .withMessage(new Message()
-                                .withBody(new Body()
-                                        .withHtml(new Content()
-                                                .withCharset(CHARSET_UTF_8).withData(body)))
-                                .withSubject(new Content()
-                                        .withCharset(CHARSET_UTF_8).withData(subject)))
-                        .withSource(from + AT + emailDomainFrom);
-                SendEmailResult result = ses.sendEmail(request);
-                if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("Email with messageId={} sent successfully.", result.getMessageId());
-                }
-                status = status && result != null;
-            } catch (Exception ex) {
-                LOGGER.error("The email could not be sent. Error message: {}", ex.getMessage());
-                status = false;
-            }
+    private MimeMessage getMimeMessage(String subject, String body, Collection<String> recipients, String from, byte[] logoImage) throws MessagingException {
+        Session session = Session.getDefaultInstance(new Properties());
 
-        return status;
+        // Create a new MimeMessage object.
+        MimeMessage message = new MimeMessage(session);
+
+        // Add subject, from and to lines.
+        message.setSubject(subject, CHARSET_UTF_8);
+        message.setFrom(new InternetAddress(from));
+        message.setRecipients(jakarta.mail.Message.RecipientType.BCC, InternetAddress.parse(String.join(",", recipients)));
+
+        // Set the HTML part.
+        MimeBodyPart htmlPart = new MimeBodyPart();
+        htmlPart.setContent(body, "text/html; charset=" + CHARSET_UTF_8);
+
+        // Create a multipart/mixed parent container.
+        MimeMultipart msgParent = new MimeMultipart("related");
+
+        // Add the body to the message.
+        msgParent.addBodyPart(htmlPart);
+
+        // Add the parent container to the message.
+        message.setContent(msgParent);
+
+        if (logoImage != null) {
+            MimeBodyPart logo = new MimeBodyPart();
+            logo.setContent(logoImage, "image/png");
+            logo.setContentID(HTML_LOGO_CID_PLACEHOLDER);
+            logo.setDisposition(Part.INLINE);
+            // Add the attachment to the message.
+            msgParent.addBodyPart(logo);
+        }
+
+        return message;
+    }
+
+    private boolean sendEmailMIME(String subject, String body, Collection<String> recipients) {
+        MimeMessage mimeMessage;
+        try {
+            mimeMessage = getMimeMessage(subject, body, recipients, from + AT + emailDomainFrom, logoImage);
+        } catch (MessagingException ex) {
+            LOGGER.error("The email could not be sent. Error message: {}", ex.getMessage());
+            return false;
+        }
+
+        return emailProvider.sendEmail(recipients, from + AT + emailDomainFrom, mimeMessage);
     }
 }

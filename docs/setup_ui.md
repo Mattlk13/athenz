@@ -21,26 +21,25 @@ UI Server is a Node.js application.
 
 [Node.js JavaScript Runtime](https://nodejs.org/en/)
 
-Verify that you have the required minimum version of `node` and
+Verify that you have the following versions of `node` and
 `nodemon` binaries installed on your system and are included
 in your runtime path:
 
 ```shell
 $ node --version
-v6.9.4
+v12.14.0
 $ npm install -g nodemon
 $ nodemon --version
-1.11.0
+2.0.3
 ```
-
+ 
 ## Getting Software
 -------------------
 
-Download latest Athenz UI release from Bintray - click on the `Files` tab,
-choose the latest version directory and then download the
-`athenz-ui-<latest-version>-bin.tar.gz` file:
-
-[ ![Download](https://api.bintray.com/packages/yahoo/maven/athenz-ui/images/download.svg) ](https://bintray.com/yahoo/maven/athenz-ui/_latestVersion)
+Build the latest UI binary release by following the
+[development instructions](dev_environment.md). The binary release
+packages  will be created automatically in the `assembly` subdirectory.
+Copy the `athenz-ui-X.Y-bin.tar.gz` to your desired setup directory.
 
 ```shell
 $ tar xvfz athenz-ui-X.Y-bin.tar.gz
@@ -62,7 +61,7 @@ argument below pass the full path of the zms_cert.pem.
 
 ```shell
 $ cd athenz-ui-X.Y
-$ bin/setup_dev_ui.sh <zms-hostname> <zms-public-cert-path>
+$ bin/setup_dev_ui.sh <zms-hostname> <zms-public-cert-path> <admin-username> <admin-fullname>
 ```
 
 Running this setup script completes the following tasks:
@@ -81,7 +80,7 @@ Set the following environment variable before starting the UI Server:
 
 ```shell
 $ cd athenz-ui-X.Y
-$ export UI_SERVER=<ui-server-host-name> ZMS_SERVER=<zms-server-host-name>
+$ export UI_SERVER=<ui-server-host-name> ZMS_SERVER=<zms-server-host-name> NODE_ENV=production
 $ sudo -E bin/athenz_ui start
 ```
 
@@ -92,7 +91,7 @@ To stop the UI server, execute the following commands:
 
 ```shell
 $ cd athenz-ui-X.Y
-$ export UI_SERVER=<ui-server-host-name> ZMS_SERVER=<zms-server-host-name>
+$ export UI_SERVER=<ui-server-host-name> ZMS_SERVER=<zms-server-host-name> NODE_ENV=production
 $ sudo -E bin/athenz_ui stop
 ```
 

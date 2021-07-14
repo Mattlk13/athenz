@@ -23,22 +23,23 @@ import java.util.List;
 import java.util.Map;
 
 import javax.net.ssl.SSLContext;
+import javax.ws.rs.client.ClientBuilder;
 
 import com.amazonaws.services.securitytoken.model.Credentials;
+import javax.net.ssl.HostnameVerifier;
 import com.yahoo.athenz.auth.Principal;
-import com.yahoo.athenz.auth.ServiceIdentityProvider;
+import com.yahoo.athenz.auth.util.Crypto;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 
 public class ZTSClientMock extends ZTSClient {
 
-    public ZTSClientMock() {
-    }
+    private static ClientBuilder clientBuilder;
+    private String csrUriVerifyValue;
+    private List<String> csrDnsVerifyValues;
 
     public ZTSClientMock(String ztsUrl) {
         super(ztsUrl);
-    }
-
-    public ZTSClientMock(Principal identity) {
-        super(identity);
     }
 
     public ZTSClientMock(String ztsUrl, Principal identity) {
@@ -49,12 +50,26 @@ public class ZTSClientMock extends ZTSClient {
         super(ztsUrl, sslContext);
     }
 
-    public ZTSClientMock(String domainName, String serviceName, ServiceIdentityProvider siaProvider) {
-        super(domainName, serviceName, siaProvider);
+    @Override
+    PoolingHttpClientConnectionManager createConnectionManager(SSLContext sslContext, HostnameVerifier hostnameVerifier) {
+        return null;
     }
 
-    public ZTSClientMock(String ztsUrl, String domainName, String serviceName, ServiceIdentityProvider siaProvider) {
-        super(ztsUrl, domainName, serviceName, siaProvider);
+    public static void setClientBuilder(ClientBuilder builder) {
+        clientBuilder = builder;
+    }
+
+    public void setCsrUriVerifyValue(final String uriValue) {
+        csrUriVerifyValue = uriValue;
+    }
+
+    public void setCsrDnsVerifyValues(final List<String> dnsValues) {
+        csrDnsVerifyValues = dnsValues;
+    }
+
+    @Override
+    ClientBuilder getClientBuilder() {
+        return (clientBuilder == null) ? ClientBuilder.newBuilder() : clientBuilder;
     }
 
     @Override
@@ -70,6 +85,25 @@ public class ZTSClientMock extends ZTSClient {
     @Override
     public InstanceIdentity postInstanceRegisterInformation(InstanceRegisterInformation info,
             Map<String, List<String>> responseHeaders) {
+
+        // if we're asked to validate any values we should do so here
+
+        if (csrUriVerifyValue != null) {
+            PKCS10CertificationRequest certReq = Crypto.getPKCS10CertRequest(info.getCsr());
+            final List<String> values = Crypto.extractX509CSRURIs(certReq);
+            if (values.size() != 1 || !csrUriVerifyValue.equals(values.get(0))) {
+                throw new IllegalArgumentException("csr uri value not verified");
+            }
+        }
+
+        if (csrDnsVerifyValues != null) {
+            PKCS10CertificationRequest certReq = Crypto.getPKCS10CertRequest(info.getCsr());
+            final List<String> dnsValues = Crypto.extractX509CSRDnsNames(certReq);
+            if (!csrDnsVerifyValues.equals(dnsValues)) {
+                throw new IllegalArgumentException("csr dns name value not verified");
+            }
+        }
+
         InstanceIdentity identity = new InstanceIdentity();
         Path path = Paths.get("./src/test/resources/test_cert.pem");
         try {
@@ -79,5 +113,4 @@ public class ZTSClientMock extends ZTSClient {
         }
         return identity;
     }
-    
 }

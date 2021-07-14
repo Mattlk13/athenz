@@ -15,10 +15,13 @@
  */
 package com.yahoo.athenz.zts.cert;
 
+import com.yahoo.athenz.auth.AuthorityConsts;
 import com.yahoo.athenz.auth.util.Crypto;
 import com.yahoo.athenz.auth.util.CryptoException;
+import com.yahoo.athenz.common.utils.X509CertUtils;
 import com.yahoo.athenz.zts.ZTSConsts;
 import com.yahoo.athenz.zts.utils.ZTSUtils;
+import org.eclipse.jetty.util.StringUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,85 +32,124 @@ public class X509RoleCertRequest extends X509CertRequest {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(X509RoleCertRequest.class);
 
+    private static final String SPIFFE_ROLE_AGENT    = "ra";
+
+    protected String reqRoleName;
+    protected String reqRoleDomain;
+    protected String rolePrincipal;
+
     public X509RoleCertRequest(String csr) throws CryptoException {
+
+        // parse the csr request
+
         super(csr);
-    }
 
-    public Map<String, String[]> getRequestedRoleList() {
+        // make sure the CN is a valid role name
 
-        // first extract the URI list from the request
-
-        if (uris == null || uris.isEmpty()) {
-            return null;
+        int idx = cn.indexOf(AuthorityConsts.ROLE_SEP);
+        if (idx == -1 || idx == 0 || idx == cn.length() - AuthorityConsts.ROLE_SEP.length()) {
+            throw new CryptoException("Role Certificate CN is not a valid role: " + cn);
         }
 
-        Map<String, List<String>> domainRoles = new HashMap<>();
+        reqRoleDomain = cn.substring(0, idx);
+        reqRoleName = cn.substring(idx + AuthorityConsts.ROLE_SEP.length());
+        rolePrincipal = X509CertUtils.extractItemFromURI(uris, ZTSConsts.ZTS_CERT_PRINCIPAL_URI);
+    }
 
-        // the format of our URIs is:
-        // athenz://role/<domainName>/<roleName>
+    public String getReqRoleName() {
+        return reqRoleName;
+    }
 
+    public void setReqRoleName(final String reqRoleName) {
+        this.reqRoleName = reqRoleName;
+    }
+
+    public String getReqRoleDomain() {
+        return reqRoleDomain;
+    }
+
+    public void setReqRoleDomain(final String reqRoleDomain) {
+        this.reqRoleDomain = reqRoleDomain;
+    }
+
+    boolean validateProxyUserUri(final String proxyUser) {
+
+        // if we have not URI values then it's failure
+
+        if (uris == null || uris.isEmpty()) {
+            LOGGER.error("No URI fields available in the CSR");
+            return false;
+        }
+
+        // we must only have a single spiffe uri in the list
+
+        String proxyUserUri = null;
         for (String uri : uris) {
 
-            if (!uri.toLowerCase().startsWith(ZTSConsts.ZTS_CERT_ROLE_URI)) {
+            if (!uri.toLowerCase().startsWith(ZTSConsts.ZTS_CERT_PROXY_USER_URI)) {
                 continue;
             }
 
-            final String roleUri = uri.substring(ZTSConsts.ZTS_CERT_ROLE_URI.length());
-            int idx = roleUri.indexOf('/');
-            if (idx == -1) {
-                if (LOGGER.isDebugEnabled()) {
-                    LOGGER.debug("Invalid role name '{}' in CSR", uri);
-                }
-                return null;
+            if (proxyUserUri != null) {
+                LOGGER.error("Multiple ProxyUser URIs in the CSR: {}/{}", uri, proxyUserUri);
+                return false;
             }
 
-            final String domainName = roleUri.substring(0, idx);
-            List<String> rolesForDomain = domainRoles.get(domainName);
-            if (rolesForDomain == null) {
-                rolesForDomain = new ArrayList<>();
-                domainRoles.put(domainName, rolesForDomain);
-            }
-            rolesForDomain.add(roleUri.substring(idx + 1));
+            proxyUserUri = uri;
         }
 
-        if (domainRoles.isEmpty()) {
-            return null;
+        if (proxyUserUri == null) {
+            LOGGER.error("No ProxyUserURI fields available in the CSR");
+            return false;
         }
 
-        Map<String, String[]> roles = new HashMap<>();
-        for (String domainName : domainRoles.keySet()) {
-            roles.put(domainName, domainRoles.get(domainName).toArray(new String[0]));
+        final String uriCheck = ZTSConsts.ZTS_CERT_PROXY_USER_URI + proxyUser;
+        if (!proxyUserUri.equals(uriCheck)) {
+            LOGGER.error("ProxyUserURI mismatch: {} vs {}", proxyUserUri, uriCheck);
+            return false;
         }
 
-        return roles;
+        return true;
     }
 
-    String validateAndExtractRoleName(Set<String> roles, final String domainName) {
+    boolean validateRolePrincipal(final String principal) {
 
-        // we must have only a single value in our list since we specified
-        // what role we're looking for but we'll iterate through the list
-        // anyway
+        // let's get our email fields which we're going to
+        // use for our principal validation (this is the old
+        // format)
 
-        for (String role : roles) {
-            final String roleName = domainName + ":role." + role;
-            if (LOGGER.isDebugEnabled()) {
-                LOGGER.debug("validateRoleCertificateRequest: validating role {} against {}",
-                        roleName, cn);
+        List<String> emails = Crypto.extractX509CSREmails(certReq);
+
+        // if we already have a principal extracted from the uri
+        // we'll use that for verification
+
+        if (!StringUtil.isEmpty(rolePrincipal)) {
+
+            if (!principal.equalsIgnoreCase(rolePrincipal)) {
+                LOGGER.error("validateRolePrincipal: role principal mismatch {} vs {}", principal, rolePrincipal);
+                return false;
             }
-            if (cn.equals(roleName)) {
-                return role;
+
+            // we need to make sure we don't have any email
+            // fields (old format) specified in the request
+            // otherwise we're going to validate that as well
+
+            if (emails.isEmpty()) {
+                return true;
             }
         }
-        return null;
+
+        // now let's check if we have an rfc822 field for the principal
+
+        return validateEmail(emails, principal);
     }
 
-    boolean validateEmail(final String principal) {
+    boolean validateEmail(List<String> emails, final String principal) {
 
         // now let's check if we have an rfc822 field specified in the
         // request. it must be of the following format: principal@[dns-suffix]
         // and we must have only a single value specified
 
-        List<String> emails = Crypto.extractX509CSREmails(certReq);
         if (emails.size() != 1) {
             LOGGER.error("validateRoleCertificateRequest: csr has incorrect number of emails: {}",
                     emails.size());
@@ -125,21 +167,17 @@ public class X509RoleCertRequest extends X509CertRequest {
         return true;
     }
 
-    public boolean validate(Set<String> roles, final String domainName,
-            final String principal, Set<String> validCertSubjectOrgValues) {
+    public boolean validate(final String principal, final String proxyUser, Set<String> validCertSubjectOrgValues) {
 
-        // validate that the common name matches to the role name
-        // that is being returned in the response
+        // now let's check if we have a valid role principal
 
-        final String roleName = validateAndExtractRoleName(roles, domainName);
-        if (roleName == null) {
-            LOGGER.error("validateRoleCertificateRequest: unable to validate role name");
+        if (!validateRolePrincipal(principal)) {
             return false;
         }
 
-        // now let's check if we have an rfc822 field for the principal
+        // let's check if we have a uri for the proxy user
 
-        if (!validateEmail(principal)) {
+        if (proxyUser != null && !validateProxyUserUri(proxyUser)) {
             return false;
         }
 
@@ -151,36 +189,7 @@ public class X509RoleCertRequest extends X509CertRequest {
 
         // validate spiffe uri if one is provided
 
-        return validateSpiffeURI(domainName, "ra", roleName);
-    }
-
-    public boolean validate(final String principal, final String proxyUser,
-            Set<String> validCertSubjectOrgValues) {
-
-        // first make sure the cn is our expected principal
-
-        if (!validateCommonName(principal)) {
-            return false;
-        }
-
-        // now let's check if we have an rfc822 field for the
-        // proxy principal if proxy user is the one making the
-        // role request
-
-        if (proxyUser != null && !validateEmail(proxyUser)) {
-            return false;
-        }
-
-        // validate the o field value is specified
-
-        if (!validateSubjectOField(validCertSubjectOrgValues)) {
-            return false;
-        }
-
-        // validate spiffe uri to make sure we don't have
-        // any specified
-
-        return spiffeUri == null;
+        return validateSpiffeURI(reqRoleDomain, SPIFFE_ROLE_AGENT, reqRoleName);
     }
 
     public boolean validateIPAddress(X509Certificate cert, final String ip) {

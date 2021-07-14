@@ -37,6 +37,12 @@
                         },
                         {
                             "effect": "DENY",
+                            "action": "ThroW2",
+                            "role": "angler:role.public",
+                            "resource": "angler:StUFf2"
+                        },
+                        {
+                            "effect": "DENY",
                             "action": "fish",
                             "role": "angler:role.public",
                             "resource": "angler:spawningpond*"
@@ -52,6 +58,12 @@
                             "action": "access",
                             "effect": "ALLOW",
                             "resource": "angler:tables.blah"
+                        },
+                        {
+                            "role": "angler:role.pachinko",
+                            "action": "AccEss2",
+                            "effect": "ALLOW",
+                            "resource": "angler:TableS.BlaH2"
                         }
                     ],
                     "modified": "2014-05-24T00:35:11.387Z",
@@ -154,9 +166,9 @@
                 }
             ]
         },
-        "zmsSignature": "eN5aZiqCof3HjHctjkYB2itNvI.90u.bq6zzLoXG8CJ8hSwG6IBMaIQ0yf.Q_SR5HTFi7Tmrc1quQuH17H0PJg--",
+        "zmsSignature": "RJ1jktCbxaw7h5VD8i28Y2ylRqCRgTR5KZE_vPPY5XE4vUdVoaVtTwddB_AZOUEDSTEAEdl2Kol.H4iFE4875n6dI2_o6ivEGpdiDPZfOvUfGcJ3vgAZpyn9_DQfsLvYdtOujFPAJRDIoi7kWLVaydKcCS3E0mjuu9HIvK6bS6GCzA4kUYTLHZu6xkhiCMAnDfjFQlLFuX8z1Q6rWvRvPjvm3UbsIZhEsIMi2GAW.NR9Hm9ez404GxRPB5TfgZs5Q8KUBOiipTr4yCaLjmOpxxek4H.pvjF9tmqgUk8OEtj9fT.4AJc_f5N.4eNurqrBHTqYTa_nqxg_mf2BRVazJw--",
         "zmsKeyId": "0"
     },
-    "signature": "o6G6eXPifUvvE87ElgpquAaSQGr0L0v_6HkcXJ972.v62eaedhMkJO5fPLS0RbmhQfiy_GPZsZNPB_gkULI4eFSsqfWb4hTtKgo1uqS6QoPc2KZDeXrGc_ocAqpB4l1qsj4y_o9vj8ICtHgLqRxIvmdajSPmy4xo0p8Us7q0pZ2_td8xN3ZsjMZDES78_grhRexcwnI_3a25jAWg_BzUZh5ynGUh221wAZZ3FzqL7CijKzHv.V7iUqOaqb4yziCtxEuWIkcpyQ8U77BA8jCxvwxoIEBbGXE_BM0Hp8G7sfFFxV6WojoY4YwHfVIPCOlG5C0fcH5gf0NzsvlUb7oOew--",
+    "signature": "WLec.k8heG8pcbNeJg7wQmQTlTgMWQv9sEXtF0qlGUULtPh9eFp4ruuqDXn8ASNevvTBq9Cu2WKeytu_Yn3sRlxVK8X8r_dVZS8vC6TIc4uRtT7slHGW.3El.pwHKbFoR0GVKiFTWswoS4_hZHwYSbWyd2BRLY5BdIBse7dhtFBCSFgv.OUpHD.Q0s5ssf_ckvB9AVLa1nuOiwj72Fzte25Dwp_Em9K7spw44R4LHeHKaD9GMuAUl8tDYRoprUA0BEopSOeYP5LJJ9jORvXFcu__ELcMj6X4FGhP_P4CH5oXZPpEITWtgmTeIwghobTls2YE3a2SUUNp1icZwmyu8g--",
     "keyId": "0"
 }

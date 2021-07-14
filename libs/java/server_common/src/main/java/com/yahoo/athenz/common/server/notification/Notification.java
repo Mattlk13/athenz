@@ -16,12 +16,11 @@
 
 package com.yahoo.athenz.common.server.notification;
 
+import com.yahoo.rdl.Timestamp;
+
 import java.util.*;
 
 public class Notification {
-
-    // Denotes notification type. MEMBERSHIP_APPROVAL, MEMBERSHIP_EXPIRY etc.
-    private String type;
 
     // Intended recipients of notification
     private Set<String> recipients;
@@ -29,18 +28,13 @@ public class Notification {
     // key value pair describing additional details about notification
     private Map<String, String> details;
 
-    public Notification (String type, Set<String> recipients, Map<String, String> details) {
-        this.type = type;
-        this.recipients = recipients;
-        this.details = details;
-    }
+    // Utility class to convert the notification into an email
+    private NotificationToEmailConverter notificationToEmailConverter;
 
-    public Notification (String type) {
-        this.type = type;
-    }
+    // Utility class to convert the notification into metric attributes
+    private NotificationToMetricConverter notificationToMetricConverter;
 
-    public String getType() {
-        return type;
+    public Notification () {
     }
 
     public Set<String> getRecipients() {
@@ -80,6 +74,30 @@ public class Notification {
         return this;
     }
 
+    public Notification setNotificationToEmailConverter(NotificationToEmailConverter notificationToEmailConverter) {
+        this.notificationToEmailConverter = notificationToEmailConverter;
+        return this;
+    }
+
+    public NotificationEmail getNotificationAsEmail() {
+        if (notificationToEmailConverter != null) {
+            return notificationToEmailConverter.getNotificationAsEmail(this);
+        }
+        return null;
+    }
+
+    public Notification setNotificationToMetricConverter(NotificationToMetricConverter notificationToMetricConverter) {
+        this.notificationToMetricConverter = notificationToMetricConverter;
+        return this;
+    }
+
+    public NotificationMetric getNotificationAsMetrics(Timestamp currentTime) {
+        if (notificationToMetricConverter != null) {
+            return notificationToMetricConverter.getNotificationAsMetrics(this, currentTime);
+        }
+        return null;
+    }
+
     @Override
     public boolean equals(Object o) {
         if (this == o) {
@@ -89,22 +107,33 @@ public class Notification {
             return false;
         }
         Notification that = (Notification) o;
-        return getType().equals(that.getType()) &&
-                Objects.equals(getRecipients(), that.getRecipients()) &&
-                Objects.equals(getDetails(), that.getDetails());
+        Timestamp currentTime = Timestamp.fromMillis(System.currentTimeMillis());
+        return  Objects.equals(getRecipients(), that.getRecipients()) &&
+                Objects.equals(getDetails(), that.getDetails()) &&
+                Objects.equals(getNotificationAsMetrics(currentTime), that.getNotificationAsMetrics(currentTime)) &&
+                Objects.equals(getNotificationAsEmail(), that.getNotificationAsEmail());
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(getType(), getRecipients(), getDetails());
+        return Objects.hash(getRecipients(), getDetails());
     }
 
     @Override
     public String toString() {
+        String emailConverterClassName = "";
+        if (notificationToEmailConverter != null) {
+            emailConverterClassName = notificationToEmailConverter.getClass().getName();
+        }
+        String metricConverterClassName = "";
+        if (notificationToMetricConverter != null) {
+            metricConverterClassName = notificationToMetricConverter.getClass().getName();
+        }
         return "Notification{" +
-                "type='" + type + '\'' +
-                ", recipients=" + recipients +
+                "recipients=" + recipients +
                 ", details=" + details +
+                ", emailConverterClass=" + emailConverterClassName +
+                ", metricConverterClass=" + metricConverterClassName +
                 '}';
     }
 }

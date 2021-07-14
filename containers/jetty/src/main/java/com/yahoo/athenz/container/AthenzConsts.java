@@ -34,23 +34,27 @@ public final class AthenzConsts {
     public static final String ATHENZ_PROP_TRUSTSTORE_PASSWORD    = "athenz.ssl_trust_store_password";
     public static final String ATHENZ_PROP_KEYSTORE_PATH          = "athenz.ssl_key_store";
     public static final String ATHENZ_PROP_KEYSTORE_TYPE          = "athenz.ssl_key_store_type";
+    public static final String ATHENZ_PROP_KEYSTORE_RELOAD_SEC    = "athenz.ssl_key_store_reload_seconds";
     public static final String ATHENZ_PROP_TRUSTSTORE_PATH        = "athenz.ssl_trust_store";
     public static final String ATHENZ_PROP_TRUSTSTORE_TYPE        = "athenz.ssl_trust_store_type";
     public static final String ATHENZ_PROP_EXCLUDED_CIPHER_SUITES = "athenz.ssl_excluded_cipher_suites";
     public static final String ATHENZ_PROP_INCLUDED_CIPHER_SUITES = "athenz.ssl_included_cipher_suites";
     public static final String ATHENZ_PROP_EXCLUDED_PROTOCOLS     = "athenz.ssl_excluded_protocols";
     public static final String ATHENZ_PROP_CLIENT_AUTH            = "athenz.ssl_need_client_auth";
-    public static final String ATHENZ_PROP_ENABLE_OCSP            = "athenz.ssl_enable_ocsp";
     public static final String ATHENZ_PROP_RENEGOTIATION_ALLOWED  = "athenz.ssl_renegotiation_allowed";
+    public static final String ATHENZ_PROP_SSL_LOG_FAILURES       = "athenz.ssl_log_failures";
     public static final String ATHENZ_PROP_IDLE_TIMEOUT           = "athenz.http_idle_timeout";
     public static final String ATHENZ_PROP_PROXY_PROTOCOL         = "athenz.proxy_protocol";
     public static final String ATHENZ_PROP_SEND_SERVER_VERSION    = "athenz.http_send_server_version";
     public static final String ATHENZ_PROP_SEND_DATE_HEADER       = "athenz.http_send_date_header";
     public static final String ATHENZ_PROP_OUTPUT_BUFFER_SIZE     = "athenz.http_output_buffer_size";
-    public static final String ATHENZ_PROP_REQUEST_HEADER_SIZE    = "athenz.http_reqeust_header_size";
+    public static final String ATHENZ_PROP_REQUEST_HEADER_SIZE    = "athenz.http_request_header_size";
     public static final String ATHENZ_PROP_RESPONSE_HEADER_SIZE   = "athenz.http_response_header_size";
     public static final String ATHENZ_PROP_LISTEN_HOST            = "athenz.listen_host";
     public static final String ATHENZ_PROP_KEEP_ALIVE             = "athenz.keep_alive";
+    public static final String ATHENZ_PROP_RESPONSE_HEADERS_JSON  = "athenz.response_headers_json";
+    public static final String ATHENZ_PROP_GZIP_SUPPORT           = "athenz.gzip_support";
+    public static final String ATHENZ_PROP_GZIP_MIN_SIZE          = "athenz.gzip_min_size";
     public static final String ATHENZ_PROP_MAX_THREADS            = "athenz.http_max_threads";
     public static final String ATHENZ_PROP_HOSTNAME               = "athenz.hostname";
     public static final String ATHENZ_PROP_JETTY_HOME             = "athenz.jetty_home";
@@ -78,4 +82,7 @@ public final class AthenzConsts {
     public static final String ATHENZ_PROP_KEYSTORE_PASSWORD_APPNAME   = "athenz.ssl_key_store_password_appname";
     public static final String ATHENZ_PROP_KEYMANAGER_PASSWORD_APPNAME = "athenz.ssl_key_manager_password_appname";
     public static final String ATHENZ_PROP_TRUSTSTORE_PASSWORD_APPNAME = "athenz.ssl_trust_store_password_appname";
+
+    public static final String ATHENZ_PROP_GRACEFUL_SHUTDOWN = "athenz.graceful_shutdown";
+    public static final String ATHENZ_PROP_GRACEFUL_SHUTDOWN_TIMEOUT = "athenz.graceful_shutdown_timeout";
 }

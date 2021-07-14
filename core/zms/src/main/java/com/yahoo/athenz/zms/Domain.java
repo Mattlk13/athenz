@@ -3,7 +3,9 @@
 //
 
 package com.yahoo.athenz.zms;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import java.util.Map;
 import com.yahoo.rdl.*;
 
 //
@@ -14,6 +16,7 @@ import com.yahoo.rdl.*;
 // reverse-DNS namespaces). The top level domains are governed by the special
 // "sys.auth" domain.
 //
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class Domain {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
@@ -45,6 +48,33 @@ public class Domain {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public Integer tokenExpiryMins;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer serviceCertExpiryMins;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer roleCertExpiryMins;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String signAlgorithm;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer serviceExpiryDays;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer groupExpiryDays;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String userAuthorityFilter;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String azureSubscription;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Map<String, TagValueList> tags;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public String businessService;
     public String name;
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
@@ -123,6 +153,69 @@ public class Domain {
     public Integer getTokenExpiryMins() {
         return tokenExpiryMins;
     }
+    public Domain setServiceCertExpiryMins(Integer serviceCertExpiryMins) {
+        this.serviceCertExpiryMins = serviceCertExpiryMins;
+        return this;
+    }
+    public Integer getServiceCertExpiryMins() {
+        return serviceCertExpiryMins;
+    }
+    public Domain setRoleCertExpiryMins(Integer roleCertExpiryMins) {
+        this.roleCertExpiryMins = roleCertExpiryMins;
+        return this;
+    }
+    public Integer getRoleCertExpiryMins() {
+        return roleCertExpiryMins;
+    }
+    public Domain setSignAlgorithm(String signAlgorithm) {
+        this.signAlgorithm = signAlgorithm;
+        return this;
+    }
+    public String getSignAlgorithm() {
+        return signAlgorithm;
+    }
+    public Domain setServiceExpiryDays(Integer serviceExpiryDays) {
+        this.serviceExpiryDays = serviceExpiryDays;
+        return this;
+    }
+    public Integer getServiceExpiryDays() {
+        return serviceExpiryDays;
+    }
+    public Domain setGroupExpiryDays(Integer groupExpiryDays) {
+        this.groupExpiryDays = groupExpiryDays;
+        return this;
+    }
+    public Integer getGroupExpiryDays() {
+        return groupExpiryDays;
+    }
+    public Domain setUserAuthorityFilter(String userAuthorityFilter) {
+        this.userAuthorityFilter = userAuthorityFilter;
+        return this;
+    }
+    public String getUserAuthorityFilter() {
+        return userAuthorityFilter;
+    }
+    public Domain setAzureSubscription(String azureSubscription) {
+        this.azureSubscription = azureSubscription;
+        return this;
+    }
+    public String getAzureSubscription() {
+        return azureSubscription;
+    }
+    public Domain setTags(Map<String, TagValueList> tags) {
+        this.tags = tags;
+        return this;
+    }
+    public Map<String, TagValueList> getTags() {
+        return tags;
+    }
+    public Domain setBusinessService(String businessService) {
+        this.businessService = businessService;
+        return this;
+    }
+    public String getBusinessService() {
+        return businessService;
+    }
     public Domain setName(String name) {
         this.name = name;
         return this;
@@ -180,6 +273,33 @@ public class Domain {
                 return false;
             }
             if (tokenExpiryMins == null ? a.tokenExpiryMins != null : !tokenExpiryMins.equals(a.tokenExpiryMins)) {
+                return false;
+            }
+            if (serviceCertExpiryMins == null ? a.serviceCertExpiryMins != null : !serviceCertExpiryMins.equals(a.serviceCertExpiryMins)) {
+                return false;
+            }
+            if (roleCertExpiryMins == null ? a.roleCertExpiryMins != null : !roleCertExpiryMins.equals(a.roleCertExpiryMins)) {
+                return false;
+            }
+            if (signAlgorithm == null ? a.signAlgorithm != null : !signAlgorithm.equals(a.signAlgorithm)) {
+                return false;
+            }
+            if (serviceExpiryDays == null ? a.serviceExpiryDays != null : !serviceExpiryDays.equals(a.serviceExpiryDays)) {
+                return false;
+            }
+            if (groupExpiryDays == null ? a.groupExpiryDays != null : !groupExpiryDays.equals(a.groupExpiryDays)) {
+                return false;
+            }
+            if (userAuthorityFilter == null ? a.userAuthorityFilter != null : !userAuthorityFilter.equals(a.userAuthorityFilter)) {
+                return false;
+            }
+            if (azureSubscription == null ? a.azureSubscription != null : !azureSubscription.equals(a.azureSubscription)) {
+                return false;
+            }
+            if (tags == null ? a.tags != null : !tags.equals(a.tags)) {
+                return false;
+            }
+            if (businessService == null ? a.businessService != null : !businessService.equals(a.businessService)) {
                 return false;
             }
             if (name == null ? a.name != null : !name.equals(a.name)) {

@@ -57,14 +57,19 @@ public class RoleAuthority implements Authority, AuthorityKeyStore {
             allowedOffset = 300;
         }
     }
-    
+
+    @Override
+    public String getID() {
+        return "Auth-ROLE";
+    }
+
     @Override
     public void initialize() {
     }
 
     @Override
     public String getDomain() {
-        return "sys.auth";
+        return SYS_AUTH_DOMAIN;
     }
 
     @Override
@@ -82,7 +87,7 @@ public class RoleAuthority implements Authority, AuthorityKeyStore {
 
         errMsg = errMsg == null ? new StringBuilder(512) : errMsg;
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Authenticating RoleToken: " + signedToken);
+            LOG.debug("Authenticating RoleToken: {}", signedToken);
         }
 
         RoleToken roleToken;

@@ -747,78 +747,6 @@ func (client ZTSClient) GetAWSTemporaryCredentials(domainName DomainName, role A
 	}
 }
 
-func (client ZTSClient) PostOSTKInstanceInformation(info *OSTKInstanceInformation) (*Identity, error) {
-	var data *Identity
-	url := client.URL + "/ostk/instance"
-	contentBytes, err := json.Marshal(info)
-	if err != nil {
-		return data, err
-	}
-	resp, err := client.httpPost(url, nil, contentBytes)
-	if err != nil {
-		return data, err
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case 200:
-		err = json.NewDecoder(resp.Body).Decode(&data)
-		if err != nil {
-			return data, err
-		}
-		return data, nil
-	default:
-		var errobj rdl.ResourceError
-		contentBytes, err = ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return data, err
-		}
-		json.Unmarshal(contentBytes, &errobj)
-		if errobj.Code == 0 {
-			errobj.Code = resp.StatusCode
-		}
-		if errobj.Message == "" {
-			errobj.Message = string(contentBytes)
-		}
-		return data, errobj
-	}
-}
-
-func (client ZTSClient) PostOSTKInstanceRefreshRequest(domain CompoundName, service SimpleName, req *OSTKInstanceRefreshRequest) (*Identity, error) {
-	var data *Identity
-	url := client.URL + "/ostk/instance/" + fmt.Sprint(domain) + "/" + fmt.Sprint(service) + "/refresh"
-	contentBytes, err := json.Marshal(req)
-	if err != nil {
-		return data, err
-	}
-	resp, err := client.httpPost(url, nil, contentBytes)
-	if err != nil {
-		return data, err
-	}
-	defer resp.Body.Close()
-	switch resp.StatusCode {
-	case 200:
-		err = json.NewDecoder(resp.Body).Decode(&data)
-		if err != nil {
-			return data, err
-		}
-		return data, nil
-	default:
-		var errobj rdl.ResourceError
-		contentBytes, err = ioutil.ReadAll(resp.Body)
-		if err != nil {
-			return data, err
-		}
-		json.Unmarshal(contentBytes, &errobj)
-		if errobj.Code == 0 {
-			errobj.Code = resp.StatusCode
-		}
-		if errobj.Message == "" {
-			errobj.Message = string(contentBytes)
-		}
-		return data, errobj
-	}
-}
-
 func (client ZTSClient) PostInstanceRegisterInformation(info *InstanceRegisterInformation) (*InstanceIdentity, string, error) {
 	var data *InstanceIdentity
 	url := client.URL + "/instance"
@@ -892,6 +820,38 @@ func (client ZTSClient) PostInstanceRefreshInformation(provider ServiceName, dom
 	}
 }
 
+func (client ZTSClient) GetInstanceRegisterToken(provider ServiceName, domain DomainName, service SimpleName, instanceId PathElement) (*InstanceRegisterToken, error) {
+	var data *InstanceRegisterToken
+	url := client.URL + "/instance/" + fmt.Sprint(provider) + "/" + fmt.Sprint(domain) + "/" + fmt.Sprint(service) + "/" + fmt.Sprint(instanceId) + "/token"
+	resp, err := client.httpGet(url, nil)
+	if err != nil {
+		return data, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+		err = json.NewDecoder(resp.Body).Decode(&data)
+		if err != nil {
+			return data, err
+		}
+		return data, nil
+	default:
+		var errobj rdl.ResourceError
+		contentBytes, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return data, err
+		}
+		json.Unmarshal(contentBytes, &errobj)
+		if errobj.Code == 0 {
+			errobj.Code = resp.StatusCode
+		}
+		if errobj.Message == "" {
+			errobj.Message = string(contentBytes)
+		}
+		return data, errobj
+	}
+}
+
 func (client ZTSClient) DeleteInstanceIdentity(provider ServiceName, domain DomainName, service SimpleName, instanceId PathElement) error {
 	url := client.URL + "/instance/" + fmt.Sprint(provider) + "/" + fmt.Sprint(domain) + "/" + fmt.Sprint(service) + "/" + fmt.Sprint(instanceId)
 	resp, err := client.httpDelete(url, nil)
@@ -919,14 +879,10 @@ func (client ZTSClient) DeleteInstanceIdentity(provider ServiceName, domain Doma
 	}
 }
 
-func (client ZTSClient) PostDomainMetrics(domainName DomainName, req *DomainMetrics) (*DomainMetrics, error) {
-	var data *DomainMetrics
-	url := client.URL + "/metrics/" + fmt.Sprint(domainName)
-	contentBytes, err := json.Marshal(req)
-	if err != nil {
-		return data, err
-	}
-	resp, err := client.httpPost(url, nil, contentBytes)
+func (client ZTSClient) GetCertificateAuthorityBundle(name SimpleName) (*CertificateAuthorityBundle, error) {
+	var data *CertificateAuthorityBundle
+	url := client.URL + "/cacerts/" + fmt.Sprint(name)
+	resp, err := client.httpGet(url, nil)
 	if err != nil {
 		return data, err
 	}
@@ -940,7 +896,7 @@ func (client ZTSClient) PostDomainMetrics(domainName DomainName, req *DomainMetr
 		return data, nil
 	default:
 		var errobj rdl.ResourceError
-		contentBytes, err = ioutil.ReadAll(resp.Body)
+		contentBytes, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			return data, err
 		}
@@ -1110,6 +1066,102 @@ func (client ZTSClient) PostRoleCertificateRequestExt(req *RoleCertificateReques
 	default:
 		var errobj rdl.ResourceError
 		contentBytes, err = ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return data, err
+		}
+		json.Unmarshal(contentBytes, &errobj)
+		if errobj.Code == 0 {
+			errobj.Code = resp.StatusCode
+		}
+		if errobj.Message == "" {
+			errobj.Message = string(contentBytes)
+		}
+		return data, errobj
+	}
+}
+
+func (client ZTSClient) GetWorkloadsByService(domainName DomainName, serviceName EntityName) (*Workloads, error) {
+	var data *Workloads
+	url := client.URL + "/domain/" + fmt.Sprint(domainName) + "/service/" + fmt.Sprint(serviceName) + "/workloads"
+	resp, err := client.httpGet(url, nil)
+	if err != nil {
+		return data, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+		err = json.NewDecoder(resp.Body).Decode(&data)
+		if err != nil {
+			return data, err
+		}
+		return data, nil
+	default:
+		var errobj rdl.ResourceError
+		contentBytes, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return data, err
+		}
+		json.Unmarshal(contentBytes, &errobj)
+		if errobj.Code == 0 {
+			errobj.Code = resp.StatusCode
+		}
+		if errobj.Message == "" {
+			errobj.Message = string(contentBytes)
+		}
+		return data, errobj
+	}
+}
+
+func (client ZTSClient) GetWorkloadsByIP(ip string) (*Workloads, error) {
+	var data *Workloads
+	url := client.URL + "/workloads/" + ip
+	resp, err := client.httpGet(url, nil)
+	if err != nil {
+		return data, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+		err = json.NewDecoder(resp.Body).Decode(&data)
+		if err != nil {
+			return data, err
+		}
+		return data, nil
+	default:
+		var errobj rdl.ResourceError
+		contentBytes, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			return data, err
+		}
+		json.Unmarshal(contentBytes, &errobj)
+		if errobj.Code == 0 {
+			errobj.Code = resp.StatusCode
+		}
+		if errobj.Message == "" {
+			errobj.Message = string(contentBytes)
+		}
+		return data, errobj
+	}
+}
+
+func (client ZTSClient) GetTransportRules(domainName DomainName, serviceName EntityName) (*TransportRules, error) {
+	var data *TransportRules
+	url := client.URL + "/domain/" + fmt.Sprint(domainName) + "/service/" + fmt.Sprint(serviceName) + "/transportRules"
+	resp, err := client.httpGet(url, nil)
+	if err != nil {
+		return data, err
+	}
+	defer resp.Body.Close()
+	switch resp.StatusCode {
+	case 200:
+		err = json.NewDecoder(resp.Body).Decode(&data)
+		if err != nil {
+			return data, err
+		}
+		return data, nil
+	default:
+		var errobj rdl.ResourceError
+		contentBytes, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			return data, err
 		}

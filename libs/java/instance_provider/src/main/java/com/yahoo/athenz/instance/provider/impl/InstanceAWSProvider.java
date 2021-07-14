@@ -22,6 +22,7 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
 
+import org.eclipse.jetty.util.StringUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -52,8 +53,7 @@ public class InstanceAWSProvider implements InstanceProvider {
     static final String ATTR_REGION       = "region";
     static final String ATTR_PENDING_TIME = "pendingTime";
     static final String ATTR_INSTANCE_ID  = "instanceId";
-
-    static final String ZTS_INSTANCE_AWS_ACCOUNT  = "cloudAccount";
+    static final String ATTR_PRIVATE_IP   = "privateIp";
 
     static final String AWS_PROP_PUBLIC_CERT      = "athenz.zts.aws_public_cert";
     static final String AWS_PROP_BOOT_TIME_OFFSET = "athenz.zts.aws_boot_time_offset";
@@ -78,8 +78,8 @@ public class InstanceAWSProvider implements InstanceProvider {
     public void initialize(String provider, String providerEndpoint, SSLContext sslContext,
             KeyStore keyStore) {
         
-        String awsCertFileName = System.getProperty(AWS_PROP_PUBLIC_CERT);
-        if (awsCertFileName != null && !awsCertFileName.isEmpty()) {
+        String awsCertFileName = System.getProperty(AWS_PROP_PUBLIC_CERT, "");
+        if (!awsCertFileName.isEmpty()) {
             File awsCertFile = new File(awsCertFileName);
             X509Certificate awsCert = Crypto.loadX509Certificate(awsCertFile);
             awsPublicKey = awsCert.getPublicKey();
@@ -188,7 +188,7 @@ public class InstanceAWSProvider implements InstanceProvider {
     
     boolean validateAWSDocument(final String provider, AWSAttestationData info,
             final String awsAccount, final String instanceId, boolean checkTime,
-            StringBuilder errMsg) {
+            StringBuilder privateIp, StringBuilder errMsg) {
         
         final String document = info.getDocument();
         if (!validateAWSSignature(document, info.getSignature(), errMsg)) {
@@ -220,7 +220,14 @@ public class InstanceAWSProvider implements InstanceProvider {
         if (!validateAWSInstanceId(instanceId, infoInstanceId, errMsg)) {
             return false;
         }
-        
+
+        // save the private ip
+
+        final String ip = instanceDocument.getString(ATTR_PRIVATE_IP);
+        if (ip != null) {
+            privateIp.append(ip);
+        }
+
         // verify that the boot up time for the instance is now
 
         return !checkTime || validateInstanceBootTime(instanceDocument, errMsg);
@@ -262,7 +269,7 @@ public class InstanceAWSProvider implements InstanceProvider {
         // object has an associated aws account id
         
         final String awsAccount = InstanceUtils.getInstanceProperty(instanceAttributes, ZTS_INSTANCE_AWS_ACCOUNT);
-        if (awsAccount == null) {
+        if (StringUtil.isEmpty(awsAccount)) {
             throw error("Unable to extract AWS Account id");
         }
         
@@ -277,7 +284,7 @@ public class InstanceAWSProvider implements InstanceProvider {
         // validate the certificate host names
         
         StringBuilder instanceId = new StringBuilder(256);
-        if (!InstanceUtils.validateCertRequestHostnames(instanceAttributes, instanceDomain,
+        if (!InstanceUtils.validateCertRequestSanDnsNames(instanceAttributes, instanceDomain,
                 instanceService, dnsSuffix, instanceId)) {
             throw error("Unable to validate certificate request hostnames");
         }
@@ -288,10 +295,11 @@ public class InstanceAWSProvider implements InstanceProvider {
         // a default of 7 days only
 
         boolean instanceDocumentCreds = info.getDocument() != null;
+        StringBuilder privateIp = new StringBuilder(64);
         if (instanceDocumentCreds) {
             StringBuilder errMsg = new StringBuilder(256);
-            if (!validateAWSDocument(confirmation.getProvider(), info,
-                    awsAccount, instanceId.toString(), true, errMsg)) {
+            if (!validateAWSDocument(confirmation.getProvider(), info, awsAccount,
+                    instanceId.toString(), true, privateIp, errMsg)) {
                 LOGGER.error("validateAWSDocument: {}", errMsg.toString());
                 throw error("Unable to validate AWS document: " + errMsg.toString());
             }
@@ -299,7 +307,7 @@ public class InstanceAWSProvider implements InstanceProvider {
             
         // set the attributes to be returned to the ZTS server
 
-        setConfirmationAttributes(confirmation, instanceDocumentCreds);
+        setConfirmationAttributes(confirmation, instanceDocumentCreds, privateIp.toString());
 
         // verify that the temporary credentials specified in the request
         // can be used to assume the given role thus verifying the
@@ -360,10 +368,11 @@ public class InstanceAWSProvider implements InstanceProvider {
         // to issue SSH host certificates
 
         boolean instanceDocumentCreds = info.getDocument() != null;
+        StringBuilder privateIp = new StringBuilder(64);
         if (instanceDocumentCreds) {
             StringBuilder errMsg = new StringBuilder(256);
-            if (!validateAWSDocument(confirmation.getProvider(), info,
-                    awsAccount, instanceId, false, errMsg)) {
+            if (!validateAWSDocument(confirmation.getProvider(), info, awsAccount,
+                    instanceId, false, privateIp, errMsg)) {
                 LOGGER.error("validateAWSDocument: {}", errMsg.toString());
                 throw error("Unable to validate AWS document: " + errMsg.toString());
             }
@@ -371,7 +380,7 @@ public class InstanceAWSProvider implements InstanceProvider {
 
         // set the attributes to be returned to the ZTS server
 
-        setConfirmationAttributes(confirmation, instanceDocumentCreds);
+        setConfirmationAttributes(confirmation, instanceDocumentCreds, privateIp.toString());
         
         // verify that the temporary credentials specified in the request
         // can be used to assume the given role thus verifying the
@@ -384,12 +393,16 @@ public class InstanceAWSProvider implements InstanceProvider {
         return confirmation;
     }
     
-    void setConfirmationAttributes(InstanceConfirmation confirmation, boolean instanceDocumentCreds) {
+    void setConfirmationAttributes(InstanceConfirmation confirmation, boolean instanceDocumentCreds,
+                                   final String privateIp) {
 
         Map<String, String> attributes = new HashMap<>();
         attributes.put(InstanceProvider.ZTS_CERT_SSH, Boolean.toString(instanceDocumentCreds));
         if (!instanceDocumentCreds) {
             attributes.put(InstanceProvider.ZTS_CERT_EXPIRY_TIME, Long.toString(certValidityTime));
+        }
+        if (!privateIp.isEmpty()) {
+            attributes.put(InstanceProvider.ZTS_INSTANCE_PRIVATE_IP, privateIp);
         }
         confirmation.setAttributes(attributes);
     }

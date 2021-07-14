@@ -16,7 +16,6 @@
 package com.yahoo.athenz.zts;
 
 import java.util.*;
-
 import com.yahoo.rdl.Timestamp;
 
 public class ZTSRDLClientMock extends ZTSRDLGeneratedClient implements java.io.Closeable {
@@ -35,11 +34,13 @@ public class ZTSRDLClientMock extends ZTSRDLGeneratedClient implements java.io.C
     private String policyName = null;
     private List<String> tenantDomains = null;
     private int jwkExcCode = 0;
+    private int requestCount = 0;
 
     Map<String, AWSTemporaryCredentials> credsMap = new HashMap<>();
 
     private Map<String, Long> lastRoleTokenFetchedTime = new HashMap<>();
     private Map<String, Long> lastAccessTokenFetchedTime = new HashMap<>();
+    private Map<String, Long> lastRoleTokenFailTime = new HashMap<>();
 
     static String getKey(String domain, String roleName, String proxyForPrincipal) {
         return domain + "-" + roleName + "-" + proxyForPrincipal;
@@ -59,6 +60,14 @@ public class ZTSRDLClientMock extends ZTSRDLGeneratedClient implements java.io.C
             return lastRoleTokenFetchedTime.get(key);
         }
         return -1;
+    }
+
+    long getLastTokenFailTime(String domain, String roleName) {
+        String key = domain + ":" + roleName;
+        if (lastRoleTokenFailTime.containsKey(key)) {
+            return lastRoleTokenFailTime.get(key);
+        }
+        return -1L;
     }
 
     long getLastAccessTokenFetchedTime(String domain, String roleName, String proxyForPrincipal) {
@@ -186,6 +195,9 @@ public class ZTSRDLClientMock extends ZTSRDLGeneratedClient implements java.io.C
         } else if (request.equals("grant_type=client_credentials&expires_in=3600&scope=coretech%3Adomain+openid+coretech%3Aservice.backend")) {
             tokenResponse.setScope("coretech:role.role1");
             tokenResponse.setId_token("idtoken");
+        } else if (request.equals("grant_type=client_credentials&expires_in=3600&scope=coretech%3Arole.role1&authorization_details=%5B%7B%22type%22%3A%22message_access%22%2C%22location%22%3A%5B%22https%3A%2F%2Flocation1%22%2C%22https%3A%2F%2Flocation2%22%5D%2C%22identifier%22%3A%22id1%22%7D%5D")) {
+            tokenResponse.setAccess_token("accesstoken-authz-details");
+            tokenResponse.setExpires_in(3600 + requestCount);
         } else if (request.equals("grant_type=client_credentials&expires_in=500&scope=resourceexception%3Adomain")) {
             throw new ResourceException(400, "Unable to get access token");
         } else if (request.equals("grant_type=client_credentials&expires_in=500&scope=exception%3Adomain")) {
@@ -205,6 +217,7 @@ public class ZTSRDLClientMock extends ZTSRDLGeneratedClient implements java.io.C
             }
         }
 
+        requestCount += 1;
         return tokenResponse;
     }
 
@@ -245,11 +258,14 @@ public class ZTSRDLClientMock extends ZTSRDLGeneratedClient implements java.io.C
     @Override
     public AWSTemporaryCredentials getAWSTemporaryCredentials(String domainName, String roleName,
             Integer durationSeconds, String externalId) {
-        
-        if (credsMap.isEmpty()) {
-            throw new ZTSClientException(ZTSClientException.NOT_FOUND, "role is not assumed");
-        }
+
         String key = domainName + ":" + roleName;
+        if (credsMap.isEmpty()) {
+            lastRoleTokenFailTime.put(key, System.currentTimeMillis());
+            throw new ZTSClientException(ResourceException.NOT_FOUND, "role is not assumed");
+        } else {
+            lastRoleTokenFailTime.put(key, -1L);
+        }
         AWSTemporaryCredentials creds = credsMap.get(key);
         if (creds == null) {
             return null;
@@ -411,6 +427,11 @@ public class ZTSRDLClientMock extends ZTSRDLGeneratedClient implements java.io.C
     }
 
     @Override
+    public RoleCertificate postRoleCertificateRequestExt(RoleCertificateRequest req) {
+        return new RoleCertificate().setX509Certificate("x509cert");
+    }
+
+    @Override
     public Access getAccess(String domainName, String roleName, String principal) {
         if (domainName.equals("exc")) {
             throw new ResourceException(400, "Invalid request");
@@ -443,10 +464,73 @@ public class ZTSRDLClientMock extends ZTSRDLGeneratedClient implements java.io.C
     }
 
     @Override
-    public DomainMetrics postDomainMetrics(String domainName, DomainMetrics req) {
-        if (domainName.equals("exc")) {
-            throw new ResourceException(400, "Invalid request");
+    public CertificateAuthorityBundle getCertificateAuthorityBundle(String bundleName) {
+        if (bundleName.equals("exc")) {
+            throw new NullPointerException("Invalid request");
         }
-        return null;
+        if (bundleName.equals("system")) {
+            throw new ResourceException(404, "Unknown bundle name");
+        }
+        CertificateAuthorityBundle bundle = new CertificateAuthorityBundle();
+        bundle.setName(bundleName);
+        bundle.setCerts("certs");
+        return bundle;
+    }
+
+    @Override
+    public Workloads getWorkloadsByService(String domainName, String serviceName) {
+        if ("bad-domain".equals(domainName)) {
+            throw new ResourceException(404, "unknown domain");
+        }
+        Workload wl = new Workload().setProvider("openstack").setIpAddresses(Collections.singletonList("10.0.0.1"))
+                .setUuid("avve-resw").setUpdateTime(Timestamp.fromMillis(System.currentTimeMillis()));
+        return new Workloads().setWorkloadList(Collections.singletonList(wl));
+    }
+
+    @Override
+    public Workloads getWorkloadsByIP(String ip) {
+        if ("127.0.0.1".equals(ip)) {
+            throw new ResourceException(404, "unknown ip");
+        }
+        Workload wl = new Workload().setProvider("openstack").setDomainName("athenz").setServiceName("api")
+                .setUuid("avve-resw").setUpdateTime(Timestamp.fromMillis(System.currentTimeMillis()));
+        return new Workloads().setWorkloadList(Collections.singletonList(wl));
+    }
+
+    @Override
+    public TransportRules getTransportRules(String domainName, String serviceName) {
+        TransportRule tr;
+        TransportRules transportRules = null;
+        switch (domainName) {
+            case "bad-domain":
+                throw new ResourceException(404, "unknown domain");
+            case "ingress-domain":
+                tr = new TransportRule().setEndPoint("10.0.0.1/26").setPort(4443).setProtocol("TCP")
+                        .setSourcePortRange("1024-65535");
+                transportRules = new TransportRules();
+                transportRules.setIngressRules(Collections.singletonList(tr));
+                break;
+            case "egress-domain":
+                tr = new TransportRule().setEndPoint("10.0.0.1/23").setPort(8443).setProtocol("TCP")
+                        .setSourcePortRange("1024-65535");
+                transportRules = new TransportRules();
+                transportRules.setEgressRules(Collections.singletonList(tr));
+                break;
+        }
+
+        return transportRules;
+    }
+
+    @Override
+    public InstanceRegisterToken getInstanceRegisterToken(String provider, String domain, String service, String instanceId) {
+
+        if ("coretech".equals(domain)) {
+            return new InstanceRegisterToken().setProvider(provider).setDomain(domain)
+                    .setService(service).setAttestationData("token");
+        } else if ("bad-domain".equals(domain)) {
+            throw new ResourceException(ResourceException.NOT_FOUND, "unknown domain");
+        } else {
+            throw new IllegalArgumentException();
+        }
     }
 }

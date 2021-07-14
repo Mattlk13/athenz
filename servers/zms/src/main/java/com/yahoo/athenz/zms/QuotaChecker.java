@@ -25,7 +25,8 @@ class QuotaChecker {
 
     private final Quota defaultQuota;
     private boolean quotaCheckEnabled;
-    
+    int assertionConditionsQuota = Integer.parseInt(System.getProperty(ZMSConsts.ZMS_PROP_QUOTA_ASSERTION_CONDITIONS, "10"));
+
     public QuotaChecker() {
         
         // first check if the quota check is enabled or not
@@ -43,13 +44,16 @@ class QuotaChecker {
         int publicKeyQuota = Integer.parseInt(System.getProperty(ZMSConsts.ZMS_PROP_QUOTA_PUBLIC_KEY, "100"));
         int entityQuota = Integer.parseInt(System.getProperty(ZMSConsts.ZMS_PROP_QUOTA_ENTITY, "100"));
         int subDomainQuota = Integer.parseInt(System.getProperty(ZMSConsts.ZMS_PROP_QUOTA_SUBDOMAIN, "100"));
-        
+        int groupQuota = Integer.parseInt(System.getProperty(ZMSConsts.ZMS_PROP_QUOTA_GROUP, "100"));
+        int groupMemberQuota = Integer.parseInt(System.getProperty(ZMSConsts.ZMS_PROP_QUOTA_GROUP_MEMBER, "100"));
+
         defaultQuota = new Quota().setName("server-default")
                 .setAssertion(assertionQuota).setEntity(entityQuota)
                 .setPolicy(policyQuota).setPublicKey(publicKeyQuota)
                 .setRole(roleQuota).setRoleMember(roleMemberQuota)
                 .setService(serviceQuota).setServiceHost(serviceHostQuota)
-                .setSubdomain(subDomainQuota).setModified(Timestamp.fromCurrentTime());
+                .setSubdomain(subDomainQuota).setGroup(groupQuota)
+                .setGroupMember(groupMemberQuota).setModified(Timestamp.fromCurrentTime());
     }
     
     public Quota getDomainQuota(ObjectStoreConnection con, String domainName) {
@@ -136,7 +140,44 @@ class QuotaChecker {
                     + quota.getRole() + " actual: " + objectCount, caller);
         }
     }
-    
+
+    void checkGroupQuota(ObjectStoreConnection con, String domainName, Group group, String caller) {
+
+        // if quota check is disabled we have nothing to do
+
+        if (!quotaCheckEnabled) {
+            return;
+        }
+
+        // if our group is null then there is no quota check
+
+        if (group == null) {
+            return;
+        }
+
+        // first retrieve the domain quota
+
+        final Quota quota = getDomainQuota(con, domainName);
+
+        // first we're going to verify the elements that do not
+        // require any further data from the object store
+
+        int objectCount = getListSize(group.getGroupMembers());
+        if (quota.getGroupMember() < objectCount) {
+            throw ZMSUtils.quotaLimitError("group member quota exceeded - limit: "
+                    + quota.getGroupMember() + " actual: " + objectCount, caller);
+        }
+
+        // now we're going to check if we'll be allowed
+        // to create this group in the domain
+
+        objectCount = con.countGroups(domainName) + 1;
+        if (quota.getGroup() < objectCount) {
+            throw ZMSUtils.quotaLimitError("group quota exceeded - limit: "
+                    + quota.getGroup() + " actual: " + objectCount, caller);
+        }
+    }
+
     void checkRoleMembershipQuota(ObjectStoreConnection con, String domainName,
             String roleName, String caller) {
         
@@ -159,7 +200,30 @@ class QuotaChecker {
                     + quota.getRoleMember() + " actual: " + objectCount, caller);
         }
     }
-    
+
+    void checkGroupMembershipQuota(ObjectStoreConnection con, String domainName,
+                                  String groupName, String caller) {
+
+        // if quota check is disabled we have nothing to do
+
+        if (!quotaCheckEnabled) {
+            return;
+        }
+
+        // first retrieve the domain quota
+
+        final Quota quota = getDomainQuota(con, domainName);
+
+        // now check to make sure we can add 1 more member
+        // to this group without exceeding the quota
+
+        int objectCount = con.countGroupMembers(domainName, groupName) + 1;
+        if (quota.getGroupMember() < objectCount) {
+            throw ZMSUtils.quotaLimitError("group member quota exceeded - limit: "
+                    + quota.getGroupMember() + " actual: " + objectCount, caller);
+        }
+    }
+
     void checkPolicyQuota(ObjectStoreConnection con, String domainName, Policy policy, String caller) {
         
         // if quota check is disabled we have nothing to do
@@ -313,6 +377,47 @@ class QuotaChecker {
         if (quota.getEntity() < objectCount) {
             throw ZMSUtils.quotaLimitError("entity quota exceeded - limit: "
                     + quota.getEntity() + " actual: " + objectCount, caller);
+        }
+    }
+    void checkAssertionConditionsQuota(ObjectStoreConnection con, long assertionId, AssertionConditions assertionConditions,
+                                       String caller) {
+
+        // if quota check is disabled we have nothing to do
+        if (!quotaCheckEnabled) {
+            return;
+        }
+
+        // if our assertionConditions is null then there is no quota check
+        if (assertionConditions == null || assertionConditions.getConditionsList() == null ||
+                assertionConditions.getConditionsList().isEmpty()) {
+            return;
+        }
+
+        // we're going to check if we'll be allowed to create given assertionConditions
+        int newCount = assertionConditions.getConditionsList().stream().map(c -> c.getConditionsMap().size()).reduce(0, Integer::sum);
+        countAssertionConditions(con, assertionId, newCount, caller);
+    }
+
+    void checkAssertionConditionQuota(ObjectStoreConnection con, long assertionId, AssertionCondition assertionCondition,
+                                      String caller) {
+
+        // if quota check is disabled we have nothing to do
+        if (!quotaCheckEnabled) {
+            return;
+        }
+        if (assertionCondition == null) {
+            return;
+        }
+        countAssertionConditions(con, assertionId, assertionCondition.getConditionsMap().size(), caller);
+
+    }
+
+    void countAssertionConditions(ObjectStoreConnection con, long assertionId, int newCount, String caller) {
+        // we're going to check if we'll be allowed to create given assertionConditions
+        int objectCount = con.countAssertionConditions(assertionId) + newCount;
+        if (assertionConditionsQuota < objectCount) {
+            throw ZMSUtils.quotaLimitError("assertion conditions quota exceeded - limit: "
+                    + assertionConditionsQuota + " actual: " + objectCount, caller);
         }
     }
 }

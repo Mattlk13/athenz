@@ -26,17 +26,20 @@ public interface ZTSHandler {
     TenantDomains getTenantDomains(ResourceContext context, String providerDomainName, String userName, String roleName, String serviceName);
     Identity postInstanceRefreshRequest(ResourceContext context, String domain, String service, InstanceRefreshRequest req);
     AWSTemporaryCredentials getAWSTemporaryCredentials(ResourceContext context, String domainName, String role, Integer durationSeconds, String externalId);
-    Identity postOSTKInstanceInformation(ResourceContext context, OSTKInstanceInformation info);
-    Identity postOSTKInstanceRefreshRequest(ResourceContext context, String domain, String service, OSTKInstanceRefreshRequest req);
     Response postInstanceRegisterInformation(ResourceContext context, InstanceRegisterInformation info);
     InstanceIdentity postInstanceRefreshInformation(ResourceContext context, String provider, String domain, String service, String instanceId, InstanceRefreshInformation info);
+    InstanceRegisterToken getInstanceRegisterToken(ResourceContext context, String provider, String domain, String service, String instanceId);
     void deleteInstanceIdentity(ResourceContext context, String provider, String domain, String service, String instanceId);
-    DomainMetrics postDomainMetrics(ResourceContext context, String domainName, DomainMetrics req);
+    CertificateAuthorityBundle getCertificateAuthorityBundle(ResourceContext context, String name);
     Status getStatus(ResourceContext context);
     Response postSSHCertRequest(ResourceContext context, SSHCertRequest certRequest);
     JWKList getJWKList(ResourceContext context, Boolean rfc);
     AccessTokenResponse postAccessTokenRequest(ResourceContext context, String request);
     RoleCertificate postRoleCertificateRequestExt(ResourceContext context, RoleCertificateRequest req);
+    Workloads getWorkloadsByService(ResourceContext context, String domainName, String serviceName);
+    Workloads getWorkloadsByIP(ResourceContext context, String ip);
+    TransportRules getTransportRules(ResourceContext context, String domainName, String serviceName);
     Schema getRdlSchema(ResourceContext context);
-    ResourceContext newResourceContext(HttpServletRequest request, HttpServletResponse response);
+    ResourceContext newResourceContext(HttpServletRequest request, HttpServletResponse response, String apiName);
+    void recordMetrics(ResourceContext ctx, int httpStatus);
 }

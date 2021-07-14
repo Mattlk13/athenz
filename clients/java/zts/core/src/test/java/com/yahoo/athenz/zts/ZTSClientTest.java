@@ -15,6 +15,8 @@
  */
 package com.yahoo.athenz.zts;
 
+import static com.yahoo.athenz.zts.AccessTokenTestFileHelper.setupInvalidTokenFile;
+import static com.yahoo.athenz.zts.AccessTokenTestFileHelper.setupTokenFile;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotEquals;
@@ -23,6 +25,7 @@ import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
+import com.yahoo.athenz.auth.token.jwts.JwtsSigningKeyResolver;
 import org.bouncycastle.asn1.x500.RDN;
 import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.asn1.x500.style.BCStyle;
@@ -31,7 +34,10 @@ import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.security.PrivateKey;
+import java.security.PublicKey;
 import java.security.cert.Certificate;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
@@ -42,6 +48,8 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLPeerUnverifiedException;
 import javax.net.ssl.SSLSession;
 
+import org.glassfish.jersey.client.JerseyClientBuilder;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeClass;
@@ -94,6 +102,7 @@ public class ZTSClientTest {
     public void testLookupZTSUrl() {
 
         System.setProperty(ZTSClient.ZTS_CLIENT_PROP_ATHENZ_CONF, "src/test/resources/athenz.conf");
+        ZTSClient.initConfigValues();
         Principal principal = SimplePrincipal.create("user_domain", "user",
                 "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
         ZTSClient client = new ZTSClient(null, principal);
@@ -123,54 +132,36 @@ public class ZTSClientTest {
 
     @Test
     public void testIsExpiredTokenSmallerThanMin() {
-        Principal principal = SimplePrincipal.create("user_domain", "user",
-                "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
-        ZTSClient client = new ZTSClient("http://localhost:4080/", principal);
-        assertTrue(client.isExpiredToken(100, 200, null, 900));
-        client.close();
+        assertTrue(ZTSClient.isExpiredToken(100, 200, null, 900));
     }
 
     @Test
     public void testIsExpiredTokenBiggerThanMax() {
-        Principal principal = SimplePrincipal.create("user_domain", "user",
-                "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
-        ZTSClient client = new ZTSClient("http://localhost:4080/", principal);
-        assertTrue(client.isExpiredToken(500, null, 300, 900));
-        assertTrue(client.isExpiredToken(500, 200, 300, 900));
-        client.close();
+        // we allow 300 sec offset
+        assertFalse(ZTSClient.isExpiredToken(500, null, 300, 900));
+        assertTrue(ZTSClient.isExpiredToken(650, null, 300, 900));
+        assertTrue(ZTSClient.isExpiredToken(650, 200, 300, 900));
     }
 
     @Test
     public void testIsExpiredTokenAtLeastOneLimitIsNotNull() {
-        Principal principal = SimplePrincipal.create("user_domain", "user",
-                "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
-        ZTSClient client = new ZTSClient("http://localhost:4080/", principal);
-        assertFalse(client.isExpiredToken(500, null, 600, 900));
-        assertFalse(client.isExpiredToken(500, 200, null, 900));
-        assertFalse(client.isExpiredToken(500, 200, 501, 900));
-        client.close();
+        assertFalse(ZTSClient.isExpiredToken(500, null, 600, 900));
+        assertFalse(ZTSClient.isExpiredToken(500, 200, null, 900));
+        assertFalse(ZTSClient.isExpiredToken(500, 200, 501, 900));
     }
 
     @Test
     public void testIsExpiredTokenAtLeastBothLimitsNullSmallerThanMin() {
         System.setProperty(ZTSClient.ZTS_CLIENT_PROP_TOKEN_MIN_EXPIRY_TIME, "600");
         ZTSClient.initConfigValues();
-        Principal principal = SimplePrincipal.create("user_domain", "user",
-                "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
-        ZTSClient client = new ZTSClient("http://localhost:4080/", principal);
-        assertTrue(client.isExpiredToken(500, null, null, 600));
-        client.close();
+        assertTrue(ZTSClient.isExpiredToken(500, null, null, 600));
     }
 
     @Test
     public void testIsExpiredTokenAtLeastBothLimitsNullBiggerThanMin() {
         System.setProperty(ZTSClient.ZTS_CLIENT_PROP_TOKEN_MIN_EXPIRY_TIME, "400");
         ZTSClient.initConfigValues();
-        Principal principal = SimplePrincipal.create("user_domain", "user",
-                "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
-        ZTSClient client = new ZTSClient("http://localhost:4080/", principal);
-        assertFalse(client.isExpiredToken(500, null, null, 400));
-        client.close();
+        assertFalse(ZTSClient.isExpiredToken(500, null, null, 400));
     }
 
     @Test
@@ -361,6 +352,7 @@ public class ZTSClientTest {
         Principal principal = SimplePrincipal.create("user_domain", "user",
                 "auth_creds", PRINCIPAL_AUTHORITY);
         ZTSClient client = new ZTSClient("http://localhost:4080/", principal);
+        ZTSClient.ROLE_TOKEN_CACHE.clear();
 
         String cacheKey = "p=auth_creds;d=coretech;r=Role1";
         assertNull(client.lookupRoleTokenInCache(cacheKey, null, null, 900));
@@ -380,7 +372,7 @@ public class ZTSClientTest {
         client.ROLE_TOKEN_CACHE.put(cacheKey, roleToken);
 
         assertNull(client.lookupRoleTokenInCache(cacheKey, 3000, 4000, 900));
-        assertNull(client.lookupRoleTokenInCache(cacheKey, 500, 800, 900));
+        assertNull(client.lookupRoleTokenInCache(cacheKey, 300, 600, 900));
 
         client.ROLE_TOKEN_CACHE.clear();
         client.close();
@@ -400,8 +392,8 @@ public class ZTSClientTest {
 
         assertNotNull(client.lookupRoleTokenInCache(cacheKey, 3000, 4000, 900));
 
-        Long expiryTime = roleToken.getExpiryTime();
-        String token = "v=Z1;d=mydomain;r=admin;p=user_domain.user;h=localhost;a=f10bc905071a72d1;t=1448045776;e=" + expiryTime.toString() + ";k=0;i=10.11.12.13;s=pujvQuvaLa2jgE3k24bCw5Hm7AP9dUQkmkwNfX2bPhVXyhdRkOlbttF4exJm9V571sJXid6vsihgopCdxqW_qA--";
+        long expiryTime = roleToken.getExpiryTime();
+        String token = "v=Z1;d=mydomain;r=admin;p=user_domain.user;h=localhost;a=f10bc905071a72d1;t=1448045776;e=" + expiryTime + ";k=0;i=10.11.12.13;s=pujvQuvaLa2jgE3k24bCw5Hm7AP9dUQkmkwNfX2bPhVXyhdRkOlbttF4exJm9V571sJXid6vsihgopCdxqW_qA--";
         ZTSClientTokenCacher.setRoleToken(token, "admin");
         cacheKey = client.getRoleTokenCacheKey("mydomain", "admin", null);
         assertEquals(cacheKey, "p=user_domain.user;d=mydomain;r=admin");
@@ -441,8 +433,8 @@ public class ZTSClientTest {
 
         // add new role token to the cache
         //
-        Long expiryTime = roleToken.getExpiryTime();
-        String token = "v=Z1;d=mydomain;r=admin;p=mytenantdomain.myservice;h=localhost;a=f10bc905071a72d1;t=1448045776;e=" + expiryTime.toString() + ";k=0;i=10.11.12.13;s=pujvQuvaLa2jgE3k24bCw5Hm7AP9dUQkmkwNfX2bPhVXyhdRkOlbttF4exJm9V571sJXid6vsihgopCdxqW_qA--";
+        long expiryTime = roleToken.getExpiryTime();
+        String token = "v=Z1;d=mydomain;r=admin;p=mytenantdomain.myservice;h=localhost;a=f10bc905071a72d1;t=1448045776;e=" + expiryTime + ";k=0;i=10.11.12.13;s=pujvQuvaLa2jgE3k24bCw5Hm7AP9dUQkmkwNfX2bPhVXyhdRkOlbttF4exJm9V571sJXid6vsihgopCdxqW_qA--";
         ZTSClientTokenCacher.setRoleToken(token, "admin");
         String cacherKeyCacher = client.getRoleTokenCacheKey("mydomain", "admin", null);
         assertEquals(cacherKeyCacher, "p=mytenantdomain.myservice;d=mydomain;r=admin");
@@ -463,7 +455,7 @@ public class ZTSClientTest {
         assertNotNull(client2.lookupRoleTokenInCache(cacherKeyCacher, 3000, 4000, 900));
 
         // add new role token to cache using new domain=mydomain2 and new tenant domain=mytenantdomain2 and new service=myservice2
-        String token2 = "v=Z1;d=mydomain2;r=admin;p=mytenantdomain2.myservice2;h=localhost;a=f10bc905071a72d1;t=1448045776;e=" + expiryTime.toString() + ";k=0;i=10.11.12.13;s=pujvQuvaLa2jgE3k24bCw5Hm7AP9dUQkmkwNfX2bPhVXyhdRkOlbttF4exJm9V571sJXid6vsihgopCdxqW_qA--";
+        String token2 = "v=Z1;d=mydomain2;r=admin;p=mytenantdomain2.myservice2;h=localhost;a=f10bc905071a72d1;t=1448045776;e=" + expiryTime + ";k=0;i=10.11.12.13;s=pujvQuvaLa2jgE3k24bCw5Hm7AP9dUQkmkwNfX2bPhVXyhdRkOlbttF4exJm9V571sJXid6vsihgopCdxqW_qA--";
         ZTSClientTokenCacher.setRoleToken(token2, "admin");
         String cacheKeyNewDomain = client2.getRoleTokenCacheKey("mydomain2", "admin", null);
         assertEquals(cacheKeyNewDomain, "p=mytenantdomain2.myservice2;d=mydomain2;r=admin");
@@ -499,8 +491,8 @@ public class ZTSClientTest {
     public void testLookupRoleTokenServiceProvider() {
 
         String domName = "svcdomtest";
-        Long expiryTime = (System.currentTimeMillis() / 1000) + 3500L;
-        String token = "v=Z1;d=" + domName + ";r=admin;p=sports.hockey;h=localhost;a=f10bc905071a72d1;t=1448045776;e=" + expiryTime.toString()
+        long expiryTime = (System.currentTimeMillis() / 1000) + 3500L;
+        String token = "v=Z1;d=" + domName + ";r=admin;p=sports.hockey;h=localhost;a=f10bc905071a72d1;t=1448045776;e=" + expiryTime
                 + ";k=0;i=10.11.12.13;s=pujvQuvaLa2jgE3k24bCw5Hm7AP9dUQkmkwNfX2bPhVXyhdRkOlbttF4exJm9V571sJXid6vsihgopCdxqW_qA--";
         RoleToken roleToken = new RoleToken().setToken(token).setExpiryTime((System.currentTimeMillis() / 1000) + 3500L);
 
@@ -1328,7 +1320,7 @@ public class ZTSClientTest {
 
         System.out.println("testPrefetchRoleTokenShouldCallServer: sleep Secs="
                 + (2 * intervalSecs) + "+0.1");
-        Thread.sleep((2 * intervalSecs * 1000) + 100);
+        Thread.sleep((2L * intervalSecs * 1000) + 100);
         System.out.println("testPrefetchRoleTokenShouldCallServer: nap over so what happened");
 
         assertEquals(client.getScheduledItemsSize(), 1);
@@ -1348,7 +1340,7 @@ public class ZTSClientTest {
         // wait a few seconds, and see subsequent fetch happened.
         System.out.println("testPrefetchRoleTokenShouldCallServer: again sleep Secs="
                 + (2 * intervalSecs) + "+0.1");
-        Thread.sleep((2 * intervalSecs * 1000) + 100);
+        Thread.sleep((2L * intervalSecs * 1000) + 100);
         System.out.println("testPrefetchRoleTokenShouldCallServer: again nap over so what happened");
 
         long lastTokenFetchedTime2 = ztsClientMock.getLastRoleTokenFetchedTime(domain1, null, null);
@@ -1382,7 +1374,7 @@ public class ZTSClientTest {
     }
 
     @Test
-    public void testPrefetchAwsCredShouldCallServer() throws Exception {
+    public void testPrefetchAwsCredShouldCallServerNoNotification() throws Exception {
         System.out.println("testPrefetchAwsCredShouldCallServer");
 
         ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
@@ -1398,8 +1390,10 @@ public class ZTSClientTest {
         Mockito.when(siaProvider.getIdentity(Mockito.any(),
                 Mockito.any())).thenReturn(principal);
 
+        ZTSClientNotificationSender notificationSender = Mockito.mock(ZTSClientNotificationSender.class);
         ZTSClient client = new ZTSClient("http://localhost:4080/", "user_domain",
                 "user", siaProvider);
+        client.setNotificationSender(notificationSender);
         ZTSClient.cancelPrefetch();
         client.setZTSRDLGeneratedClient(ztsClientMock);
 
@@ -1424,7 +1418,7 @@ public class ZTSClientTest {
 
         System.out.println("testPrefetchAwsCredShouldCallServer: sleep Secs="
                 + (2 * intervalSecs) + "+0.1");
-        Thread.sleep((2 * intervalSecs * 1000) + 100);
+        Thread.sleep((2L * intervalSecs * 1000) + 100);
         System.out.println("testPrefetchAwsCredShouldCallServer: nap over so what happened");
 
         assertEquals(client.getScheduledItemsSize(), 1);
@@ -1443,7 +1437,7 @@ public class ZTSClientTest {
         // wait a few seconds, and see subsequent fetch happened.
         System.out.println("testPrefetchAwsCredShouldCallServer: again sleep Secs="
                 + (2 * intervalSecs) + "+0.1");
-        Thread.sleep((2 * intervalSecs * 1000) + 100);
+        Thread.sleep((2L * intervalSecs * 1000) + 100);
         System.out.println("testPrefetchAwsCredShouldCallServer: again nap over so what happened");
 
         long lastTokenFetchedTime2 = ztsClientMock.getLastRoleTokenFetchedTime(domain1, "role1", null);
@@ -1487,6 +1481,96 @@ public class ZTSClientTest {
         AWSTemporaryCredentials awsCred5 = client.getAWSTemporaryCredentials(domain1, "role1");
         assertNotNull(awsCred5);
         assertNotEquals(awsCred4.getAccessKeyId(), awsCred5.getAccessKeyId());
+
+        // Assert no notifications were sent
+        Mockito.verify(notificationSender, Mockito.times(0)).sendNotification(Mockito.any(ZTSClientNotification.class));
+
+        ZTSClient.cancelPrefetch();
+        client.close();
+    }
+
+    @Test
+    public void testPrefetchAwsCredShouldSendNotifications() throws Exception {
+        System.out.println("testPrefetchAwsCredShouldSendNotifications");
+
+        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
+        int intervalSecs = Integer.parseInt(System.getProperty(ZTSClient.ZTS_CLIENT_PROP_PREFETCH_SLEEP_INTERVAL, "5"));
+        ztsClientMock.setTestSleepInterval(intervalSecs);
+        ztsClientMock.setExpiryTime(intervalSecs); // token expires in 5 seconds
+        ztsClientMock.setRoleName("role1");
+
+        Principal principal = SimplePrincipal.create("user_domain", "user",
+                "auth_creds", PRINCIPAL_AUTHORITY);
+
+        ServiceIdentityProvider siaProvider = Mockito.mock(ServiceIdentityProvider.class);
+        Mockito.when(siaProvider.getIdentity(Mockito.any(),
+                Mockito.any())).thenReturn(principal);
+
+        ZTSClientNotificationSender notificationSender = Mockito.mock(ZTSClientNotificationSender.class);
+        ZTSClient client = new ZTSClient("http://localhost:4080/", "user_domain",
+                "user", siaProvider);
+        client.setNotificationSender(notificationSender);
+        ZTSClient.cancelPrefetch();
+        client.setZTSRDLGeneratedClient(ztsClientMock);
+
+        String domain1 = "coretech";
+        ztsClientMock.setAwsCreds(Timestamp.fromCurrentTime(), domain1, "role1");
+        ztsClientMock.setAwsCreds(Timestamp.fromCurrentTime(), domain1, "role2");
+
+        // initially, roleToken was never fetched.
+        assertTrue(ztsClientMock.getLastRoleTokenFetchedTime(domain1, "role1", null) < 0);
+
+        // initialize the prefetch token process.
+        client.prefetchAwsCreds(domain1, "role1", null, null, null);
+
+        ZTSClient.setPrefetchAutoEnable(true);
+        System.setProperty(ZTSClient.ZTS_CLIENT_PROP_PREFETCH_AUTO_ENABLE, "true");
+        AWSTemporaryCredentials awsCred1 = client.getAWSTemporaryCredentials(domain1, "role1");
+        assertNotNull(awsCred1);
+        long rtExpiry = awsCred1.getExpiration().millis();
+        System.out.println("testPrefetchAwsCredShouldCallServer: awsCred1:domain=" + domain1
+                + " expires at " + rtExpiry + " curtime_millis=" + System.currentTimeMillis());
+
+        System.out.println("testPrefetchAwsCredShouldCallServer: sleep Secs="
+                + (2 * intervalSecs) + "+0.1");
+        Thread.sleep((2L * intervalSecs * 1000) + 100);
+        System.out.println("testPrefetchAwsCredShouldCallServer: nap over so what happened");
+
+        assertEquals(client.getScheduledItemsSize(), 1);
+
+        long lastTokenFetchedTime1 = ztsClientMock.getLastRoleTokenFetchedTime(domain1, "role1", null);
+        awsCred1 = client.getAWSTemporaryCredentials(domain1, "role1");
+        long rtExpiry2 = awsCred1.getExpiration().millis();
+        System.out.println("testPrefetchAwsCredShouldCallServer: roleToken1:domain=" + domain1
+                + " expires at " + rtExpiry2 + " curtime_millis=" + System.currentTimeMillis());
+        assertTrue(rtExpiry2 > rtExpiry); // this token was refreshed
+
+        assertTrue(lastTokenFetchedTime1 > 0);
+
+        // Now clear credentials to cause failure and see if notification sent
+        ztsClientMock.credsMap.clear();
+
+        // wait a few seconds, and see subsequent fetch happened.
+        System.out.println("testPrefetchAwsCredShouldCallServer: again sleep Secs="
+                + (2 * intervalSecs) + "+0.1");
+        Thread.sleep((2L * intervalSecs * 1000) + 100);
+        System.out.println("testPrefetchAwsCredShouldCallServer: again nap over so what happened");
+
+        long lastFailureTime = ztsClientMock.getLastTokenFailTime(domain1, "role1");
+        assertNotEquals(lastFailureTime, -1L);
+
+        // assert notification sent
+        ArgumentCaptor<ZTSClientNotification> argument = ArgumentCaptor.forClass(ZTSClientNotification.class);
+        Mockito.verify(notificationSender, Mockito.times(1)).sendNotification(argument.capture());
+        assertEquals(domain1, argument.getValue().getDomain());
+
+        // Restore credentials, now fetching should work fine
+        ztsClientMock.setAwsCreds(Timestamp.fromCurrentTime(), domain1, "role1");
+        ztsClientMock.setAwsCreds(Timestamp.fromCurrentTime(), domain1, "role2");
+
+        client.getAWSTemporaryCredentials(domain1, "role1");
+        lastFailureTime = ztsClientMock.getLastTokenFailTime(domain1, "role1");
+        assertEquals(lastFailureTime, -1L);
 
         ZTSClient.cancelPrefetch();
         client.close();
@@ -1544,7 +1628,7 @@ public class ZTSClientTest {
         assertEquals(client.getScheduledItemsSize(), 2);
 
         System.out.println("testPrefetchShouldCallServer: sleep Secs=" + (2 * intervalSecs) + "+0.1");
-        Thread.sleep((2 * intervalSecs * 1000) + 100);
+        Thread.sleep((2L * intervalSecs * 1000) + 100);
         System.out.println("testPrefetchShouldCallServer: nap over so what happened");
 
         assertEquals(client.getScheduledItemsSize(), 2);
@@ -1573,7 +1657,7 @@ public class ZTSClientTest {
         // wait a few seconds, and see subsequent fetch happened.
         System.out.println("testPrefetchShouldCallServer: again sleep Secs="
                 + (2 * intervalSecs) + "+0.1");
-        Thread.sleep((2 * intervalSecs * 1000) + 100);
+        Thread.sleep((2L * intervalSecs * 1000) + 100);
         System.out.println("testPrefetchShouldCallServer: again nap over so what happened");
 
         long lastTokenFetchedTime2 = ztsClientMock.getLastRoleTokenFetchedTime(domain1, null, null);
@@ -2024,12 +2108,14 @@ public class ZTSClientTest {
     @Test
     public void testHostnameVerifierSupport() {
 
-        ZTSRDLGeneratedClientMock client = new ZTSRDLGeneratedClientMock("http://localhost:4080", null);
-        assertNull(client.getHostnameVerifier());
+        ZTSRDLGeneratedClientMock client = new ZTSRDLGeneratedClientMock("http://localhost:4080", (HostnameVerifier) null);
+        HostnameVerifier hostnameVerifier = client.getHostnameVerifier();
+        assertTrue(hostnameVerifier == null || hostnameVerifier instanceof org.apache.http.conn.ssl.DefaultHostnameVerifier);
 
-        HostnameVerifier hostnameVerifier = new ZTSClientTest.TestHostVerifier();
-        client = new ZTSRDLGeneratedClientMock("http://localhost:4080", null, hostnameVerifier);
-        assertNotNull(client.getHostnameVerifier());
+        HostnameVerifier ztsHostnameVerifier = new ZTSClientTest.TestHostVerifier();
+        client = new ZTSRDLGeneratedClientMock("http://localhost:4080", ztsHostnameVerifier);
+        hostnameVerifier = client.getHostnameVerifier();
+        assertTrue(hostnameVerifier instanceof com.yahoo.athenz.zts.ZTSClientTest.TestHostVerifier);
     }
 
     @Test
@@ -2149,6 +2235,89 @@ public class ZTSClientTest {
         client.close();
     }
 
+    @Test
+    public void testGetWorkloadsByIP() {
+        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
+        Principal principal = SimplePrincipal.create("user_domain", "user",
+                "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
+        ZTSClient client = new ZTSClient("http://localhost:4080", principal);
+        client.setZTSRDLGeneratedClient(ztsClientMock);
+        Workloads workloads = client.getWorkloadsByIP("10.0.0.1");
+        assertNotNull(workloads);
+        assertEquals(workloads.getWorkloadList().get(0).getProvider(), "openstack");
+        assertEquals(workloads.getWorkloadList().get(0).getUuid(), "avve-resw");
+        assertEquals(workloads.getWorkloadList().get(0).getDomainName(), "athenz");
+        assertEquals(workloads.getWorkloadList().get(0).getServiceName(), "api");
+        assertNotNull(workloads.getWorkloadList().get(0).getUpdateTime());
+        assertNull(workloads.getWorkloadList().get(0).getIpAddresses());
+        try {
+            client.getWorkloadsByIP("127.0.0.1");
+            fail();
+        } catch (ResourceException re) {
+            assertEquals(re.getCode(), 404);
+        }
+        client.close();
+    }
+
+    @Test
+    public void testGetWorkloadsByService() {
+        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
+        Principal principal = SimplePrincipal.create("user_domain", "user",
+                "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
+        ZTSClient client = new ZTSClient("http://localhost:4080", principal);
+        client.setZTSRDLGeneratedClient(ztsClientMock);
+        Workloads workloads = client.getWorkloadsByService("athenz", "api");
+        assertNotNull(workloads);
+        assertEquals(workloads.getWorkloadList().get(0).getProvider(), "openstack");
+        assertEquals(workloads.getWorkloadList().get(0).getUuid(), "avve-resw");
+        assertNull(workloads.getWorkloadList().get(0).getDomainName());
+        assertNull(workloads.getWorkloadList().get(0).getServiceName());
+        assertNotNull(workloads.getWorkloadList().get(0).getUpdateTime());
+        assertTrue(workloads.getWorkloadList().get(0).getIpAddresses().contains("10.0.0.1"));
+        try {
+            client.getWorkloadsByService("bad-domain", "api");
+            fail();
+        } catch (ResourceException re) {
+            assertEquals(re.getCode(), 404);
+        }
+        client.close();
+    }
+
+    @Test
+    public void testGetTransportRules() {
+        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
+        Principal principal = SimplePrincipal.create("user_domain", "user",
+                "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
+        ZTSClient client = new ZTSClient("http://localhost:4080", principal);
+        client.setZTSRDLGeneratedClient(ztsClientMock);
+
+        TransportRules transportRules = client.getTransportRules("ingress-domain", "api");
+        assertNotNull(transportRules);
+        assertEquals(transportRules.getIngressRules().get(0).getProtocol(), "TCP");
+        assertEquals(transportRules.getIngressRules().get(0).getPort(), 4443);
+        assertEquals(transportRules.getIngressRules().get(0).getSourcePortRange(), "1024-65535");
+        assertEquals(transportRules.getIngressRules().get(0).getEndPoint(), "10.0.0.1/26");
+
+        assertNull(transportRules.getEgressRules());
+
+        transportRules = client.getTransportRules("egress-domain", "api");
+        assertNotNull(transportRules);
+        assertEquals(transportRules.getEgressRules().get(0).getProtocol(), "TCP");
+        assertEquals(transportRules.getEgressRules().get(0).getPort(), 8443);
+        assertEquals(transportRules.getEgressRules().get(0).getSourcePortRange(), "1024-65535");
+        assertEquals(transportRules.getEgressRules().get(0).getEndPoint(), "10.0.0.1/23");
+
+        assertNull(transportRules.getIngressRules());
+        try {
+            client.getTransportRules("bad-domain", "api");
+            fail();
+        } catch (ResourceException re) {
+            assertEquals(re.getCode(), 404);
+        }
+
+        client.close();
+    }
+
     private static class TestHostVerifier implements HostnameVerifier {
 
         public boolean verify(String hostname, SSLSession session) {
@@ -2248,6 +2417,54 @@ public class ZTSClientTest {
     }
 
     @Test
+    public void testGetRoleAccessWithCache() {
+
+        ZTSClientCache ztsClientDisabledCache = new ZTSClientCache();
+
+        System.setProperty(ZTSClientCache.ZTS_CLIENT_PROP_EHCACHE_XML_PATH_ROLE_ACCESS,
+                this.getClass().getClassLoader().getResource("zts-client-ehcache.xml").getPath());
+        ZTSClientCache ztsClientEnabledCache = new ZTSClientCache();
+        System.clearProperty(ZTSClientCache.ZTS_CLIENT_PROP_EHCACHE_XML_PATH_ROLE_ACCESS);
+
+        class SpyZTSRDLClientMock extends ZTSRDLClientMock {
+            int getRoleAccessCount = 0;
+            public RoleAccess getRoleAccess(String domainName, String principal) {
+                getRoleAccessCount++;
+                return super.getRoleAccess(domainName, principal);
+            }
+        }
+
+        class TesterHelp {
+            void makeTest(ZTSClientCache ztsClientCache, int expectedGetRoleAccessCountCallsCount) {
+                SpyZTSRDLClientMock ztsRDLClientMock = new SpyZTSRDLClientMock();
+
+                Principal principal = SimplePrincipal.create("user_domain", "user",
+                        "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
+                ZTSClient client = new ZTSClient("http://localhost:4080", principal);
+                client.setZTSRDLGeneratedClient(ztsRDLClientMock);
+                client.setZTSClientCache(ztsClientCache);
+
+                // Call getRoleAccess() multiple times: the matching RDL method should only be called once - due to caching.
+                for (int cycle = 0; cycle < 3; cycle++) {
+                    RoleAccess roleAccess = client.getRoleAccess("coretech", "user.joe");
+                    List<String> roles = roleAccess.getRoles();
+                    assertEquals(roles.size(), 2);
+                    assertTrue(roles.contains("role1"));
+                }
+
+                client.close();
+                assertEquals(ztsRDLClientMock.getRoleAccessCount, expectedGetRoleAccessCountCallsCount);
+            }
+        }
+
+        // With cache disabled - com.yahoo.athenz.zts.ZTSClient.getRoleAccess() should be called 3 times
+        new TesterHelp().makeTest(ztsClientDisabledCache, 3);
+
+        // With cache enabled - com.yahoo.athenz.zts.ZTSClient.getRoleAccess() should be called only once
+        new TesterHelp().makeTest(ztsClientEnabledCache, 1);
+    }
+
+    @Test
     public void testGetAccess() {
 
         ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
@@ -2319,55 +2536,6 @@ public class ZTSClientTest {
             assertEquals(ex.getCode(), 400);
         }
 
-        client.close();
-    }
-
-    @Test
-    public void testPostDomainMetrics() {
-
-        Principal principal = SimplePrincipal.create("user_domain", "user",
-                "auth_creds", PRINCIPAL_AUTHORITY);
-
-        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
-        ZTSClient client = new ZTSClient("http://localhost:4080", principal);
-        client.setZTSRDLGeneratedClient(ztsClientMock);
-
-        List<DomainMetric> metricList = new ArrayList<>();
-        metricList.add(
-                new DomainMetric().
-                        setMetricType(DomainMetricType.ACCESS_ALLOWED_DENY_NO_MATCH).
-                        setMetricVal(99));
-        DomainMetrics req = new DomainMetrics().
-                setDomainName("coretech").
-                setMetricList(metricList);
-        client.postDomainMetrics("coretech", req);
-        client.close();
-    }
-
-    @Test
-    public void testPostDomainMetricsBadRequest() {
-
-        Principal principal = SimplePrincipal.create("user_domain", "user",
-                "auth_creds", PRINCIPAL_AUTHORITY);
-
-        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
-        ZTSClient client = new ZTSClient("http://localhost:4080", principal);
-        client.setZTSRDLGeneratedClient(ztsClientMock);
-
-        List<DomainMetric> metricList = new ArrayList<>();
-        metricList.add(
-                new DomainMetric().
-                        setMetricType(DomainMetricType.ACCESS_ALLOWED_DENY_NO_MATCH).
-                        setMetricVal(99));
-        DomainMetrics req = new DomainMetrics().
-                setDomainName("coretech").
-                setMetricList(metricList);
-        try {
-            client.postDomainMetrics("exc", req);
-            fail();
-        } catch (ZTSClientException ex) {
-            assertEquals(ex.getCode(), 400);
-        }
         client.close();
     }
 
@@ -2479,6 +2647,9 @@ public class ZTSClientTest {
         RoleToken roleToken = client.postRoleCertificateRequest("coretech", "role1", req);
         assertNotNull(roleToken);
 
+        RoleCertificate roleCertificate = client.postRoleCertificateRequest(req);
+        assertNotNull(roleCertificate);
+
         try {
             client.postRoleCertificateRequest("exc", "no-role", req);
             fail();
@@ -2498,7 +2669,7 @@ public class ZTSClientTest {
     @Test
     public void testGenerateRoleCertificateRequest() {
 
-        File privkey = new File("./src/test/resources/test_private_k0.pem");
+        File privkey = new File("./src/test/resources/unit_test_private_k0.pem");
         PrivateKey privateKey = Crypto.loadPrivateKey(privkey);
 
         RoleCertificateRequest req = ZTSClient.generateRoleCertificateRequest("coretech",
@@ -2513,7 +2684,7 @@ public class ZTSClientTest {
     @Test
     public void testGenerateInstanceRefreshRequestTopDomain() {
 
-        File privkey = new File("./src/test/resources/test_private_k0.pem");
+        File privkey = new File("./src/test/resources/unit_test_private_k0.pem");
         PrivateKey privateKey = Crypto.loadPrivateKey(privkey);
 
         InstanceRefreshRequest req = ZTSClient.generateInstanceRefreshRequest("coretech",
@@ -2528,7 +2699,7 @@ public class ZTSClientTest {
     @Test
     public void testGenerateInstanceRefreshRequestSubDomain() {
 
-        File privkey = new File("./src/test/resources/test_private_k0.pem");
+        File privkey = new File("./src/test/resources/unit_test_private_k0.pem");
         PrivateKey privateKey = Crypto.loadPrivateKey(privkey);
 
         InstanceRefreshRequest req = ZTSClient.generateInstanceRefreshRequest("coretech.system",
@@ -2677,6 +2848,9 @@ public class ZTSClientTest {
         roles.add("ones");
 
         assertEquals(ZTSClient.multipleRoleKey(roles), "apple,one,ones,role,yellow");
+
+        List<String> unmRoles = Collections.unmodifiableList(roles);
+        assertEquals(ZTSClient.multipleRoleKey(unmRoles), "apple,one,ones,role,yellow");
     }
 
     @Test
@@ -2713,6 +2887,14 @@ public class ZTSClientTest {
         ZTSClientMock client = new ZTSClientMock("http://localhost:4080");
         ZTSClientMock.setX509CsrDetails("o=Athenz", "athenz.cloud");
 
+        // configure the values to be verified
+
+        client.setCsrUriVerifyValue("spiffe://athenz/sa/service");
+        List<String> dnsValues = new ArrayList<>();
+        dnsValues.add("service.athenz.athenz.cloud");
+        dnsValues.add("lambda-1234-service.instanceid.athenz.athenz.cloud");
+        client.setCsrDnsVerifyValues(dnsValues);
+
         AWSLambdaIdentity identity = client.getAWSLambdaServiceCertificate("athenz", "service", "1234", "provider");
         assertNotNull(identity);
         assertNotNull(identity.getPrivateKey());
@@ -2724,10 +2906,25 @@ public class ZTSClientTest {
     @Test
     public void testGetAWSCredentialsProvider() {
 
-        ZTSClientMock client = new ZTSClientMock("http://localhost:4080");
-        assertNotNull(client.getAWSCredentialProvider("domain", "role"));
-        assertNotNull(client.getAWSCredentialProvider("domain", "role", "id", null, null));
-        assertNotNull(client.getAWSCredentialProvider("domain", "role", "id", 100, 300));
+        ZTSClientMock client = new ZTSClientMock("http://localhost:40888");
+        try {
+            client.getAWSCredentialProvider("domain", "role");
+            fail();
+        } catch (ResourceException ex) {
+            assertEquals(ex.getCode(), 400);
+        }
+        try {
+            client.getAWSCredentialProvider("domain", "role", "id", 100, 300);
+            fail();
+        } catch (ResourceException ex) {
+            assertEquals(ex.getCode(), 400);
+        }
+        try {
+            client.getAWSCredentialProvider("domain", "role", "id", null, null);
+            fail();
+        } catch (ResourceException ex) {
+            assertEquals(ex.getCode(), 400);
+        }
     }
 
     @Test
@@ -2737,68 +2934,68 @@ public class ZTSClientTest {
 
         // identity domain check
 
-        item1.identityDomain("domain1");
-        item2.identityDomain("domain2");
+        item1.setIdentityDomain("domain1");
+        item2.setIdentityDomain("domain2");
         assertNotEquals(item1.hashCode(), item2.hashCode());
         assertNotEquals(item1, item2);
 
-        item2.identityDomain("domain1");
+        item2.setIdentityDomain("domain1");
         assertEquals(item1.hashCode(), item2.hashCode());
         assertEquals(item1, item2);
 
         // identity name check
 
-        item1.identityName("name1");
-        item2.identityName("name2");
+        item1.setIdentityName("name1");
+        item2.setIdentityName("name2");
         assertNotEquals(item1.hashCode(), item2.hashCode());
         assertNotEquals(item1, item2);
 
-        item2.identityName("name1");
+        item2.setIdentityName("name1");
         assertEquals(item1.hashCode(), item2.hashCode());
         assertEquals(item1, item2);
 
         // is invalid check
 
-        item1.isInvalid(false);
-        item2.isInvalid(true);
+        item1.setIsInvalid(false);
+        item2.setIsInvalid(true);
         assertNotEquals(item1.hashCode(), item2.hashCode());
         assertNotEquals(item1, item2);
 
-        item2.isInvalid(false);
+        item2.setIsInvalid(false);
         assertEquals(item1.hashCode(), item2.hashCode());
         assertEquals(item1, item2);
 
         // domainname check
 
-        item1.domainName("dom1");
+        item1.setDomainName("dom1");
         assertNotEquals(item1, item2);
 
-        item2.domainName("dom2");
+        item2.setDomainName("dom2");
         assertNotEquals(item1, item2);
 
-        item2.domainName("dom1");
+        item2.setDomainName("dom1");
         assertEquals(item1, item2);
 
         // external id check
 
-        item1.externalId("id1");
+        item1.setExternalId("id1");
         assertNotEquals(item1, item2);
 
-        item2.externalId("id2");
+        item2.setExternalId("id2");
         assertNotEquals(item1, item2);
 
-        item2.externalId("id1");
+        item2.setExternalId("id1");
         assertEquals(item1, item2);
 
         // proxy for principal check
 
-        item1.proxyForPrincipal("proxy1");
+        item1.setProxyForPrincipal("proxy1");
         assertNotEquals(item1, item2);
 
-        item2.proxyForPrincipal("proxy2");
+        item2.setProxyForPrincipal("proxy2");
         assertNotEquals(item1, item2);
 
-        item2.proxyForPrincipal("proxy1");
+        item2.setProxyForPrincipal("proxy1");
         assertEquals(item1, item2);
     }
 
@@ -2818,24 +3015,35 @@ public class ZTSClientTest {
         ZTSClient client = new ZTSClient("http://localhost:4080", principal);
 
         assertEquals("grant_type=client_credentials&scope=coretech%3Adomain",
-                client.generateAccessTokenRequestBody("coretech", null, null, null, 0));
+                client.generateAccessTokenRequestBody("coretech", null, null, null, null, null, 0));
         assertEquals("grant_type=client_credentials&expires_in=100&scope=coretech%3Adomain",
-                client.generateAccessTokenRequestBody("coretech", null, null, null, 100));
+                client.generateAccessTokenRequestBody("coretech", null, null, null, null, null, 100));
         assertEquals("grant_type=client_credentials&expires_in=100&scope=coretech%3Adomain",
-                client.generateAccessTokenRequestBody("coretech", null, "", null, 100));
+                client.generateAccessTokenRequestBody("coretech", null, "", null, null, null, 100));
         assertEquals("grant_type=client_credentials&expires_in=100&scope=coretech%3Adomain+openid+coretech%3Aservice.api",
-                client.generateAccessTokenRequestBody("coretech", null, "api", null, 100));
+                client.generateAccessTokenRequestBody("coretech", null, "api", null, null, null, 100));
         assertEquals("grant_type=client_credentials&expires_in=100&scope=coretech%3Arole.readers+openid+coretech%3Aservice.api",
-                client.generateAccessTokenRequestBody("coretech", Collections.singletonList("readers"), "api", null, 100));
+                client.generateAccessTokenRequestBody("coretech", Collections.singletonList("readers"), "api", null, null, "", 100));
         assertEquals("grant_type=client_credentials&expires_in=100&scope=coretech%3Arole.readers+openid+coretech%3Aservice.api",
-                client.generateAccessTokenRequestBody("coretech", Collections.singletonList("readers"), "api", "", 100));
+                client.generateAccessTokenRequestBody("coretech", Collections.singletonList("readers"), "api", "", null, null, 100));
         assertEquals("grant_type=client_credentials&expires_in=100&scope=coretech%3Arole.readers+openid+coretech%3Aservice.api&proxy_for_principal=user.proxy",
-                client.generateAccessTokenRequestBody("coretech", Collections.singletonList("readers"), "api", "user.proxy", 100));
+                client.generateAccessTokenRequestBody("coretech", Collections.singletonList("readers"), "api", "user.proxy", null, "", 100));
         List<String> roles = new ArrayList<>();
         roles.add("readers");
         roles.add("writers");
         assertEquals("grant_type=client_credentials&expires_in=100&scope=coretech%3Arole.readers+coretech%3Arole.writers+openid+coretech%3Aservice.api",
-                client.generateAccessTokenRequestBody("coretech", roles, "api", null, 100));
+                client.generateAccessTokenRequestBody("coretech", roles, "api", null, null, null, 100));
+        final String authorizationDetails = "[{\"type\":\"message_access\",\"location\":[\"https://location1\"," +
+                "\"https://location2\"],\"identifier\":\"id1\"}]";
+        final String encodedDetails = "%5B%7B%22type%22%3A%22message_access%22%2C%22location%22%3A%5B%22https%3A%2F%2Flocation1%22%2C%22https%3A%2F%2Flocation2%22%5D%2C%22identifier%22%3A%22id1%22%7D%5D";
+        assertEquals("grant_type=client_credentials&expires_in=100&scope=coretech%3Arole.readers+openid+coretech%3Aservice.api&authorization_details=" + encodedDetails,
+                client.generateAccessTokenRequestBody("coretech", Collections.singletonList("readers"), "api", null, authorizationDetails, null, 100));
+        final String proxyPrincipalsEncoded = "spiffe%3A%2F%2Fathenz%2Fsa%2Fservice1%2Cspiffe%3A%2F%2Fathenz%2Fsa%2Fservice2";
+        assertEquals("grant_type=client_credentials&expires_in=100&scope=coretech%3Arole.readers+openid+coretech%3Aservice.api&authorization_details="
+                        + encodedDetails + "&proxy_principal_spiffe_uris=" + proxyPrincipalsEncoded,
+                client.generateAccessTokenRequestBody("coretech", Collections.singletonList("readers"), "api", null,
+                        authorizationDetails, "spiffe://athenz/sa/service1,spiffe://athenz/sa/service2", 100));
+
         client.close();
     }
 
@@ -2852,7 +3060,7 @@ public class ZTSClientTest {
 
         AccessTokenResponse response1 = new AccessTokenResponse();
         response1.setExpires_in(3600);
-        client.ACCESS_TOKEN_CACHE.put(cacheKey, new AccessTokenResponseCacheEntry(response1));
+        ZTSClient.ACCESS_TOKEN_CACHE.put(cacheKey, new AccessTokenResponseCacheEntry(response1));
 
         // with standard 1 hour check, our entry is not expired
 
@@ -2862,13 +3070,13 @@ public class ZTSClientTest {
         // will not be removed from the cache
 
         assertNull(client.lookupAccessTokenResponseInCache(cacheKey, 36000));
-        assertNotNull(client.ACCESS_TOKEN_CACHE.get(cacheKey));
+        assertNotNull(ZTSClient.ACCESS_TOKEN_CACHE.get(cacheKey));
 
         // add a second entry with 1 second timeout
 
         AccessTokenResponse response2 = new AccessTokenResponse();
         response2.setExpires_in(1);
-        client.ACCESS_TOKEN_CACHE.put(cacheKey, new AccessTokenResponseCacheEntry(response2));
+        ZTSClient.ACCESS_TOKEN_CACHE.put(cacheKey, new AccessTokenResponseCacheEntry(response2));
 
         // sleep a second and then ask for a cache entry
 
@@ -2877,7 +3085,7 @@ public class ZTSClientTest {
         // entry is not returned from lookup and also removed from the cache
 
         assertNull(client.lookupAccessTokenResponseInCache(cacheKey, 3600));
-        assertNull(client.ACCESS_TOKEN_CACHE.get(cacheKey));
+        assertNull(ZTSClient.ACCESS_TOKEN_CACHE.get(cacheKey));
         client.close();
     }
 
@@ -2888,33 +3096,48 @@ public class ZTSClientTest {
                 "auth_creds", PRINCIPAL_AUTHORITY);
         ZTSClient client = new ZTSClient("http://localhost:4080/", principal);
 
-        assertNull(client.getAccessTokenCacheKey(null, "service", "coretech", null, null, null));
+        assertNull(client.getAccessTokenCacheKey(null, "service", "coretech", null, null, null, null, null));
 
         assertEquals("p=sports;d=coretech",
-                client.getAccessTokenCacheKey("sports", null, "coretech", null, null, null));
+                client.getAccessTokenCacheKey("sports", null, "coretech", null, null, null, null, null));
         assertEquals("p=sports.api;d=coretech",
-                client.getAccessTokenCacheKey("sports", "api", "coretech", null, null, null));
+                client.getAccessTokenCacheKey("sports", "api", "coretech", null, null, null, null, null));
         assertEquals("p=sports.api;d=coretech;r=readers",
                 client.getAccessTokenCacheKey("sports", "api", "coretech",
-                        Collections.singletonList("readers"), null, null));
+                        Collections.singletonList("readers"), null, null, null, null));
 
         List<String> roles = new ArrayList<>();
         roles.add("writers");
         roles.add("readers");
         assertEquals("p=sports.api;d=coretech;r=readers,writers",
-                client.getAccessTokenCacheKey("sports", "api", "coretech", roles, null, null));
+                client.getAccessTokenCacheKey("sports", "api", "coretech", roles, null, null, null, null));
 
         assertEquals("p=sports.api;d=coretech;r=readers,writers",
-                client.getAccessTokenCacheKey("sports", "api", "coretech", roles, "", null));
+                client.getAccessTokenCacheKey("sports", "api", "coretech", roles, "", null, null, null));
 
         assertEquals("p=sports.api;d=coretech;r=readers,writers;o=backend",
-                client.getAccessTokenCacheKey("sports", "api", "coretech", roles, "backend", null));
+                client.getAccessTokenCacheKey("sports", "api", "coretech", roles, "backend", null, null, null));
 
         // using tenant domain details from principal object
 
         assertEquals("p=user_domain.user;d=coretech;r=readers,writers;o=backend",
-                client.getAccessTokenCacheKey("coretech", roles, "backend", null));
+                client.getAccessTokenCacheKey("coretech", roles, "backend", null, null, null));
 
+        // using authorization details
+
+        assertEquals("p=sports.api;d=coretech;r=readers,writers;o=backend;z=ZHMaRw4r9BWIPOWxVv9kDcCMTFzXm3nCUzNs9SA5aL8",
+                client.getAccessTokenCacheKey("sports", "api", "coretech", roles, "backend", null,
+                        "[{\"type\": \"message\",\"uuid\": \"uuid-12345678\"}]", null));
+
+        assertEquals("p=sports.api;d=coretech;r=readers,writers;o=backend;z=ZHMaRw4r9BWIPOWxVv9kDcCMTFzXm3nCUzNs9SA5aL8",
+                client.getAccessTokenCacheKey("sports", "api", "coretech", roles, "backend", null,
+                        "[{\"type\": \"message\",\"uuid\": \"uuid-12345678\"}]", ""));
+
+        // using proxy principal spiffe uris
+
+        assertEquals("p=sports.api;d=coretech;r=readers,writers;o=backend;z=ZHMaRw4r9BWIPOWxVv9kDcCMTFzXm3nCUzNs9SA5aL8;s=spiffe://athenz/sa/service1",
+                client.getAccessTokenCacheKey("sports", "api", "coretech", roles, "backend", null,
+                        "[{\"type\": \"message\",\"uuid\": \"uuid-12345678\"}]", "spiffe://athenz/sa/service1"));
         client.close();
     }
 
@@ -2924,13 +3147,40 @@ public class ZTSClientTest {
         SSLContext sslContext = Mockito.mock(SSLContext.class);
         final String contextStr = sslContext.toString();
 
-        ZTSClient client = new ZTSClient("http://localhost:4080/", sslContext);
+        ZTSClientMock.setClientBuilder(new JerseyClientBuilder());
+        ZTSClientMock client = new ZTSClientMock("http://localhost:4080/", sslContext);
 
         final String expectedStr = "p=" + contextStr + ";d=coretech;r=readers;o=backend";
         assertEquals(expectedStr, client.getAccessTokenCacheKey("coretech",
-                Collections.singletonList("readers"), "backend", null));
+                Collections.singletonList("readers"), "backend", null, null, null));
 
         client.close();
+    }
+
+    @Test
+    public void testGetAccessTokenFromFile() {
+        File ecPublicKey = new File("./src/test/resources/ec_public.key");
+        JwtsSigningKeyResolver resolver = new JwtsSigningKeyResolver(null, null);
+        PublicKey publicKey = Crypto.loadPublicKey(ecPublicKey);
+        resolver.addPublicKey("eckey1", publicKey);
+        Path path = Paths.get("./src/test/resources/");
+        System.setProperty(ZTSAccessTokenFileLoader.ACCESS_TOKEN_PATH_PROPERTY, path.toString());
+        setupTokenFile();
+        setupInvalidTokenFile();
+
+        Principal principal = SimplePrincipal.create("user_domain", "user",
+                "auth_creds", PRINCIPAL_AUTHORITY);
+
+        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
+        ZTSClient client = new ZTSClient("http://localhost:4080", principal);
+        client.setZTSRDLGeneratedClient(ztsClientMock);
+        ZTSClient.setAccessTokenSignKeyResolver(resolver);
+        ZTSClient.initZTSAccessTokenFileLoader();
+
+        AccessTokenResponse accessTokenResponse = client.getAccessToken("test.domain", Collections.singletonList("admin"), 3600);
+        assertNotNull(accessTokenResponse);
+        assertEquals(accessTokenResponse.getScope(), "admin");
+        assertEquals((int) accessTokenResponse.getExpires_in(), 28800);
     }
 
     @Test
@@ -2946,13 +3196,13 @@ public class ZTSClientTest {
         AccessTokenResponse accessTokenResponse = client.getAccessToken("coretech", null, 3600);
         assertNotNull(accessTokenResponse);
         assertEquals("accesstoken", accessTokenResponse.getAccess_token());
-        assertTrue(3600 == accessTokenResponse.getExpires_in());
+        assertEquals((int) accessTokenResponse.getExpires_in(), 3600);
         assertNull(accessTokenResponse.getId_token());
 
         accessTokenResponse = client.getAccessToken("coretech", Collections.singletonList("role1"), 3600);
         assertNotNull(accessTokenResponse);
         assertEquals("accesstoken", accessTokenResponse.getAccess_token());
-        assertTrue(3600 == accessTokenResponse.getExpires_in());
+        assertEquals((int) accessTokenResponse.getExpires_in(), 3600);
         assertNull(accessTokenResponse.getId_token());
 
         // the second request should be addressed from the cache
@@ -2960,7 +3210,7 @@ public class ZTSClientTest {
         accessTokenResponse = client.getAccessToken("coretech", Collections.singletonList("role1"), 3600);
         assertNotNull(accessTokenResponse);
         assertEquals("accesstoken", accessTokenResponse.getAccess_token());
-        assertTrue(3600 == accessTokenResponse.getExpires_in());
+        assertEquals((int) accessTokenResponse.getExpires_in(), 3600);
         assertNull(accessTokenResponse.getId_token());
 
         // now with id token
@@ -2969,7 +3219,7 @@ public class ZTSClientTest {
         assertNotNull(accessTokenResponse);
         assertEquals("accesstoken", accessTokenResponse.getAccess_token());
         assertEquals("idtoken", accessTokenResponse.getId_token());
-        assertTrue(3600 == accessTokenResponse.getExpires_in());
+        assertEquals((int) accessTokenResponse.getExpires_in(), 3600);
 
         // now with id token and cache disabled
 
@@ -2977,7 +3227,7 @@ public class ZTSClientTest {
         assertNotNull(accessTokenResponse);
         assertEquals("accesstoken", accessTokenResponse.getAccess_token());
         assertEquals("idtoken", accessTokenResponse.getId_token());
-        assertTrue(3600 == accessTokenResponse.getExpires_in());
+        assertEquals((int) accessTokenResponse.getExpires_in(), 3600);
 
 
         ZTSClient.setCacheDisable(true);
@@ -2985,8 +3235,36 @@ public class ZTSClientTest {
         assertNotNull(accessTokenResponse);
         assertEquals("accesstoken", accessTokenResponse.getAccess_token());
         assertEquals("idtoken", accessTokenResponse.getId_token());
-        assertTrue(3600 == accessTokenResponse.getExpires_in());
+        assertEquals((int) accessTokenResponse.getExpires_in(), 3600);
         ZTSClient.setCacheDisable(false);
+
+        client.close();
+    }
+
+    @Test
+    public void testGetAccessTokenWithAuthorizationDetails() {
+
+        Principal principal = SimplePrincipal.create("user_domain", "user",
+                "auth_creds", PRINCIPAL_AUTHORITY);
+
+        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
+        ZTSClient client = new ZTSClient("http://localhost:4080", principal);
+        client.setZTSRDLGeneratedClient(ztsClientMock);
+
+        final String authorizationDetails = "[{\"type\":\"message_access\",\"location\":[\"https://location1\"," +
+                "\"https://location2\"],\"identifier\":\"id1\"}]";
+
+        AccessTokenResponse accessTokenResponse = client.getAccessToken("coretech", "role1", authorizationDetails, 3600);
+        assertNotNull(accessTokenResponse);
+        assertEquals("accesstoken-authz-details", accessTokenResponse.getAccess_token());
+        assertEquals((int) accessTokenResponse.getExpires_in(), 3600);
+
+        // the second request should be addressed from the cache
+
+        accessTokenResponse = client.getAccessToken("coretech", "role1", authorizationDetails, 3600);
+        assertNotNull(accessTokenResponse);
+        assertEquals("accesstoken-authz-details", accessTokenResponse.getAccess_token());
+        assertEquals((int) accessTokenResponse.getExpires_in(), 3600);
 
         client.close();
     }
@@ -3024,8 +3302,8 @@ public class ZTSClientTest {
         tokenResponse.setAccess_token("accesstoken1");
         tokenResponse.setExpires_in(100);
 
-        client.ACCESS_TOKEN_CACHE.put("p=user_domain.user;d=weather", new AccessTokenResponseCacheEntry(tokenResponse));
-        client.ACCESS_TOKEN_CACHE.put("p=user_domain.user;d=exception", new AccessTokenResponseCacheEntry(tokenResponse));
+        ZTSClient.ACCESS_TOKEN_CACHE.put("p=user_domain.user;d=weather", new AccessTokenResponseCacheEntry(tokenResponse));
+        ZTSClient.ACCESS_TOKEN_CACHE.put("p=user_domain.user;d=exception", new AccessTokenResponseCacheEntry(tokenResponse));
 
         // with cache disabled we're not going to get any data back
 
@@ -3120,7 +3398,7 @@ public class ZTSClientTest {
 
         ZTSClient client = new ZTSClient("http://localhost:4080/", "user_domain",
                 "user", siaProvider);
-        client.setPrefetchInterval(1);
+        ZTSClient.setPrefetchInterval(1);
         client.setZTSRDLGeneratedClient(ztsClientMock);
 
         String domain1 = "coretech";
@@ -3130,19 +3408,18 @@ public class ZTSClientTest {
         assertTrue(ztsClientMock.getLastAccessTokenFetchedTime(domain1, null, null) < 0);
 
         // initialize the prefetch token process.
-        client.prefetchAccessToken(domain1, null, null, null, 8);
+        client.prefetchAccessToken(domain1, null, null, null, null, null, 8);
         int scheduledItemsSize = client.getScheduledItemsSize();
 
         // make sure only unique items are in the queue
-        client.prefetchAccessToken(domain1, null, null, null, 8);
+        client.prefetchAccessToken(domain1, null, null, null, null, null, 8);
         int scheduledItemsSize2 = client.getScheduledItemsSize();
         assertEquals(scheduledItemsSize, scheduledItemsSize2);
 
         AccessTokenResponse access1 = client.getAccessToken(domain1, null, 8);
         assertNotNull(access1);
-        long rt1Expiry = System.currentTimeMillis() / 1000 + access1.getExpires_in();
 
-        client.prefetchAccessToken(domain2, null, null, null, 8);
+        client.prefetchAccessToken(domain2, null, null, null, null, null, 8);
         assertEquals(client.getScheduledItemsSize(), scheduledItemsSize + 1);
 
         AccessTokenResponse access2 = client.getAccessToken(domain2, null, 8);
@@ -3156,7 +3433,6 @@ public class ZTSClientTest {
         System.out.println("testPrefetchAccessTokenShouldNotCallServer: nap over so what happened");
 
         assertEquals(client.getScheduledItemsSize(), scheduledItemsSize + 1);
-        long lastTimerTriggered1 = ZTSClient.FETCHER_LAST_RUN_AT.get();
 
         long lastTokenFetchedTime1 = ztsClientMock.getLastAccessTokenFetchedTime(domain1, null, null);
         assertTrue(lastTokenFetchedTime1 > 0);
@@ -3179,6 +3455,68 @@ public class ZTSClientTest {
         assertTrue(rt2Expiry3 > rt2Expiry2); // this token was refreshed
 
         ZTSClient.cancelPrefetch();
+        client.close();
+    }
+
+    @Test
+    public void testGetCertificateAuthorityBundle() {
+
+        Principal principal = SimplePrincipal.create("user_domain", "user",
+                "auth_creds", PRINCIPAL_AUTHORITY);
+
+        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
+        ZTSClient client = new ZTSClient("http://localhost:4080", principal);
+        client.setZTSRDLGeneratedClient(ztsClientMock);
+
+        CertificateAuthorityBundle bundle = client.getCertificateAuthorityBundle("athenz");
+        assertNotNull(bundle);
+        assertEquals(bundle.getName(), "athenz");
+        assertEquals(bundle.getCerts(), "certs");
+
+        try {
+            client.getCertificateAuthorityBundle("exc");
+            fail();
+        } catch (ZTSClientException ex) {
+            assertEquals(ex.getCode(), 400);
+        }
+
+        try {
+            client.getCertificateAuthorityBundle("system");
+            fail();
+        } catch (ZTSClientException ex) {
+            assertEquals(ex.getCode(), 404);
+        }
+
+        client.close();
+    }
+
+    @Test
+    public void getGetInstanceRegisterToken() {
+
+        ZTSRDLClientMock ztsClientMock = new ZTSRDLClientMock();
+        Principal principal = SimplePrincipal.create("user_domain", "user",
+                "v=S1;d=user_domain;n=user;s=sig", PRINCIPAL_AUTHORITY);
+        ZTSClient client = new ZTSClient("http://localhost:4080", principal);
+        client.setZTSRDLGeneratedClient(ztsClientMock);
+
+        InstanceRegisterToken token = client.getInstanceRegisterToken("sys.auth.zts", "coretech",
+                "api", "id-001");
+        assertNotNull(token);
+
+        try {
+            client.getInstanceRegisterToken("sys.auth.zts", "bad-domain", "api", "id-001");
+            fail();
+        } catch (ZTSClientException ex) {
+            assertEquals(ex.getCode(), ResourceException.NOT_FOUND);
+        }
+
+        try {
+            client.getInstanceRegisterToken("sys.auth.zts", "exc", "api", "id-001");
+            fail();
+        } catch (ZTSClientException ex) {
+            assertEquals(ex.getCode(), ResourceException.BAD_REQUEST);
+        }
+
         client.close();
     }
 }

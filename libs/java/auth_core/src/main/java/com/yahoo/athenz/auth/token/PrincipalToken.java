@@ -178,14 +178,14 @@ public class PrincipalToken extends Token {
         unsignedToken = strBuilder.toString();
         
         if (LOG.isDebugEnabled()) {
-            LOG.debug("PrincipalToken created: " + unsignedToken);
+            LOG.debug("PrincipalToken created: {}", unsignedToken);
         }
     }
 
     public PrincipalToken(String signedToken) {
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Constructing PrincipalToken with input string: " + signedToken);
+            LOG.debug("Constructing PrincipalToken with input string: {}", signedToken);
         }
         
         if (signedToken == null || signedToken.isEmpty()) {
@@ -217,12 +217,25 @@ public class PrincipalToken extends Token {
          *    private key for user tokens and y64 encoded
          */
 
+        String authzSvcToken = null;
         int idx = signedToken.indexOf(";s=");
         if (idx != -1) {
             unsignedToken = signedToken.substring(0, idx);
+
+            // we might have authorized service token details after the signature
+            // so we're going to extract our signature component.
+
+            int authzIdx = signedToken.indexOf(';', idx + 3);
+            if (authzIdx != -1 && signedToken.indexOf(";bs=", idx + 3) != -1) {
+                signature = signedToken.substring(idx + 3, authzIdx);
+                authzSvcToken = signedToken.substring(authzIdx);
+            } else {
+                signature = signedToken.substring(idx + 3);
+            }
         }
 
-        for (String item : signedToken.split(";")) {
+        final String parseToken = unsignedToken != null ? unsignedToken : signedToken;
+        for (String item : parseToken.split(";")) {
             String [] kv = item.split("=");
             if (kv.length == 2) {
                 switch (kv[0]) {
@@ -231,15 +244,6 @@ public class PrincipalToken extends Token {
                     break;
                 case "b":
                     authorizedServices = Arrays.asList(kv[1].split(","));
-                    break;
-                case "bk":
-                    authorizedServiceKeyId = kv[1];
-                    break;
-                case "bn":
-                    authorizedServiceName = kv[1];
-                    break;
-                case "bs":
-                    authorizedServiceSignature = kv[1];
                     break;
                 case "d":
                     domain = kv[1];
@@ -262,9 +266,6 @@ public class PrincipalToken extends Token {
                 case "o":
                     originalRequestor = kv[1];
                     break;
-                case "s":
-                    signature = kv[1];
-                    break;
                 case "t":
                     timestamp = Long.parseLong(kv[1]);
                     break;
@@ -274,6 +275,29 @@ public class PrincipalToken extends Token {
                 case "z":
                     keyService = kv[1];
                     break;
+                }
+            }
+        }
+
+        // now process the authorized service token part
+
+        if (authzSvcToken != null && !authzSvcToken.isEmpty()) {
+            idx = authzSvcToken.indexOf(";bs=");
+            if (idx != -1) {
+                authorizedServiceSignature = authzSvcToken.substring(idx + 4);
+
+                for (String item : authzSvcToken.substring(0, idx).split(";")) {
+                    String[] kv = item.split("=");
+                    if (kv.length == 2) {
+                        switch (kv[0]) {
+                            case "bk":
+                                authorizedServiceKeyId = kv[1];
+                                break;
+                            case "bn":
+                                authorizedServiceName = kv[1];
+                                break;
+                        }
+                    }
                 }
             }
         }
@@ -295,25 +319,15 @@ public class PrincipalToken extends Token {
         this.signedToken = signedToken;
         
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Values extracted from token " +
-                    " version:" + version +
-                    " domain:" + domain +
-                    " service:" + name +
-                    " host:" + host +
-                    " ip: " + ip +
-                    " id: " + keyId +
-                    " keyService: " + keyService +
-                    " originalRequestor: " + originalRequestor +
-                    " salt:" + salt +
-                    " timestamp:" + timestamp +
-                    " expiryTime:" + expiryTime +
-                    " signature:" + signature);
+            LOG.debug("Values extracted from token version:{} domain:{} service:{} host:{}" +
+                    " ip:{} id:{} keyService:{} originalRequestor:{} salt:{} timestamp:{}" +
+                    " expiryTime:{} signature:{}", version, domain, name, host, ip, keyId,
+                    keyService, originalRequestor, salt, timestamp, expiryTime, signature);
             if (authorizedServices != null) {
-                LOG.debug("Authorized service details from token " +
-                    " authorizedServices:" + String.join(",", authorizedServices) +
-                    " authorizedServiceName:" + authorizedServiceName +
-                    " authorizedServiceKeyId:" + authorizedServiceKeyId +
-                    " authorizedServiceSignature:" + authorizedServiceSignature);
+                LOG.debug("Authorized service details from token authorizedServices:{}" +
+                        " authorizedServiceName:{} authorizedServiceKeyId:{} authorizedServiceSignature:{}",
+                        String.join(",", authorizedServices), authorizedServiceName, authorizedServiceKeyId,
+                        authorizedServiceSignature);
             }
         }
     }
@@ -369,15 +383,11 @@ public class PrincipalToken extends Token {
             LOG.error(errMsg.toString());
             return false;
         }
-        
+
+        // since at this point authorizedServiceSignature is not null
+        // our signed token has the ";bs=" component
+
         int idx = signedToken.indexOf(";bs=");
-        if (idx == -1) {
-            errMsg.append("PrincipalToken:validateForAuthorizedService: token=").
-                   append(unsignedToken).append(" : not signed by any authorized service");
-            LOG.error(errMsg.toString());
-            return false;
-        }
-        
         String unsignedAuthorizedServiceToken = signedToken.substring(0, idx);
         
         if (pubKey == null) {
@@ -399,8 +409,7 @@ public class PrincipalToken extends Token {
                        append(pubKey);
                 LOG.error(errMsg.toString());
             } else if (LOG.isDebugEnabled()) {
-                LOG.debug("validateForAuthorizedService: Token: " + unsignedToken +
-                        " -  successfully authenticated");
+                LOG.debug("validateForAuthorizedService: Token: {} -  successfully authenticated", unsignedToken);
             }
             ///CLOVER:ON
         } catch (Exception e) {

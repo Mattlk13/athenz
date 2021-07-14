@@ -3,17 +3,22 @@
 //
 
 package com.yahoo.athenz.zms;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.yahoo.rdl.*;
 
 //
 // RoleMember -
 //
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class RoleMember {
     public String memberName;
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public Timestamp expiration;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Timestamp reviewReminder;
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public Boolean active;
@@ -29,6 +34,18 @@ public class RoleMember {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public Timestamp lastNotifiedTime;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String requestPrincipal;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Timestamp reviewLastNotifiedTime;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer systemDisabled;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer principalType;
 
     public RoleMember setMemberName(String memberName) {
         this.memberName = memberName;
@@ -43,6 +60,13 @@ public class RoleMember {
     }
     public Timestamp getExpiration() {
         return expiration;
+    }
+    public RoleMember setReviewReminder(Timestamp reviewReminder) {
+        this.reviewReminder = reviewReminder;
+        return this;
+    }
+    public Timestamp getReviewReminder() {
+        return reviewReminder;
     }
     public RoleMember setActive(Boolean active) {
         this.active = active;
@@ -79,6 +103,34 @@ public class RoleMember {
     public Timestamp getLastNotifiedTime() {
         return lastNotifiedTime;
     }
+    public RoleMember setRequestPrincipal(String requestPrincipal) {
+        this.requestPrincipal = requestPrincipal;
+        return this;
+    }
+    public String getRequestPrincipal() {
+        return requestPrincipal;
+    }
+    public RoleMember setReviewLastNotifiedTime(Timestamp reviewLastNotifiedTime) {
+        this.reviewLastNotifiedTime = reviewLastNotifiedTime;
+        return this;
+    }
+    public Timestamp getReviewLastNotifiedTime() {
+        return reviewLastNotifiedTime;
+    }
+    public RoleMember setSystemDisabled(Integer systemDisabled) {
+        this.systemDisabled = systemDisabled;
+        return this;
+    }
+    public Integer getSystemDisabled() {
+        return systemDisabled;
+    }
+    public RoleMember setPrincipalType(Integer principalType) {
+        this.principalType = principalType;
+        return this;
+    }
+    public Integer getPrincipalType() {
+        return principalType;
+    }
 
     @Override
     public boolean equals(Object another) {
@@ -91,6 +143,9 @@ public class RoleMember {
                 return false;
             }
             if (expiration == null ? a.expiration != null : !expiration.equals(a.expiration)) {
+                return false;
+            }
+            if (reviewReminder == null ? a.reviewReminder != null : !reviewReminder.equals(a.reviewReminder)) {
                 return false;
             }
             if (active == null ? a.active != null : !active.equals(a.active)) {
@@ -106,6 +161,18 @@ public class RoleMember {
                 return false;
             }
             if (lastNotifiedTime == null ? a.lastNotifiedTime != null : !lastNotifiedTime.equals(a.lastNotifiedTime)) {
+                return false;
+            }
+            if (requestPrincipal == null ? a.requestPrincipal != null : !requestPrincipal.equals(a.requestPrincipal)) {
+                return false;
+            }
+            if (reviewLastNotifiedTime == null ? a.reviewLastNotifiedTime != null : !reviewLastNotifiedTime.equals(a.reviewLastNotifiedTime)) {
+                return false;
+            }
+            if (systemDisabled == null ? a.systemDisabled != null : !systemDisabled.equals(a.systemDisabled)) {
+                return false;
+            }
+            if (principalType == null ? a.principalType != null : !principalType.equals(a.principalType)) {
                 return false;
             }
         }

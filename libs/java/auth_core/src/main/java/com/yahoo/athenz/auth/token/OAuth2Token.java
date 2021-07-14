@@ -16,11 +16,10 @@
 package com.yahoo.athenz.auth.token;
 
 import com.yahoo.athenz.auth.token.jwts.JwtsSigningKeyResolver;
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.Jws;
-import io.jsonwebtoken.Jwts;
+import io.jsonwebtoken.*;
 
 import java.security.PublicKey;
+import java.util.Date;
 
 public class OAuth2Token {
 
@@ -33,43 +32,104 @@ public class OAuth2Token {
     protected long expiryTime;
     protected long issueTime;
     protected long authTime;
+    protected long notBeforeTime;
     protected String audience;
     protected String issuer;
     protected String subject;
-    protected Jws<Claims> claims = null;
+    protected String jwtId;
+    protected Claims body = null;
 
     public OAuth2Token() {
     }
 
     public OAuth2Token(final String token, JwtsSigningKeyResolver keyResolver) {
 
-        claims = Jwts.parser()
-                .setSigningKeyResolver(keyResolver)
-                .setAllowedClockSkewSeconds(60)
-                .parseClaimsJws(token);
+        // if the keyresolver is null and the token does not have
+        // a signature we're going to treat and parse it as a jwt
+
+        if (keyResolver == null && isSignatureMissing(token)) {
+            Jwt<Header, Claims> claims = Jwts.parserBuilder()
+                    .setAllowedClockSkewSeconds(60)
+                    .build()
+                    .parseClaimsJwt(token);
+            body = claims.getBody();
+        } else {
+            Jws<Claims> claims = Jwts.parserBuilder()
+                    .setSigningKeyResolver(keyResolver)
+                    .setAllowedClockSkewSeconds(60)
+                    .build()
+                    .parseClaimsJws(token);
+            body = claims.getBody();
+        }
 
         setTokenFields();
     }
 
     public OAuth2Token(final String token, PublicKey publicKey) {
 
-        claims = Jwts.parser()
-                .setSigningKey(publicKey)
-                .setAllowedClockSkewSeconds(60)
-                .parseClaimsJws(token);
+        if (publicKey == null && isSignatureMissing(token)) {
+            Jwt<Header, Claims> claims = Jwts.parserBuilder()
+                    .setAllowedClockSkewSeconds(60)
+                    .build()
+                    .parseClaimsJwt(token);
+            body = claims.getBody();
+        } else {
+            Jws<Claims> claims = Jwts.parserBuilder()
+                    .setSigningKey(publicKey)
+                    .setAllowedClockSkewSeconds(60)
+                    .build()
+                    .parseClaimsJws(token);
+            body = claims.getBody();
+        }
 
         setTokenFields();
     }
 
+    boolean isSignatureMissing(final String token) {
+        return token.length() == token.lastIndexOf('.') + 1;
+    }
+
+    int parseIntegerValue(Claims body, final String claimName) {
+
+        // if the object is not of our expected integer class
+        // then we'll just return 0 and ignore all exceptions
+
+        try {
+            return body.get(claimName, Integer.class);
+        } catch (Exception ignored) {
+        }
+        return 0;
+    }
+
+    long parseLongValue(Claims body, final String claimName) {
+
+        // if the object is not of our expected long class
+        // then we'll just return 0 and ignore all exceptions
+
+        try {
+            return body.get(claimName, Long.class);
+        } catch (Exception ignored) {
+        }
+        return 0;
+    }
+
+    long parseDateValue(Date date) {
+
+        // our date values are stored in seconds
+
+        return date == null ? 0 : date.getTime() / 1000;
+    }
+
     void setTokenFields() {
-        final Claims body = claims.getBody();
-        setVersion(body.get(CLAIM_VERSION, Integer.class));
+        setVersion(parseIntegerValue(body, CLAIM_VERSION));
         setAudience(body.getAudience());
-        setExpiryTime(body.getExpiration().getTime() / 1000);
-        setIssueTime(body.getIssuedAt().getTime() / 1000);
-        setAuthTime(body.get(CLAIM_AUTH_TIME, Long.class));
+        setExpiryTime(parseDateValue(body.getExpiration()));
+        setIssueTime(parseDateValue(body.getIssuedAt()));
+        setNotBeforeTime(parseDateValue(body.getNotBefore()));
+        setAuthTime(parseLongValue(body, CLAIM_AUTH_TIME));
         setIssuer(body.getIssuer());
         setSubject(body.getSubject());
+        setJwtId(body.getId());
     }
 
     public int getVersion() {
@@ -104,6 +164,14 @@ public class OAuth2Token {
         this.issueTime = issueTime;
     }
 
+    public long getNotBeforeTime() {
+        return notBeforeTime;
+    }
+
+    public void setNotBeforeTime(long notBeforeTime) {
+        this.notBeforeTime = notBeforeTime;
+    }
+
     public String getIssuer() {
         return issuer;
     }
@@ -126,5 +194,13 @@ public class OAuth2Token {
 
     public void setAuthTime(long authTime) {
         this.authTime = authTime;
+    }
+
+    public String getJwtId() {
+        return jwtId;
+    }
+
+    public void setJwtId(String jwtId) {
+        this.jwtId = jwtId;
     }
 }

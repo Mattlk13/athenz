@@ -3,6 +3,7 @@
 //
 
 package com.yahoo.athenz.zms;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import java.util.List;
 import com.yahoo.rdl.*;
@@ -10,12 +11,16 @@ import com.yahoo.rdl.*;
 //
 // Tenancy - A representation of tenant.
 //
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class Tenancy {
     public String domain;
     public String service;
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public List<String> resourceGroups;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Boolean createAdminRole;
 
     public Tenancy setDomain(String domain) {
         this.domain = domain;
@@ -38,6 +43,13 @@ public class Tenancy {
     public List<String> getResourceGroups() {
         return resourceGroups;
     }
+    public Tenancy setCreateAdminRole(Boolean createAdminRole) {
+        this.createAdminRole = createAdminRole;
+        return this;
+    }
+    public Boolean getCreateAdminRole() {
+        return createAdminRole;
+    }
 
     @Override
     public boolean equals(Object another) {
@@ -55,7 +67,20 @@ public class Tenancy {
             if (resourceGroups == null ? a.resourceGroups != null : !resourceGroups.equals(a.resourceGroups)) {
                 return false;
             }
+            if (createAdminRole == null ? a.createAdminRole != null : !createAdminRole.equals(a.createAdminRole)) {
+                return false;
+            }
         }
         return true;
+    }
+
+    //
+    // sets up the instance according to its default field values, if any
+    //
+    public Tenancy init() {
+        if (createAdminRole == null) {
+            createAdminRole = true;
+        }
+        return this;
     }
 }

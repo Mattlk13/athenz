@@ -1,60 +1,91 @@
+/*
+ * Copyright 2019 Oath Holdings Inc.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package com.yahoo.athenz.zts.cert;
-
-import java.io.File;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.security.cert.X509Certificate;
-import java.util.*;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.yahoo.athenz.auth.util.Crypto;
-import com.yahoo.athenz.zts.utils.*;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import com.yahoo.athenz.zts.SSHCertificates;
-import com.yahoo.athenz.zts.SSHCertRequest;
-import com.yahoo.athenz.zts.ZTSConsts;
-import com.yahoo.athenz.zts.InstanceIdentity;
-import com.yahoo.athenz.zts.ResourceException;
-
+import com.google.common.net.InetAddresses;
 import com.yahoo.athenz.auth.Authorizer;
 import com.yahoo.athenz.auth.Principal;
 import com.yahoo.athenz.auth.PrivateKeyStore;
-import com.yahoo.athenz.common.server.cert.CertSigner;
-import com.yahoo.athenz.common.server.cert.CertSignerFactory;
-import com.yahoo.athenz.common.server.ssh.SSHSigner;
-import com.yahoo.athenz.common.server.ssh.SSHSignerFactory;
+import com.yahoo.athenz.auth.util.AthenzUtils;
+import com.yahoo.athenz.auth.util.Crypto;
+import com.yahoo.athenz.auth.util.CryptoException;
+import com.yahoo.athenz.common.server.cert.*;
+import com.yahoo.athenz.common.server.db.RolesProvider;
+import com.yahoo.athenz.common.server.dns.HostnameResolver;
+import com.yahoo.athenz.common.server.notification.NotificationManager;
+import com.yahoo.athenz.common.server.ssh.*;
+import com.yahoo.athenz.common.server.workload.WorkloadRecord;
+import com.yahoo.athenz.common.server.workload.WorkloadRecordStore;
+import com.yahoo.athenz.common.server.workload.WorkloadRecordStoreConnection;
+import com.yahoo.athenz.common.server.workload.WorkloadRecordStoreFactory;
+import com.yahoo.athenz.common.utils.X509CertUtils;
+import com.yahoo.athenz.zts.*;
+import com.yahoo.athenz.zts.utils.*;
+import com.yahoo.rdl.Timestamp;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.security.cert.X509Certificate;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
 
 public class InstanceCertManager {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(InstanceCertManager.class);
 
+    private static final String CA_TYPE_X509 = "x509";
+
     private Authorizer authorizer;
     private CertSigner certSigner;
     private SSHSigner sshSigner;
+    private HostnameResolver hostnameResolver;
     private CertRecordStore certStore = null;
-    private ScheduledExecutorService scheduledExecutor;
+    private SSHRecordStore sshStore = null;
+    private WorkloadRecordStore workloadStore = null;
+    private ScheduledExecutorService certScheduledExecutor;
+    private ScheduledExecutorService sshScheduledExecutor;
     private List<IPBlock> certRefreshIPBlocks;
     private Map<String, List<IPBlock>> instanceCertIPBlocks;
     private String caX509CertificateSigner = null;
+    private Map<String, String> caX509ProviderCertificateSigners = null;
     private String sshUserCertificateSigner = null;
     private String sshHostCertificateSigner = null;
     private boolean responseSendSSHSignerCerts;
     private boolean responseSendX509SignerCerts;
     private ObjectMapper jsonMapper;
+    private Map<String, CertificateAuthorityBundle> certAuthorityBundles = null;
 
-    public InstanceCertManager(final PrivateKeyStore keyStore, Authorizer authorizer,
+    public InstanceCertManager(final PrivateKeyStore keyStore, Authorizer authorizer, HostnameResolver hostnameResolver,
             boolean readOnlyMode) {
 
         // set our authorizer object
 
         this.authorizer = authorizer;
+
+        // set hostname resolver
+
+        this.hostnameResolver = hostnameResolver;
 
         // initialize our jackson object mapper
 
@@ -75,24 +106,23 @@ public class InstanceCertManager {
         
         loadCertificateObjectStore(keyStore);
 
-        // check to see if we have been provided with a x.509/ssh certificate
-        // bundle or we need to fetch one from the certsigner
+        // if ZTS configured to issue ssh host certificates for services,
+        // it can track of some details if enabled
 
-        responseSendSSHSignerCerts = Boolean.parseBoolean(
-                System.getProperty(ZTSConsts.ZTS_PROP_RESP_SSH_SIGNER_CERTS, "true"));
-        responseSendX509SignerCerts = Boolean.parseBoolean(
-                System.getProperty(ZTSConsts.ZTS_PROP_RESP_X509_SIGNER_CERTS, "true"));
+        loadSSHObjectStore(keyStore);
 
-        // if we're not asked to skip sending certificate signers then
-        // check to see if we need to load them from files instead of
-        // certsigner directly
+        // if ZTS configured to store workload information for services,
+        // it can track of some details if enabled
 
-        if (responseSendX509SignerCerts) {
-            caX509CertificateSigner = loadCertificateBundle(ZTSConsts.ZTS_PROP_X509_CA_CERT_FNAME);
-        }
-        if (responseSendSSHSignerCerts) {
-            sshUserCertificateSigner = loadCertificateBundle(ZTSConsts.ZTS_PROP_SSH_USER_CA_CERT_FNAME);
-            sshHostCertificateSigner = loadCertificateBundle(ZTSConsts.ZTS_PROP_SSH_HOST_CA_CERT_FNAME);
+        loadWorkloadObjectStore(keyStore);
+
+
+        // load any configuration wrt certificate signers and any
+        // configured certificate bundles
+
+        if (!loadCertificateAuthorityBundles()) {
+            throw new ResourceException(ResourceException.INTERNAL_SERVER_ERROR,
+                    "Unable to load Certificate Authority Bundles");
         }
 
         // load our allowed cert refresh and instance register ip blocks
@@ -110,16 +140,145 @@ public class InstanceCertManager {
         // to the database
 
         if (!readOnlyMode && certStore != null && certSigner != null) {
-            scheduledExecutor = Executors.newScheduledThreadPool(1);
-            scheduledExecutor.scheduleAtFixedRate(
+            certScheduledExecutor = Executors.newScheduledThreadPool(1);
+            certScheduledExecutor.scheduleAtFixedRate(
                     new ExpiredX509CertRecordCleaner(certStore, certSigner.getMaxCertExpiryTimeMins()),
                     0, 1, TimeUnit.DAYS);
+        }
+
+        if (!readOnlyMode && sshStore != null) {
+            int expiryTimeMins = (int) TimeUnit.MINUTES.convert(30, TimeUnit.DAYS);
+            sshScheduledExecutor = Executors.newScheduledThreadPool(1);
+            sshScheduledExecutor.scheduleAtFixedRate(
+                    new ExpiredSSHCertRecordCleaner(sshStore, expiryTimeMins), 0, 1, TimeUnit.DAYS);
         }
     }
     
     void shutdown() {
-        if (scheduledExecutor != null) {
-            scheduledExecutor.shutdownNow();
+        if (certScheduledExecutor != null) {
+            certScheduledExecutor.shutdownNow();
+        }
+        if (sshScheduledExecutor != null) {
+            sshScheduledExecutor.shutdownNow();
+        }
+    }
+
+    private boolean loadCertificateAuthorityBundles() {
+
+        // check to see if we have been provided with a x.509/ssh certificate
+        // bundle or we need to fetch one from the certsigner
+
+        responseSendSSHSignerCerts = Boolean.parseBoolean(
+                System.getProperty(ZTSConsts.ZTS_PROP_RESP_SSH_SIGNER_CERTS, "true"));
+        responseSendX509SignerCerts = Boolean.parseBoolean(
+                System.getProperty(ZTSConsts.ZTS_PROP_RESP_X509_SIGNER_CERTS, "true"));
+
+        // if we're not asked to skip sending certificate signers then
+        // check to see if we need to load them from files instead of
+        // certsigner directly
+
+        if (responseSendX509SignerCerts) {
+            caX509CertificateSigner = loadCertificateBundle(ZTSConsts.ZTS_PROP_X509_CA_CERT_FNAME);
+            caX509ProviderCertificateSigners = new ConcurrentHashMap<>();
+        }
+        if (responseSendSSHSignerCerts) {
+            sshUserCertificateSigner = loadCertificateBundle(ZTSConsts.ZTS_PROP_SSH_USER_CA_CERT_FNAME);
+            sshHostCertificateSigner = loadCertificateBundle(ZTSConsts.ZTS_PROP_SSH_HOST_CA_CERT_FNAME);
+        }
+
+        // now let's fetch our configured certificate authority bundles
+
+        certAuthorityBundles = new HashMap<>();
+
+        final String caBundleFile =  System.getProperty(ZTSConsts.ZTS_PROP_CERT_BUNDLES_FNAME);
+        if (caBundleFile == null || caBundleFile.isEmpty()) {
+            return true;
+        }
+
+        byte[] data = ZTSUtils.readFileContents(caBundleFile);
+        if (data == null) {
+            return false;
+        }
+
+        CertBundles certBundles = null;
+        try {
+            certBundles = jsonMapper.readValue(data, CertBundles.class);
+        } catch (Exception ex) {
+            LOGGER.error("Unable to parse CA bundle file: {} - {}", caBundleFile, ex.getMessage());
+        }
+
+        if (certBundles == null) {
+            return false;
+        }
+
+        List<CertBundle> bundleList = certBundles.getCertBundles();
+        if (bundleList == null || bundleList.isEmpty()) {
+            LOGGER.error("No CA bundles available in the file: {}", caBundleFile);
+            return false;
+        }
+
+        for (CertBundle bundle : bundleList) {
+            if (!processCertificateAuthorityBundle(bundle)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private boolean processCertificateAuthorityBundle(CertBundle bundle) {
+
+        final String name = bundle.getName();
+        final String fileName = bundle.getFilename();
+        if (fileName == null || fileName.isEmpty()) {
+            LOGGER.error("Bundle {} does not have a file configured", name);
+            return false;
+        }
+
+        // if this is x.509 certificate bundle then we're going
+        // to extract our data, validate all certs and regenerate
+        // our pem data to remove any other comments from the data
+        // file to minimize the data size
+
+        String bundleData = null;
+        if (CA_TYPE_X509.equalsIgnoreCase(bundle.getType())) {
+            bundleData = extractX509CertificateBundle(fileName);
+        } else {
+            byte[] data = ZTSUtils.readFileContents(fileName);
+            if (data != null) {
+                bundleData = new String(data);
+            }
+        }
+
+        if (bundleData == null) {
+            LOGGER.error("Unable to load bundle {} from file {}", name, fileName);
+            return false;
+        }
+
+        CertificateAuthorityBundle certAuthorityBundle = new CertificateAuthorityBundle()
+                .setName(name)
+                .setCerts(bundleData);
+
+        certAuthorityBundles.put(name, certAuthorityBundle);
+        return true;
+    }
+
+    String extractX509CertificateBundle(final String filename) {
+
+        try {
+            // first load our certificates file to make sure
+            // all the certs in the file are valid
+
+            X509Certificate[] x509Certs = Crypto.loadX509Certificates(filename);
+
+            // then re-generate the certs in pem format to
+            // remove any comments/etc to minimize the data size
+
+            return Crypto.x509CertificatesToPEM(x509Certs);
+
+        } catch (CryptoException ex) {
+            LOGGER.error("Unable to load certificate file", ex);
+            return null;
         }
     }
 
@@ -136,7 +295,7 @@ public class InstanceCertManager {
             return true;
         }
 
-        byte[] data = readFileContents(providerIPMapFile);
+        byte[] data = ZTSUtils.readFileContents(providerIPMapFile);
         if (data == null) {
             return false;
         }
@@ -180,8 +339,7 @@ public class InstanceCertManager {
         try {
             certSignerFactory = (CertSignerFactory) Class.forName(certSignerFactoryClass).newInstance();
         } catch (InstantiationException | IllegalAccessException | ClassNotFoundException e) {
-            LOGGER.error("Invalid CertSignerFactory class: " + certSignerFactoryClass
-                    + " error: " + e.getMessage());
+            LOGGER.error("Invalid CertSignerFactory class: {} error: {}", certSignerFactoryClass, e.getMessage());
             throw new IllegalArgumentException("Invalid certsigner class");
         }
 
@@ -202,8 +360,7 @@ public class InstanceCertManager {
         try {
             sshSignerFactory = (SSHSignerFactory) Class.forName(sshSignerFactoryClass).newInstance();
         } catch (InstantiationException | IllegalAccessException | ClassNotFoundException e) {
-            LOGGER.error("Invalid SSHSignerFactory class: " + sshSignerFactoryClass
-                    + " error: " + e.getMessage());
+            LOGGER.error("Invalid SSHSignerFactory class: {} error: {}", sshSignerFactoryClass, e.getMessage());
             throw new IllegalArgumentException("Invalid sshsigner class");
         }
 
@@ -221,28 +378,6 @@ public class InstanceCertManager {
         this.certSigner = certSigner;
     }
 
-    Path getFilePath(File file) {
-        return Paths.get(file.toURI());
-    }
-
-    byte[] readFileContents(final String filename) {
-
-        File caFile = new File(filename);
-        if (!caFile.exists()) {
-            LOGGER.error("Configured file {} does not exist", filename);
-            return null;
-        }
-
-        byte[] data = null;
-        try {
-            data = Files.readAllBytes(getFilePath(caFile));
-        } catch (Exception ex) {
-            LOGGER.error("Unable to read {}: {}", filename, ex.getMessage());
-        }
-
-        return data;
-    }
-
     String loadCertificateBundle(final String propertyName) {
 
         final String caFileName = System.getProperty(propertyName);
@@ -250,7 +385,7 @@ public class InstanceCertManager {
             return null;
         }
 
-        byte[] data = readFileContents(caFileName);
+        byte[] data = ZTSUtils.readFileContents(caFileName);
         if (data == null) {
             throw new ResourceException(ResourceException.INTERNAL_SERVER_ERROR,
                     "Unable to load Certificate bundle from: " + caFileName);
@@ -265,7 +400,7 @@ public class InstanceCertManager {
             return true;
         }
 
-        byte[] data = readFileContents(ipAddressFileName);
+        byte[] data = ZTSUtils.readFileContents(ipAddressFileName);
         if (data == null) {
             return false;
         }
@@ -325,11 +460,75 @@ public class InstanceCertManager {
         
         certStore = certRecordStoreFactory.create(keyStore);
     }
-    
+
+    private void loadSSHObjectStore(PrivateKeyStore keyStore) {
+
+        String sshRecordStoreFactoryClass = System.getProperty(ZTSConsts.ZTS_PROP_SSH_RECORD_STORE_FACTORY_CLASS);
+        if (sshRecordStoreFactoryClass == null || sshRecordStoreFactoryClass.isEmpty()) {
+            return;
+        }
+
+        SSHRecordStoreFactory sshRecordStoreFactory;
+        try {
+            sshRecordStoreFactory = (SSHRecordStoreFactory) Class.forName(sshRecordStoreFactoryClass).newInstance();
+        } catch (InstantiationException | IllegalAccessException | ClassNotFoundException e) {
+            LOGGER.error("Invalid SSHRecordStoreFactory class: {} error: {}",
+                    sshRecordStoreFactoryClass, e.getMessage());
+            throw new IllegalArgumentException("Invalid ssh record store factory class");
+        }
+
+        // create our cert record store instance
+
+        sshStore = sshRecordStoreFactory.create(keyStore);
+    }
+
+    private void loadWorkloadObjectStore(PrivateKeyStore keyStore) {
+
+        String workloadRecordStoreFactoryClass = System.getProperty(ZTSConsts.ZTS_PROP_WORKLOAD_RECORD_STORE_FACTORY_CLASS);
+        if (workloadRecordStoreFactoryClass == null || workloadRecordStoreFactoryClass.isEmpty()) {
+            return;
+        }
+
+        WorkloadRecordStoreFactory workloadRecordStoreFactory;
+        try {
+            workloadRecordStoreFactory = (WorkloadRecordStoreFactory) Class.forName(workloadRecordStoreFactoryClass).newInstance();
+        } catch (InstantiationException | IllegalAccessException | ClassNotFoundException e) {
+            LOGGER.error("Invalid WorkloadRecordStoreFactory class: {} error: {}",
+                    workloadRecordStoreFactoryClass, e.getMessage());
+            throw new IllegalArgumentException("Invalid workload record store factory class");
+        }
+
+        // create our workload record store instance
+        workloadStore = workloadRecordStoreFactory.create(keyStore);
+    }
+
     public void setCertStore(CertRecordStore certStore) {
         this.certStore = certStore;
     }
-    
+
+    public void setSSHStore(SSHRecordStore sshStore) {
+        this.sshStore = sshStore;
+    }
+
+    public void setWorkloadStore(WorkloadRecordStore workloadStore) {
+        this.workloadStore = workloadStore;
+    }
+
+    public CertificateAuthorityBundle getCertificateAuthorityBundle(final String name) {
+        return certAuthorityBundles.get(name);
+    }
+
+    public List<X509CertRecord> getUnrefreshedCertsNotifications(String serverHostName, String provider) {
+        if (certStore == null) {
+            return new ArrayList<>();
+        }
+
+        try (CertRecordStoreConnection storeConnection = certStore.getConnection()) {
+            long updateTs = System.currentTimeMillis();
+            return storeConnection.updateUnrefreshedCertificatesNotificationTimestamp(serverHostName, updateTs, provider);
+        }
+    }
+
     public X509CertRecord getX509CertRecord(final String provider, X509Certificate cert) {
 
         if (certStore == null) {
@@ -371,7 +570,7 @@ public class InstanceCertManager {
         if (certStore == null) {
             return false;
         }
-        
+
         boolean result;
         try (CertRecordStoreConnection storeConnection = certStore.getConnection()) {
             result = storeConnection.updateX509CertRecord(certRecord);
@@ -407,40 +606,35 @@ public class InstanceCertManager {
         return result;
     }
 
-    public String generateX509Certificate(final String csr, final String keyUsage, int expiryTime) {
+    public String generateX509Certificate(final String provider, final String certIssuer,
+            final String csr, final String keyUsage, int expiryTime) {
 
-        String pemCert = certSigner.generateX509Certificate(csr, keyUsage, expiryTime);
+        String pemCert = certSigner.generateX509Certificate(provider, certIssuer, csr, keyUsage, expiryTime);
         if (pemCert == null || pemCert.isEmpty()) {
             LOGGER.error("generateX509Certificate: CertSigner was unable to generate X509 certificate");
         }
         return pemCert;
     }
 
-    public String getCACertificate() {
-        return certSigner.getCACertificate();
+    public String getCACertificate(final String provider) {
+        return certSigner.getCACertificate(provider);
     }
 
-    public InstanceIdentity generateIdentity(String csr, String cn, String keyUsage,
-            int expiryTime) {
+    public InstanceIdentity generateIdentity(final String provider, final String certIssuer,
+            final String csr, final String cn, final String keyUsage, int expiryTime) {
         
         // generate a certificate for this certificate request
 
-        final String pemCert = generateX509Certificate(csr, keyUsage, expiryTime);
+        final String pemCert = generateX509Certificate(provider, certIssuer, csr, keyUsage, expiryTime);
         if (pemCert == null || pemCert.isEmpty()) {
             return null;
         }
         
         return new InstanceIdentity().setName(cn).setX509Certificate(pemCert)
-                .setX509CertificateSigner(getX509CertificateSigner());
+                .setX509CertificateSigner(getX509CertificateSigner(provider));
     }
 
-    void updateX509CertificateSigner() {
-        if (caX509CertificateSigner == null) {
-            caX509CertificateSigner = getCACertificate();
-        }
-    }
-
-    public String getX509CertificateSigner() {
+    public String getX509CertificateSigner(final String provider) {
 
         // if configured not to send x.509 signer certs
         // then we'll return right away as null
@@ -449,12 +643,22 @@ public class InstanceCertManager {
             return null;
         }
 
-        if (caX509CertificateSigner == null) {
-            synchronized (InstanceCertManager.class) {
-                updateX509CertificateSigner();
-            }
+        if (caX509CertificateSigner != null) {
+            return caX509CertificateSigner;
         }
-        return caX509CertificateSigner;
+
+        final String providerKeyName = provider == null ? "default" : provider;
+        String certificateSigner = caX509ProviderCertificateSigners.get(providerKeyName);
+        if (certificateSigner != null) {
+            return certificateSigner;
+        }
+
+        certificateSigner = getCACertificate(provider);
+        if (certificateSigner != null) {
+            caX509ProviderCertificateSigners.put(providerKeyName, certificateSigner);
+        }
+
+        return certificateSigner;
     }
 
     void resetX509CertificateSigner() {
@@ -468,30 +672,95 @@ public class InstanceCertManager {
             return null;
         }
 
+        // if this is a host certificate we're going to fetch our
+        // ssh certificate record
+
+        SSHCertRecord sshCertRecord = null;
+        SSHCertRequestMeta meta = certRequest.getCertRequestMeta();
+        if (ZTSConsts.ZTS_SSH_HOST.equals(meta.getCertType())) {
+            sshCertRecord = getSSHCertRecord(meta.getInstanceId(), meta.getAthenzService());
+        }
+
         // ssh signer is responsible for all authorization checks and processing
         // of this request. the signer already was given the authorizer object
         // that it can use for those checks.
 
-        return sshSigner.generateCertificate(principal, certRequest, null);
+        return sshSigner.generateCertificate(principal, certRequest, sshCertRecord, null);
     }
 
-    public boolean generateSSHIdentity(Principal principal, InstanceIdentity identity,
-            String sshCsr, String certType) {
+    SshHostCsr parseSshHostCsr(final String csr) {
+        SshHostCsr sshHostCsr = null;
+        try {
+            sshHostCsr = jsonMapper.readValue(csr, SshHostCsr.class);
+        } catch (Exception ex) {
+            LOGGER.error("Unable to parse SSH CSR: {}", csr, ex);
+        }
+        return sshHostCsr;
+    }
 
-        if (sshSigner == null || sshCsr == null || sshCsr.isEmpty()) {
+    void updateSSHHostPrincipals(SshHostCsr sshHostCsr, SSHCertRecord sshCertRecord) {
+
+        if (sshHostCsr == null) {
+            sshCertRecord.setPrincipals("127.0.0.1");
+            return;
+        }
+
+        String recordPrincipals = "";
+
+        // check both principals and x-principal fields
+
+        String[] principals = sshHostCsr.getPrincipals();
+        String[] xprincipals = sshHostCsr.getXPrincipals();
+        if (principals != null || xprincipals != null) {
+            Set<String> principalSet = new HashSet<>();
+            if (principals != null) {
+                principalSet.addAll(Arrays.asList(principals));
+            }
+            if (xprincipals != null) {
+                principalSet.addAll(Arrays.asList(xprincipals));
+            }
+            if (!principalSet.isEmpty()) {
+                recordPrincipals = String.join(",", principalSet);
+            }
+        }
+
+        if (recordPrincipals.isEmpty()) {
+            sshCertRecord.setPrincipals("127.0.0.1");
+        } else {
+            sshCertRecord.setPrincipals(recordPrincipals);
+        }
+    }
+
+    public boolean generateSSHIdentity(Principal principal, InstanceIdentity identity, final String hostname,
+            final String csr, SSHCertRecord sshCertRecord, final String certType) {
+
+        if (sshSigner == null || csr == null || csr.isEmpty()) {
             return true;
         }
 
+        if (ZTSConsts.ZTS_SSH_HOST.equals(certType)) {
+
+            // parse our host csr
+
+            SshHostCsr sshHostCsr = parseSshHostCsr(csr);
+            if (hostname != null && !hostname.isEmpty() && hostnameResolver != null) {
+                if (!validPrincipals(hostname, sshCertRecord, sshHostCsr)) {
+                    LOGGER.error("SSH Host CSR validation failed, principal: {}, hostname: {}, csr: {}", principal, hostname, csr);
+                    return false;
+                }
+            }
+
+            // update our ssh record object
+
+            updateSSHHostPrincipals(sshHostCsr, sshCertRecord);
+        }
+
         SSHCertRequest certRequest = new SSHCertRequest();
-        certRequest.setCsr(sshCsr);
+        certRequest.setCsr(csr);
 
         SSHCertificates sshCerts;
         try {
-            sshCerts = sshSigner.generateCertificate(principal, certRequest, certType);
-        } catch (com.yahoo.athenz.common.server.rest.ResourceException ex) {
-            LOGGER.error("SSHSigner was unable to generate SSH certificate for {}/{} - error {}/{}",
-                    identity.getInstanceId(), identity.getName(), ex.getCode(), ex.getMessage());
-            return false;
+            sshCerts = sshSigner.generateCertificate(principal, certRequest, sshCertRecord, certType);
         } catch (Exception ex) {
             LOGGER.error("SSHSigner was unable to generate SSH certificate for {}/{} - error {}",
                     identity.getInstanceId(), identity.getName(), ex.getMessage());
@@ -503,6 +772,16 @@ public class InstanceCertManager {
                     identity.getInstanceId(), identity.getName());
             return false;
         }
+
+        // record the host ssh cert details if configured
+        // any failure will be logged by the ssh record store
+        // function also handles null objects. If our principal
+        // is null then it's a register operation otherwise
+        // we're handling a refresh operation
+
+        updateSSHCertRecord(sshCertRecord, principal != null);
+
+        // update our identity object with ssh cert details
 
         identity.setSshCertificate(sshCerts.getCertificates().get(0).getCertificate());
         identity.setSshCertificateSigner(getSSHCertificateSigner(certType));
@@ -596,6 +875,63 @@ public class InstanceCertManager {
         return verifyIPAddressAccess(ipAddress, certIPBlocks);
     }
 
+    /**
+     * validates hostname against the resolver, and verifies that the ssh principals map to hostname
+     * @param hostname of the instance
+     * @param sshCertRecord ssh certificate record stored in db
+     * @param sshHostCsr ssh host csr from the sia
+     * @return boolean true or false
+     */
+    public boolean validPrincipals(final String hostname, SSHCertRecord sshCertRecord, SshHostCsr sshHostCsr) {
+
+        if (sshHostCsr == null) {
+            return false;
+        }
+
+        String[] principals = sshHostCsr.getPrincipals();
+        String[] xPrincipals = sshHostCsr.getXPrincipals();
+
+        // Pass through when xPrincipals is not specified
+
+        if (sshHostCsr.getXPrincipals() == null) {
+            LOGGER.error("CSR has no xPrincipals to verify, hostname: {}, principals: {}", hostname, principals);
+            return true;
+        }
+
+        LOGGER.debug("CSR principals: {}, xPrincipals: {}", principals, xPrincipals);
+
+        List<String> cnames = new ArrayList<>();
+        for (String name: xPrincipals) {
+            // Skip IPs
+            if (InetAddresses.isInetAddress(name)) {
+                continue;
+            }
+            // Skip direct hostname principals
+            if (name.equals(hostname)) {
+                // verify that the hostname is a known name
+                if (hostnameResolver != null && !hostnameResolver.isValidHostname(hostname)) {
+                    LOGGER.error("{} is not a valid name", hostname);
+                    return false;
+                }
+                continue;
+            }
+
+            cnames.add(name);
+        }
+        // If there are no custom cnames, return right away
+        if (cnames.isEmpty()) {
+            return true;
+        }
+
+        LOGGER.debug("validating xPrincipals in the csr: {}", cnames);
+        if (hostnameResolver.isValidHostCnameList(sshCertRecord.getService(), hostname, cnames, CertType.SSH_HOST)) {
+            return true;
+        }
+
+        LOGGER.error("{} does not map to some cnames {}", hostname, String.join(",", cnames));
+        return false;
+    }
+
     private boolean verifyIPAddressAccess(final String ipAddress, final List<IPBlock> ipBlocks) {
         
         // if the list has no IP addresses then we allow all
@@ -613,8 +949,8 @@ public class InstanceCertManager {
         return false;
     }
 
-    public void log(final Principal principal, final String ip, final String provider,
-                    final String instanceId, final X509Certificate x509Cert) {
+    public void logX509Cert(final Principal principal, final String ip, final String provider,
+            final String instanceId, final X509Certificate x509Cert) {
 
         if (certStore == null) {
             return;
@@ -629,6 +965,162 @@ public class InstanceCertManager {
             certStore.log(principal, ip, provider, instanceId, x509Cert);
         } catch (Exception ignored) {
         }
+    }
+
+    public SSHCertRecord getSSHCertRecord(final String instanceId, final String service) {
+
+        if (sshStore == null) {
+            return null;
+        }
+
+        SSHCertRecord certRecord;
+        try (SSHRecordStoreConnection storeConnection = sshStore.getConnection()) {
+            certRecord = storeConnection.getSSHCertRecord(instanceId, service);
+        }
+
+        return certRecord;
+    }
+
+    public boolean updateSSHCertRecord(SSHCertRecord certRecord, boolean refresh) {
+
+        if (sshStore == null) {
+            return false;
+        }
+
+        if (certRecord == null) {
+            return true;
+        }
+
+        boolean result = false;
+        try (SSHRecordStoreConnection storeConnection = sshStore.getConnection()) {
+
+            // if it's a refresh we're going to try to update first
+
+            if (refresh && storeConnection.updateSSHCertRecord(certRecord)) {
+                return true;
+            }
+
+            // if it's a register operation or if we get a failure, in the case
+            // of refresh, then it's possible that we don't have the record so
+            // we're going to create it
+
+            result = storeConnection.insertSSHCertRecord(certRecord);
+        } catch (Exception ex) {
+            LOGGER.error("Unable to store ssh certificate record for principal {} - {}",
+                    certRecord.getPrincipals(), ex.getMessage());
+        }
+
+        return result;
+    }
+
+    public boolean enableCertStoreNotifications(NotificationManager notificationManager, RolesProvider rolesProvider, String serverName) {
+        boolean notificationsEnabled = false;
+        if (certStore != null) {
+            notificationsEnabled = certStore.enableNotifications(notificationManager, rolesProvider, serverName);
+        }
+
+        LOGGER.info("certStore Notifications {}", (notificationsEnabled ? "enabled" : "disabled"));
+        return notificationsEnabled;
+    }
+
+    public boolean enableSSHStoreNotifications(NotificationManager notificationManager, RolesProvider rolesProvider, String serverName) {
+        boolean notificationsEnabled = false;
+        if (sshStore != null) {
+            notificationsEnabled = sshStore.enableNotifications(notificationManager, rolesProvider, serverName);
+        }
+
+        LOGGER.info("sshStore Notifications {}", (notificationsEnabled ? "enabled" : "disabled"));
+        return notificationsEnabled;
+    }
+
+    public boolean insertWorkloadRecord(WorkloadRecord workloadRecord) {
+
+        if (workloadStore == null) {
+            return false;
+        }
+
+        boolean result;
+        try (WorkloadRecordStoreConnection storeConnection = workloadStore.getConnection()) {
+            result = storeConnection.insertWorkloadRecord(workloadRecord);
+        }
+
+        return result;
+    }
+
+    public boolean updateWorkloadRecord(WorkloadRecord workloadRecord) {
+
+        if (workloadStore == null) {
+            return false;
+        }
+
+        boolean result;
+        try (WorkloadRecordStoreConnection storeConnection = workloadStore.getConnection()) {
+            result = storeConnection.updateWorkloadRecord(workloadRecord);
+            if (!result) {
+                // failed update could be because of a new IP address for the same instance id, so we are going to try insert operation.
+                result = storeConnection.insertWorkloadRecord(workloadRecord);
+            }
+        }
+        return result;
+    }
+
+    public List<Workload> getWorkloadsByService(String domain, String service) {
+        if (workloadStore == null) {
+            return Collections.emptyList();
+        }
+        try (WorkloadRecordStoreConnection storeConnection = workloadStore.getConnection()) {
+            List<WorkloadRecord> workloadRecords = storeConnection.getWorkloadRecordsByService(domain, service);
+            Map<String, List<String>> flattenedIpAddresses = new HashMap<>();
+            String mapKey;
+            for (WorkloadRecord workloadRecord : workloadRecords) {
+                mapKey = workloadRecord.getInstanceId() + ":" + workloadRecord.getProvider() + ":" + workloadRecord.getUpdateTime().getTime() +
+                        ":" + workloadRecord.getCertExpiryTime().getTime() + ":" + workloadRecord.getHostname();
+                if (flattenedIpAddresses.containsKey(mapKey)) {
+                    flattenedIpAddresses.get(mapKey).add(workloadRecord.getIp());
+                } else {
+                    List<String> ipList = new ArrayList<>();
+                    ipList.add(workloadRecord.getIp());
+                    flattenedIpAddresses.put(mapKey, ipList);
+                }
+            }
+            return flattenedIpAddresses.entrySet().stream().map(entry -> {
+                Workload wl = new Workload();
+                String[] tempArr = entry.getKey().split(":");
+                wl.setUuid(tempArr[0])
+                        .setProvider(tempArr[1])
+                        .setUpdateTime(Timestamp.fromMillis(Long.parseLong(tempArr[2])))
+                        .setCertExpiryTime(Timestamp.fromMillis(Long.parseLong(tempArr[3])))
+                        .setHostname(tempArr[4])
+                        .setIpAddresses(entry.getValue());
+                return wl;
+            }).collect(Collectors.toList());
+
+        }
+    }
+
+    public List<Workload> getWorkloadsByIp(String ip) {
+        if (workloadStore == null) {
+            return Collections.emptyList();
+        }
+        try (WorkloadRecordStoreConnection storeConnection = workloadStore.getConnection()) {
+            return storeConnection.getWorkloadRecordsByIp(ip).stream()
+                    .map(wr -> {
+                        Workload wl = new Workload();
+                        String[] strArr = AthenzUtils.splitPrincipalName(wr.getService());
+                        if (strArr != null) {
+                            wl.setDomainName(strArr[0]).setServiceName(strArr[1]);
+                        }
+                        wl.setProvider(wr.getProvider()).setUuid(wr.getInstanceId()).setUpdateTime(Timestamp.fromDate(wr.getUpdateTime()))
+                                .setHostname(wr.getHostname()).setCertExpiryTime(Timestamp.fromDate(wr.getCertExpiryTime()));                        return wl;
+                    })
+                    .filter(distinctByKey(w -> w.getUuid() + "#" + AthenzUtils.getPrincipalName(w.getDomainName(), w.getServiceName())))
+                    .collect(Collectors.toList());
+        }
+    }
+
+    public static <T> Predicate<T> distinctByKey(Function<? super T, Object> keyExtractor) {
+        Map<Object, Boolean> map = new ConcurrentHashMap<>();
+        return t -> map.putIfAbsent(keyExtractor.apply(t), Boolean.TRUE) == null;
     }
 
     class ExpiredX509CertRecordCleaner implements Runnable {
@@ -663,6 +1155,43 @@ public class InstanceCertManager {
             int deletedRecords;
             try (CertRecordStoreConnection storeConnection = store.getConnection()) {
                 deletedRecords = storeConnection.deleteExpiredX509CertRecords(expiryTimeMins);
+            }
+            return deletedRecords;
+        }
+    }
+
+    class ExpiredSSHCertRecordCleaner implements Runnable {
+
+        private SSHRecordStore store;
+        private int expiryTimeMins;
+
+        public ExpiredSSHCertRecordCleaner(SSHRecordStore store, int expiryTimeMins) {
+            this.store = store;
+            this.expiryTimeMins = expiryTimeMins;
+        }
+
+        @Override
+        public void run() {
+
+            LOGGER.info("ExpiredSSHCertRecordCleaner: Starting expired ssh record cleaner thread...");
+
+            int deletedRecords = 0;
+            try {
+                deletedRecords = cleanupExpiredSSHCertRecords();
+            } catch (Throwable t) {
+                LOGGER.error("ExpiredSSHCertRecordCleaner: unable to cleanup expired ssh records: {}",
+                        t.getMessage());
+            }
+
+            LOGGER.info("ExpiredSSHCertRecordCleaner: Completed cleanup of {} expired ssh records",
+                    deletedRecords);
+        }
+
+        int cleanupExpiredSSHCertRecords() {
+
+            int deletedRecords;
+            try (SSHRecordStoreConnection storeConnection = store.getConnection()) {
+                deletedRecords = storeConnection.deleteExpiredSSHCertRecords(expiryTimeMins);
             }
             return deletedRecords;
         }

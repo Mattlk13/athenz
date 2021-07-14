@@ -30,6 +30,7 @@ import java.security.cert.X509Certificate;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -45,9 +46,18 @@ import com.oath.auth.KeyRefresher;
 import com.oath.auth.KeyRefresherException;
 import com.oath.auth.KeyRefresherListener;
 import com.oath.auth.Utils;
+import com.yahoo.athenz.auth.token.jwts.JwtsSigningKeyResolver;
+import org.apache.http.config.Registry;
+import org.apache.http.config.RegistryBuilder;
+import org.apache.http.conn.socket.ConnectionSocketFactory;
+import org.apache.http.conn.socket.PlainConnectionSocketFactory;
+import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
+import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
 import org.bouncycastle.asn1.DERIA5String;
 import org.bouncycastle.asn1.x509.GeneralName;
 import org.bouncycastle.operator.OperatorCreationException;
+import org.ehcache.Cache;
+import org.glassfish.jersey.apache.connector.ApacheClientProperties;
 import org.glassfish.jersey.apache.connector.ApacheConnectorProvider;
 import org.glassfish.jersey.client.ClientConfig;
 import org.glassfish.jersey.client.ClientProperties;
@@ -62,6 +72,7 @@ import com.amazonaws.services.securitytoken.model.Credentials;
 import com.amazonaws.services.securitytoken.AWSSecurityTokenServiceClientBuilder;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.yahoo.athenz.auth.AuthorityConsts;
 import com.yahoo.athenz.auth.Principal;
 import com.yahoo.athenz.auth.PrivateKeyStore;
 import com.yahoo.athenz.auth.ServiceIdentityProvider;
@@ -76,21 +87,24 @@ import com.yahoo.rdl.JSON;
 public class ZTSClient implements Closeable {
 
     private static final Logger LOG = LoggerFactory.getLogger(ZTSClient.class);
-    
+
     private String ztsUrl = null;
     private String proxyUrl = null;
     private String domain = null;
     private String service = null;
     private SSLContext sslContext = null;
-    
+    private ZTSClientNotificationSender notificationSender = null;
+
     ZTSRDLGeneratedClient ztsClient = null;
     ServiceIdentityProvider siaProvider = null;
     Principal principal = null;
+    ZTSClientCache ztsClientCache = ZTSClientCache.getInstance();
 
     // configurable fields
     //
     static private boolean cacheDisabled = false;
     static private int tokenMinExpiryTime = 900;
+    static private int tokenMaxExpiryOffset = 300;
     static private long prefetchInterval = 60; // seconds
     static private boolean prefetchAutoEnable = true;
     static private String x509CsrDn = null;
@@ -99,6 +113,7 @@ public class ZTSClient implements Closeable {
     static private int reqConnectTimeout = 30000;
     static private String x509CertDNSName = null;
     static private String confZtsUrl = null;
+    static private JwtsSigningKeyResolver resolver = null;
     
     private boolean enablePrefetch = true;
     private boolean ztsClientOverride = false;
@@ -135,6 +150,9 @@ public class ZTSClient implements Closeable {
     public static final String ZTS_CLIENT_PROP_TRUSTSTORE_PASSWORD              = "athenz.zts.client.truststore_password";
     public static final String ZTS_CLIENT_PROP_TRUSTSTORE_PWD_APP_NAME          = "athenz.zts.client.truststore_pwd_app_name";
 
+    public static final String ZTS_CLIENT_PROP_POOL_MAX_PER_ROUTE               = "athenz.zts.client.http_pool_max_per_route";
+    public static final String ZTS_CLIENT_PROP_POOL_MAX_TOTAL                   = "athenz.zts.client.http_pool_max_total";
+
     public static final String ZTS_CLIENT_PROP_PRIVATE_KEY_STORE_FACTORY_CLASS  = "athenz.zts.client.private_keystore_factory_class";
     public static final String ZTS_CLIENT_PROP_CLIENT_PROTOCOL                  = "athenz.zts.client.client_ssl_protocol";
     public static final String ZTS_CLIENT_PKEY_STORE_FACTORY_CLASS              = "com.yahoo.athenz.auth.impl.FilePrivateKeyStoreFactory";
@@ -158,6 +176,7 @@ public class ZTSClient implements Closeable {
     private static ServiceLoader<ZTSClientService> ztsTokenProviders;
     private static AtomicReference<Set<String>> svcLoaderCacheKeys;
     private static PrivateKeyStore PRIVATE_KEY_STORE = loadServicePrivateKey();
+    private static ZTSAccessTokenFileLoader ztsAccessTokenFileLoader;
 
     enum TokenType {
         ROLE,
@@ -205,6 +224,10 @@ public class ZTSClient implements Closeable {
         // finally retrieve our configuration ZTS url from our config file
         
         lookupZTSUrl();
+
+        // init zts file utility
+
+        initZTSAccessTokenFileLoader();
         
         return true;
     }
@@ -313,7 +336,19 @@ public class ZTSClient implements Closeable {
             }
         }
     }
-    
+
+    public static void initZTSAccessTokenFileLoader() {
+        if (resolver == null) {
+            resolver = new JwtsSigningKeyResolver(null, null);
+        }
+        ztsAccessTokenFileLoader = new ZTSAccessTokenFileLoader(resolver);
+        ztsAccessTokenFileLoader.preload();
+    }
+
+    public static void setAccessTokenSignKeyResolver(JwtsSigningKeyResolver jwtsSigningKeyResolver) {
+        resolver = jwtsSigningKeyResolver;
+    }
+
     /**
      * Constructs a new ZTSClient object with default settings.
      * The url for ZTS Server is automatically retrieved from the athenz
@@ -399,7 +434,7 @@ public class ZTSClient implements Closeable {
     public ZTSClient(String ztsUrl, SSLContext sslContext) {
         this(ztsUrl, null, sslContext);
     }
-    
+
     /**
      * Constructs a new ZTSClient object with the given SSLContext object
      * and ZTS Server Url through the specified Proxy URL. Default read
@@ -413,9 +448,9 @@ public class ZTSClient implements Closeable {
      * for authenticating requests
      */
     public ZTSClient(String ztsUrl, String proxyUrl, SSLContext sslContext) {
-        
+
         // verify we have a valid ssl context specified
-        
+
         if (sslContext == null) {
             throw new IllegalArgumentException("SSLContext object must be specified");
         }
@@ -439,7 +474,7 @@ public class ZTSClient implements Closeable {
     public ZTSClient(String domainName, String serviceName, ServiceIdentityProvider siaProvider) {
         this(null, domainName, serviceName, siaProvider);
     }
-    
+
     /**
      * Constructs a new ZTSClient object with the given service details
      * identity provider (which will provide the ntoken for the service)
@@ -455,11 +490,11 @@ public class ZTSClient implements Closeable {
      * @param siaProvider service identity provider for the client to request principals
      */
     public ZTSClient(String ztsUrl, String domainName, String serviceName,
-            ServiceIdentityProvider siaProvider) {
-        if (domainName == null || domainName.isEmpty()) {
+                     ServiceIdentityProvider siaProvider) {
+        if (isEmpty(domainName)) {
             throw new IllegalArgumentException("Domain name must be specified");
         }
-        if (serviceName == null || serviceName.isEmpty()) {
+        if (isEmpty(serviceName)) {
             throw new IllegalArgumentException("Service name must be specified");
         }
         if (siaProvider == null) {
@@ -500,6 +535,14 @@ public class ZTSClient implements Closeable {
     }
 
     /**
+     * Sets a notificationSender that will listen to notifications and send them (usually to domain admins)
+     * @param notificationSender notification sender
+     */
+    public void setNotificationSender(ZTSClientNotificationSender notificationSender) {
+        this.notificationSender = notificationSender;
+    }
+
+    /**
      * Cancel the Prefetch Timer. This removes all the prefetch
      * items from the list, purges and cancels the fetch timer.
      * This should be called before application shutdown.
@@ -526,8 +569,12 @@ public class ZTSClient implements Closeable {
         ztsClientOverride = true;
     }
 
+    public void setZTSClientCache(ZTSClientCache ztsClientCache) {
+        this.ztsClientCache = ztsClientCache;
+    }
+
     /**
-     * Generate the SSLContext object based on give key/cert and trusttore
+     * Generate the SSLContext object based on give key/cert and truststore
      * files. If configured, the method will monitor any changes in the given
      * key/cert files and automatically update the ssl context.
      * @param trustStorePath path to the trust-store
@@ -536,6 +583,9 @@ public class ZTSClient implements Closeable {
      * @param privateKeyFile path to the private key file
      * @param monitorKeyCertUpdates boolean flag whether or not monitor file updates
      * @return SSLContext object
+     * @throws InterruptedException interrupt exceptions
+     * @throws KeyRefresherException any exceptions from the cert refresher
+     * @throws IOException io exceptions
      */
     public SSLContext createSSLContext(final String trustStorePath, final char[] trustStorePassword,
                  final String publicCertFile, final String privateKeyFile, boolean monitorKeyCertUpdates)
@@ -561,19 +611,19 @@ public class ZTSClient implements Closeable {
         // to create our ssl context
         
         String keyStorePath = System.getProperty(ZTS_CLIENT_PROP_KEYSTORE_PATH);
-        if (keyStorePath == null || keyStorePath.isEmpty()) {
+        if (isEmpty(keyStorePath)) {
             return null;
         }
         String keyStoreType = System.getProperty(ZTS_CLIENT_PROP_KEYSTORE_TYPE);
         String keyStorePwd = System.getProperty(ZTS_CLIENT_PROP_KEYSTORE_PASSWORD);
         char[] keyStorePassword = null;
-        if (null != keyStorePwd && !keyStorePwd.isEmpty()) {
+        if (!isEmpty(keyStorePwd)) {
             keyStorePassword = keyStorePwd.toCharArray();
         }
         String keyStorePasswordAppName = System.getProperty(ZTS_CLIENT_PROP_KEYSTORE_PWD_APP_NAME);
         char[] keyManagerPassword = null;
         String keyManagerPwd = System.getProperty(ZTS_CLIENT_PROP_KEY_MANAGER_PASSWORD);
-        if (null != keyManagerPwd && !keyManagerPwd.isEmpty()) {
+        if (!isEmpty(keyManagerPwd)) {
             keyManagerPassword = keyManagerPwd.toCharArray();
         }
         String keyManagerPasswordAppName = System.getProperty(ZTS_CLIENT_PROP_KEY_MANAGER_PWD_APP_NAME);
@@ -583,7 +633,7 @@ public class ZTSClient implements Closeable {
         String trustStoreType = System.getProperty(ZTS_CLIENT_PROP_TRUSTSTORE_TYPE);
         String trustStorePwd = System.getProperty(ZTS_CLIENT_PROP_TRUSTSTORE_PASSWORD);
         char[] trustStorePassword = null;
-        if (null != trustStorePwd && !trustStorePwd.isEmpty()) {
+        if (!isEmpty(trustStorePwd)) {
             trustStorePassword = trustStorePwd.toCharArray();
         }
         String trustStorePasswordAppName = System.getProperty(ZTS_CLIENT_PROP_TRUSTSTORE_PWD_APP_NAME);
@@ -596,10 +646,10 @@ public class ZTSClient implements Closeable {
         ClientSSLContextBuilder builder = new SSLUtils.ClientSSLContextBuilder(clientProtocol)
                 .privateKeyStore(PRIVATE_KEY_STORE).keyStorePath(keyStorePath);
         
-        if (null != certAlias && !certAlias.isEmpty()) {
+        if (!isEmpty(certAlias)) {
             builder.certAlias(certAlias);
         }
-        if (null != keyStoreType && !keyStoreType.isEmpty()) {
+        if (!isEmpty(keyStoreType)) {
             builder.keyStoreType(keyStoreType);
         }
         if (null != keyStorePassword) {
@@ -614,10 +664,10 @@ public class ZTSClient implements Closeable {
         if (null != keyManagerPasswordAppName) {
             builder.keyManagerPasswordAppName(keyManagerPasswordAppName);
         }
-        if (null != trustStorePath && !trustStorePath.isEmpty()) {
+        if (!isEmpty(trustStorePath)) {
             builder.trustStorePath(trustStorePath);
         }
-        if (null != trustStoreType && !trustStoreType.isEmpty()) {
+        if (!isEmpty(trustStoreType)) {
             builder.trustStoreType(trustStoreType);
         }
         if (null != trustStorePassword) {
@@ -635,7 +685,11 @@ public class ZTSClient implements Closeable {
                 ZTS_CLIENT_PKEY_STORE_FACTORY_CLASS);
         return SSLUtils.loadServicePrivateKey(pkeyFactoryClass);
     }
-    
+
+    ClientBuilder getClientBuilder() {
+        return ClientBuilder.newBuilder();
+    }
+
     private void initClient(final String serverUrl, Principal identity,
             final String domainName, final String serviceName,
             final ServiceIdentityProvider siaProvider) {
@@ -645,7 +699,7 @@ public class ZTSClient implements Closeable {
         // verify if the url is ending with /zts/v1 and if it's
         // not we'll automatically append it
         
-        if (ztsUrl != null && !ztsUrl.isEmpty()) {
+        if (!isEmpty(ztsUrl)) {
             if (!ztsUrl.endsWith("/zts/v1")) {
                 if (ztsUrl.charAt(ztsUrl.length() - 1) != '/') {
                     ztsUrl += '/';
@@ -657,24 +711,27 @@ public class ZTSClient implements Closeable {
         // determine to see if we need a host verifier for our ssl connections
         
         HostnameVerifier hostnameVerifier = null;
-        if (x509CertDNSName != null && !x509CertDNSName.isEmpty()) {
+        if (!isEmpty(x509CertDNSName)) {
             hostnameVerifier = new AWSHostNameVerifier(x509CertDNSName);
         }
         
         // if we don't have a ssl context specified, check the system
         // properties to see if we need to create one
-        
+
         if (sslContext == null) {
             sslContext = createSSLContext();
         }
-        
+
         // setup our client config object with timeouts
 
         final JacksonJsonProvider jacksonJsonProvider = new JacksonJaxbJsonProvider()
                 .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
         final ClientConfig config = new ClientConfig(jacksonJsonProvider);
-        config.property(ClientProperties.CONNECT_TIMEOUT, reqConnectTimeout);
-        config.property(ClientProperties.READ_TIMEOUT, reqReadTimeout);
+
+        PoolingHttpClientConnectionManager connManager = createConnectionManager(sslContext, hostnameVerifier);
+        if (connManager != null) {
+            config.property(ApacheClientProperties.CONNECTION_MANAGER, connManager);
+        }
         config.connectorProvider(new ApacheConnectorProvider());
 
         // if we're asked to use a proxy for our request
@@ -685,14 +742,20 @@ public class ZTSClient implements Closeable {
             config.property(ClientProperties.PROXY_URI, proxyUrl);
         }
         
-        ClientBuilder builder = ClientBuilder.newBuilder();
+        ClientBuilder builder = getClientBuilder();
         if (sslContext != null) {
             builder = builder.sslContext(sslContext);
             enablePrefetch = true;
         }
-        Client rsClient = builder.hostnameVerifier(hostnameVerifier)
-            .withConfig(config)
-            .build();
+
+        // JerseyClientBuilder::withConfig() replaces the existing config with the new client
+        // config. Hence the client config should be added to the builder before the timeouts.
+        // Otherwise the timeout settings would be overridden.
+        Client rsClient = builder.withConfig(config)
+                .hostnameVerifier(hostnameVerifier)
+                .readTimeout(reqReadTimeout, TimeUnit.MILLISECONDS)
+                .connectTimeout(reqConnectTimeout, TimeUnit.MILLISECONDS)
+                .build();
 
         ztsClient = new ZTSRDLGeneratedClient(ztsUrl, rsClient);
         principal = identity;
@@ -709,7 +772,36 @@ public class ZTSClient implements Closeable {
             ztsClient.addCredentials(identity.getAuthority().getHeader(), identity.getCredentials());
         }
     }
-    
+
+    PoolingHttpClientConnectionManager createConnectionManager(SSLContext sslContext, HostnameVerifier hostnameVerifier) {
+
+        if (sslContext == null) {
+            return null;
+        }
+
+        SSLConnectionSocketFactory sslSocketFactory;
+        if (hostnameVerifier == null) {
+            sslSocketFactory = new SSLConnectionSocketFactory(sslContext);
+        } else {
+            sslSocketFactory = new SSLConnectionSocketFactory(sslContext, hostnameVerifier);
+        }
+        Registry<ConnectionSocketFactory> registry = RegistryBuilder
+                .<ConnectionSocketFactory>create()
+                .register("https", sslSocketFactory)
+                .register("http", new PlainConnectionSocketFactory())
+                .build();
+        PoolingHttpClientConnectionManager poolingHttpClientConnectionManager = new PoolingHttpClientConnectionManager(registry);
+
+        // we'll use the default values from apache http connector - max 20 and per route 2
+
+        int maxPerRoute = Integer.parseInt(System.getProperty(ZTS_CLIENT_PROP_POOL_MAX_PER_ROUTE, "2"));
+        int maxTotal = Integer.parseInt(System.getProperty(ZTS_CLIENT_PROP_POOL_MAX_TOTAL, "20"));
+
+        poolingHttpClientConnectionManager.setDefaultMaxPerRoute(maxPerRoute);
+        poolingHttpClientConnectionManager.setMaxTotal(maxTotal);
+        return poolingHttpClientConnectionManager;
+    }
+
     void setPrefetchInterval(long interval) {
         prefetchInterval = interval;
     }
@@ -842,7 +934,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -858,7 +950,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -893,7 +985,7 @@ public class ZTSClient implements Closeable {
      * @return ZTS generated Role Token. ZTSClientException will be thrown in case of failure
      */
     public RoleToken getRoleToken(String domainName, String roleNames) {
-        if (roleNames == null || roleNames.isEmpty()) {
+        if (isEmpty(roleNames)) {
             throw new IllegalArgumentException("RoleNames cannot be null or empty");
         }
         return getRoleToken(domainName, roleNames, null, null, false, null);
@@ -1011,7 +1103,7 @@ public class ZTSClient implements Closeable {
                 }
             }
 
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
         
         // need to add the token to our cache. If our principal was
@@ -1039,7 +1131,26 @@ public class ZTSClient implements Closeable {
      * @return ZTS generated Access Token Response object. ZTSClientException will be thrown in case of failure
      */
     public AccessTokenResponse getAccessToken(String domainName, List<String> roleNames, long expiryTime) {
-        return getAccessToken(domainName, roleNames, null, null, expiryTime, false);
+        return getAccessToken(domainName, roleNames, null, null, null, null, expiryTime, false);
+    }
+
+    /**
+     * For the specified requester(user/service) return the corresponding Access Token that
+     * includes the given role with specified authorization details included as claims.
+     * The principal must have access to the role in the specified domain, and the domain
+     * administrator must have configured the request authorization details type and fields
+     * for the requested role.
+     * @param domainName name of the domain
+     * @param roleName name of the role
+     * @param authorizationDetails additional authorization details to be added as a claim in the access token
+     * @param expiryTime (optional) specifies that the returned Access must be
+     *          at least valid for specified number of seconds. Pass 0 to use
+     *          server default timeout.
+     * @return ZTS generated Access Token Response object. ZTSClientException will be thrown in case of failure
+     */
+    public AccessTokenResponse getAccessToken(String domainName, String roleName, String authorizationDetails, long expiryTime) {
+        return getAccessToken(domainName, Collections.singletonList(roleName), null, null,
+                authorizationDetails, null, expiryTime, false);
     }
 
     /**
@@ -1058,7 +1169,7 @@ public class ZTSClient implements Closeable {
      */
     public AccessTokenResponse getAccessToken(String domainName, List<String> roleNames,
             String idTokenServiceName, long expiryTime, boolean ignoreCache) {
-        return getAccessToken(domainName, roleNames, idTokenServiceName, null, expiryTime, ignoreCache);
+        return getAccessToken(domainName, roleNames, idTokenServiceName, null, null, null, expiryTime, ignoreCache);
     }
 
     /**
@@ -1070,6 +1181,7 @@ public class ZTSClient implements Closeable {
      *          is the specified service (only service name e.g. api) in the
      *          domainName domain.
      * @param proxyForPrincipal (optional) this request is proxy for this principal
+     * @param authorizationDetails (optional) rich authorization request details
      * @param expiryTime (optional) specifies that the returned Access must be
      *          at least valid for specified number of seconds. Pass 0 to use
      *          server default timeout.
@@ -1077,16 +1189,42 @@ public class ZTSClient implements Closeable {
      * @return ZTS generated Access Token Response object. ZTSClientException will be thrown in case of failure
      */
     public AccessTokenResponse getAccessToken(String domainName, List<String> roleNames, String idTokenServiceName,
-            String proxyForPrincipal, long expiryTime, boolean ignoreCache) {
+            String proxyForPrincipal, String authorizationDetails, long expiryTime, boolean ignoreCache) {
+        return getAccessToken(domainName, roleNames, idTokenServiceName, proxyForPrincipal, authorizationDetails,
+                null, expiryTime, ignoreCache);
+    }
 
-        AccessTokenResponse accessTokenResponse;
+    /**
+     * For the specified requester(user/service) return the corresponding Access Token that
+     * includes the list of roles that the principal has access to in the specified domain
+     * @param domainName name of the domain
+     * @param roleNames (optional) only interested in roles with these names, comma separated list of roles
+     * @param idTokenServiceName (optional) as part of the response return an id token whose audience
+     *          is the specified service (only service name e.g. api) in the
+     *          domainName domain.
+     * @param proxyForPrincipal (optional) this request is proxy for this principal
+     * @param authorizationDetails (optional) rich authorization request details
+     * @param proxyPrincipalSpiffeUris (optional) comma separated list of spiffe uris of proxy
+     *          principals that this token will be routed through
+     * @param expiryTime (optional) specifies that the returned Access must be
+     *          at least valid for specified number of seconds. Pass 0 to use
+     *          server default timeout.
+     * @param ignoreCache ignore the cache and retrieve the token from ZTS Server
+     * @return ZTS generated Access Token Response object. ZTSClientException will be thrown in case of failure
+     */
+    public AccessTokenResponse getAccessToken(String domainName, List<String> roleNames, String idTokenServiceName,
+            String proxyForPrincipal, String authorizationDetails, String proxyPrincipalSpiffeUris, long expiryTime,
+            boolean ignoreCache) {
+
+        AccessTokenResponse accessTokenResponse = null;
 
         // first lookup in our cache to see if it can be satisfied
         // only if we're not asked to ignore the cache
 
         String cacheKey = null;
         if (!cacheDisabled) {
-            cacheKey = getAccessTokenCacheKey(domainName, roleNames, idTokenServiceName, proxyForPrincipal);
+            cacheKey = getAccessTokenCacheKey(domainName, roleNames, idTokenServiceName,
+                    proxyForPrincipal, authorizationDetails, proxyPrincipalSpiffeUris);
             if (cacheKey != null && !ignoreCache) {
                 accessTokenResponse = lookupAccessTokenResponseInCache(cacheKey, expiryTime);
                 if (accessTokenResponse != null) {
@@ -1095,7 +1233,7 @@ public class ZTSClient implements Closeable {
                 // start prefetch for this token if prefetch is enabled
                 if (enablePrefetch && prefetchAutoEnable) {
                     if (prefetchAccessToken(domainName, roleNames, idTokenServiceName,
-                            proxyForPrincipal, expiryTime)) {
+                            proxyForPrincipal, authorizationDetails, proxyPrincipalSpiffeUris, expiryTime)) {
                         accessTokenResponse = lookupAccessTokenResponseInCache(cacheKey, expiryTime);
                     }
                     if (accessTokenResponse != null) {
@@ -1106,48 +1244,61 @@ public class ZTSClient implements Closeable {
             }
         }
 
+        // if no hit then we need to look up in disk
+        try {
+            accessTokenResponse = ztsAccessTokenFileLoader.lookupAccessTokenFromDisk(domainName, roleNames);
+        } catch (IOException ex) {
+            LOG.error("GetAccessToken: failed to load access token from disk {}", ex.getMessage());
+        }
+
         // if no hit then we need to request a new token from ZTS
 
-        updateServicePrincipal();
-        try {
-            final String requestBody = generateAccessTokenRequestBody(domainName, roleNames,
-                    idTokenServiceName, proxyForPrincipal, expiryTime);
-            accessTokenResponse = ztsClient.postAccessTokenRequest(requestBody);
-        } catch (ResourceException ex) {
-            if (cacheKey != null && !ignoreCache) {
-                accessTokenResponse = lookupAccessTokenResponseInCache(cacheKey, -1);
-                if (accessTokenResponse != null) {
-                    return accessTokenResponse;
+        if (accessTokenResponse == null) {
+            updateServicePrincipal();
+            try {
+                final String requestBody = generateAccessTokenRequestBody(domainName, roleNames,
+                        idTokenServiceName, proxyForPrincipal, authorizationDetails,
+                        proxyPrincipalSpiffeUris, expiryTime);
+                accessTokenResponse = ztsClient.postAccessTokenRequest(requestBody);
+            } catch (ResourceException ex) {
+                if (cacheKey != null && !ignoreCache) {
+                    accessTokenResponse = lookupAccessTokenResponseInCache(cacheKey, -1);
+                    if (accessTokenResponse != null) {
+                        return accessTokenResponse;
+                    }
                 }
-            }
-            throw new ZTSClientException(ex.getCode(), ex.getData());
-        } catch (Exception ex) {
-            if (cacheKey != null && !ignoreCache) {
-                accessTokenResponse = lookupAccessTokenResponseInCache(cacheKey, -1);
-                if (accessTokenResponse != null) {
-                    return accessTokenResponse;
+                throw new ZTSClientException(ex.getCode(), ex.getData());
+            } catch (Exception ex) {
+                if (cacheKey != null && !ignoreCache) {
+                    accessTokenResponse = lookupAccessTokenResponseInCache(cacheKey, -1);
+                    if (accessTokenResponse != null) {
+                        return accessTokenResponse;
+                    }
                 }
+                throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
             }
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
         }
+
 
         // need to add the token to our cache. If our principal was
         // updated then we need to retrieve a new cache key
 
         if (!cacheDisabled) {
             if (cacheKey == null) {
-                cacheKey = getAccessTokenCacheKey(domainName, roleNames, idTokenServiceName, proxyForPrincipal);
+                cacheKey = getAccessTokenCacheKey(domainName, roleNames, idTokenServiceName,
+                        proxyForPrincipal, authorizationDetails, proxyPrincipalSpiffeUris);
             }
             if (cacheKey != null) {
                 ACCESS_TOKEN_CACHE.put(cacheKey, new AccessTokenResponseCacheEntry(accessTokenResponse));
             }
         }
+
         return accessTokenResponse;
     }
 
-    String generateAccessTokenRequestBody(String domainName, List<String> roleNames,
-            String idTokenServiceName, String proxyForPrincipal, long expiryTime)
-            throws UnsupportedEncodingException {
+    String generateAccessTokenRequestBody(String domainName, List<String> roleNames, String idTokenServiceName,
+            String proxyForPrincipal, String authorizationDetails, String proxyPrincipalSpiffeUris,
+            long expiryTime) throws UnsupportedEncodingException {
 
         StringBuilder body = new StringBuilder(256);
         body.append("grant_type=client_credentials");
@@ -1156,24 +1307,32 @@ public class ZTSClient implements Closeable {
         }
 
         StringBuilder scope = new StringBuilder(256);
-        if (roleNames == null || roleNames.isEmpty()) {
+        if (isEmpty(roleNames)) {
             scope.append(domainName).append(":domain");
         } else {
             for (String role : roleNames) {
                 if (scope.length() != 0) {
                     scope.append(' ');
                 }
-                scope.append(domainName).append(":role.").append(role);
+                scope.append(domainName).append(AuthorityConsts.ROLE_SEP).append(role);
             }
         }
-        if (idTokenServiceName != null && !idTokenServiceName.isEmpty()) {
+        if (!isEmpty(idTokenServiceName)) {
             scope.append(" openid ").append(domainName).append(":service.").append(idTokenServiceName);
         }
         final String scopeStr = scope.toString();
         body.append("&scope=").append(URLEncoder.encode(scopeStr, "UTF-8"));
 
-        if (proxyForPrincipal != null && !proxyForPrincipal.isEmpty()) {
+        if (!isEmpty(proxyForPrincipal)) {
             body.append("&proxy_for_principal=").append(URLEncoder.encode(proxyForPrincipal, "UTF-8"));
+        }
+
+        if (!isEmpty(authorizationDetails)) {
+            body.append("&authorization_details=").append(URLEncoder.encode(authorizationDetails, "UTF-8"));
+        }
+
+        if (!isEmpty(proxyPrincipalSpiffeUris)) {
+            body.append("&proxy_principal_spiffe_uris=").append(URLEncoder.encode(proxyPrincipalSpiffeUris, "UTF-8"));
         }
 
         return body.toString();
@@ -1186,6 +1345,7 @@ public class ZTSClient implements Closeable {
      * @param req Role Certificate Request (csr)
      * @return RoleToken that includes client x509 role certificate
      */
+    @Deprecated
     public RoleToken postRoleCertificateRequest(String domainName, String roleName,
             RoleCertificateRequest req) {
         
@@ -1195,10 +1355,27 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getMessage());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
-    
+
+    /**
+     * For the specified requester(user/service) return the corresponding Role Certificate
+     * @param req Role Certificate Request (csr)
+     * @return RoleCertificate that includes client x509 role certificate
+     */
+    public RoleCertificate postRoleCertificateRequest(RoleCertificateRequest req) {
+
+        updateServicePrincipal();
+        try {
+            return ztsClient.postRoleCertificateRequestExt(req);
+        } catch (ResourceException ex) {
+            throw new ZTSClientException(ex.getCode(), ex.getMessage());
+        } catch (Exception ex) {
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
     /**
      * Generate a Role Certificate request that could be sent to ZTS
      * to obtain a X509 Certificate for the requested role.
@@ -1212,7 +1389,7 @@ public class ZTSClient implements Closeable {
      * @param expiryTime number of seconds to request certificate to be valid for
      * @return RoleCertificateRequest object
      */
-    static public RoleCertificateRequest generateRoleCertificateRequest(final String principalDomain,
+    public static RoleCertificateRequest generateRoleCertificateRequest(final String principalDomain,
             final String principalService, final String roleDomainName, final String roleName,
             PrivateKey privateKey, final String csrDn, final String csrDomain, int expiryTime) {
         
@@ -1234,7 +1411,7 @@ public class ZTSClient implements Closeable {
         final String domain = principalDomain.toLowerCase();
         final String service = principalService.toLowerCase();
         
-        String dn = "cn=" + roleDomainName.toLowerCase() + ":role." + roleName.toLowerCase();
+        String dn = "cn=" + roleDomainName.toLowerCase() + AuthorityConsts.ROLE_SEP + roleName.toLowerCase();
         if (csrDn != null) {
             dn = dn.concat(",").concat(csrDn);
         }
@@ -1253,10 +1430,10 @@ public class ZTSClient implements Closeable {
         try {
             csr = Crypto.generateX509CSR(privateKey, dn, sanArray);
         } catch (OperatorCreationException | IOException ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
 
-        return new RoleCertificateRequest().setCsr(csr).setExpiryTime((long) expiryTime);
+        return new RoleCertificateRequest().setCsr(csr).setExpiryTime(expiryTime);
     }
     
     /**
@@ -1271,7 +1448,7 @@ public class ZTSClient implements Closeable {
      * @param expiryTime number of seconds to request certificate to be valid for
      * @return RoleCertificateRequest object
      */
-    static public RoleCertificateRequest generateRoleCertificateRequest(final String principalDomain,
+    public static RoleCertificateRequest generateRoleCertificateRequest(final String principalDomain,
             final String principalService, final String roleDomainName, final String roleName,
             final PrivateKey privateKey, final String cloud, int expiryTime) {
         
@@ -1302,7 +1479,7 @@ public class ZTSClient implements Closeable {
      * @param expiryTime number of seconds to request certificate to be valid for
      * @return InstanceRefreshRequest object
      */
-    static public InstanceRefreshRequest generateInstanceRefreshRequest(final String principalDomain,
+    public static InstanceRefreshRequest generateInstanceRefreshRequest(final String principalDomain,
             final String principalService, PrivateKey privateKey, final String csrDn,
             final String csrDomain, int expiryTime) {
         
@@ -1328,16 +1505,19 @@ public class ZTSClient implements Closeable {
         
         // now let's generate our dsnName field based on our principal's details
 
+        GeneralName[] sanArray = new GeneralName[2];
+
         final String hostName = service + '.' + domain.replace('.', '-') + '.' + csrDomain;
-        
-        GeneralName[] sanArray = new GeneralName[1];
         sanArray[0] = new GeneralName(GeneralName.dNSName, new DERIA5String(hostName));
-        
+
+        final String spiffeUri = "spiffe://" + domain + "/sa/" + service;
+        sanArray[1] = new GeneralName(GeneralName.uniformResourceIdentifier, new DERIA5String(spiffeUri));
+
         String csr;
         try {
             csr = Crypto.generateX509CSR(privateKey, dn, sanArray);
         } catch (OperatorCreationException | IOException ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
 
         return new InstanceRefreshRequest().setCsr(csr).setExpiryTime(expiryTime);
@@ -1353,7 +1533,7 @@ public class ZTSClient implements Closeable {
      * @param expiryTime number of seconds to request certificate to be valid for
      * @return InstanceRefreshRequest object
      */
-    static public InstanceRefreshRequest generateInstanceRefreshRequest(String principalDomain,
+    public static InstanceRefreshRequest generateInstanceRefreshRequest(String principalDomain,
             String principalService, PrivateKey privateKey, String cloud, int expiryTime) {
         
         if (cloud == null) {
@@ -1419,7 +1599,7 @@ public class ZTSClient implements Closeable {
 
         @Override
         public void run() {
-            
+
             long currentTime = System.currentTimeMillis() / 1000;
             FETCHER_LAST_RUN_AT.set(currentTime);
             
@@ -1443,7 +1623,7 @@ public class ZTSClient implements Closeable {
             boolean svcTokenRefresh = false;
             for (PrefetchTokenScheduledItem item : PREFETCH_SCHEDULED_ITEMS) {
 
-                // see if item expires within next two minutes
+                // see if item requires refresh
 
                 if (LOG.isDebugEnabled()) {
                     final String itemName = item.sslContext == null ?
@@ -1522,17 +1702,17 @@ public class ZTSClient implements Closeable {
 
                     // update the expiry time
 
-                    item.expiresAtUTC(token.getExpiryTime());
+                    item.setExpiresAtUTC(token.getExpiryTime());
                     break;
 
                 case ACCESS:
 
                     AccessTokenResponse response = itemZtsClient.getAccessToken(item.domainName, item.roleNames,
-                            item.idTokenServiceName, item.proxyForPrincipal, item.maxDuration, true);
+                            item.idTokenServiceName, item.proxyForPrincipal, item.authorizationDetails, item.maxDuration, true);
 
                     // update the expiry time
 
-                    item.expiresAtUTC(System.currentTimeMillis() / 1000 + response.getExpires_in());
+                    item.setExpiresAtUTC(System.currentTimeMillis() / 1000 + response.getExpires_in());
                     break;
 
                 case AWS:
@@ -1542,7 +1722,7 @@ public class ZTSClient implements Closeable {
 
                     // update the expiry time
 
-                    item.expiresAtUTC(awsCred.getExpiration().millis() / 1000);
+                    item.setExpiresAtUTC(awsCred.getExpiration().millis() / 1000);
                     break;
 
                 case SVC_ROLE:
@@ -1552,7 +1732,7 @@ public class ZTSClient implements Closeable {
                     // remove it from the fetch list
 
                     if (svcLoaderCache != null && !svcLoaderCache.contains(item.cacheKey)) {
-                        item.isInvalid(true);
+                        item.setIsInvalid(true);
                         PREFETCH_SCHEDULED_ITEMS.remove(item);
                     }
                     break;
@@ -1560,8 +1740,8 @@ public class ZTSClient implements Closeable {
 
             // update the fetch/fail times
 
-            item.fetchTime(currentTime);
-            item.lastFailTime(0);
+            item.setFetchTime(currentTime);
+            item.setLastFailTime(0);
 
         } catch (ZTSClientException ex) {
 
@@ -1573,16 +1753,17 @@ public class ZTSClient implements Closeable {
             // keep the item in the queue and retry later
 
             int code = ex.getCode();
-            if (code == ZTSClientException.UNAUTHORIZED || code == ZTSClientException.FORBIDDEN) {
+            if (code == ResourceException.UNAUTHORIZED || code == ResourceException.FORBIDDEN) {
 
                 // we need to mark it as invalid and then remove it from
                 // our list so that we don't match other active requests
                 // that might have been already added to the queue
 
-                item.isInvalid(true);
+                item.setIsInvalid(true);
+                item.setLastFailTime(currentTime);
                 PREFETCH_SCHEDULED_ITEMS.remove(item);
             } else {
-                item.lastFailTime(currentTime);
+                item.setLastFailTime(currentTime);
             }
 
         } catch (Exception ex) {
@@ -1592,9 +1773,22 @@ public class ZTSClient implements Closeable {
             // our list so that we don't match other active requests
             // that might have been already added to the queue
 
-            item.isInvalid(true);
+            item.setLastFailTime(currentTime);
+            item.setIsInvalid(true);
             PREFETCH_SCHEDULED_ITEMS.remove(item);
             LOG.error("PrefetchTask: Error while trying to prefetch token", ex);
+        }
+
+        if (item.shouldSendNotification()) {
+            ZTSClientNotification ztsClientNotification = new ZTSClientNotification(
+                    itemZtsClient.getZTSUrl(),
+                    item.roleName,
+                    item.tokenType.toString(),
+                    item.expiresAtUTC,
+                    item.isInvalid,
+                    item.domainName);
+            item.lastNotificationTime = currentTime;
+            item.notificationSender.sendNotification(ztsClientNotification);
         }
 
         // don't forget to restore the original client if case
@@ -1647,7 +1841,7 @@ public class ZTSClient implements Closeable {
             Integer minExpiryTime, Integer maxExpiryTime, String proxyForPrincipal) {
         
         if (domainName == null || domainName.trim().isEmpty()) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, "Domain Name cannot be empty");
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, "Domain Name cannot be empty");
         }
         
         RoleToken token = getRoleToken(domainName, roleName, minExpiryTime, maxExpiryTime,
@@ -1660,16 +1854,16 @@ public class ZTSClient implements Closeable {
         long expiryTimeUTC = token.getExpiryTime();
         
         return prefetchToken(domainName, roleName, null, minExpiryTime, maxExpiryTime,
-                proxyForPrincipal, null, null, expiryTimeUTC, TokenType.ROLE);
+                proxyForPrincipal, null, null, null, expiryTimeUTC, TokenType.ROLE);
     }
     
     boolean prefetchAwsCreds(String domainName, String roleName, String externalId,
             Integer minExpiryTime, Integer maxExpiryTime) {
         
         if (domainName == null || domainName.trim().isEmpty()) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, "Domain Name cannot be empty");
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, "Domain Name cannot be empty");
         }
-        
+
         AWSTemporaryCredentials awsCred = getAWSTemporaryCredentials(domainName, roleName,
                 externalId, minExpiryTime, maxExpiryTime, true);
         if (awsCred == null) {
@@ -1678,20 +1872,21 @@ public class ZTSClient implements Closeable {
             return false;
         }
         long expiryTimeUTC = awsCred.getExpiration().millis() / 1000;
-        
+
         return prefetchToken(domainName, roleName, null, minExpiryTime, maxExpiryTime, null,
-                externalId, null, expiryTimeUTC, TokenType.AWS);
+                externalId, null, null, expiryTimeUTC, TokenType.AWS);
     }
 
     public boolean prefetchAccessToken(String domainName, List<String> roleNames,
-            String idTokenServiceName, String proxyForPrincipal, long expiryTime) {
+            String idTokenServiceName, String proxyForPrincipal, String authorizationDetails,
+            String proxyPrincipalSpiffeUris, long expiryTime) {
 
         if (domainName == null || domainName.trim().isEmpty()) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, "Domain Name cannot be empty");
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, "Domain Name cannot be empty");
         }
 
         AccessTokenResponse tokenResponse = getAccessToken(domainName, roleNames, idTokenServiceName,
-                proxyForPrincipal, expiryTime, true);
+                proxyForPrincipal, authorizationDetails, proxyPrincipalSpiffeUris, expiryTime, true);
         if (tokenResponse == null) {
             LOG.error("PrefetchToken: No access token fetchable using domain={}", domainName);
             return false;
@@ -1699,18 +1894,20 @@ public class ZTSClient implements Closeable {
         long expiryTimeUTC = System.currentTimeMillis() / 1000 + tokenResponse.getExpires_in();
 
         return prefetchToken(domainName, null, roleNames, null, (int) expiryTime,
-                proxyForPrincipal, idTokenServiceName, null, expiryTimeUTC, TokenType.ACCESS);
+                proxyForPrincipal, null, idTokenServiceName, authorizationDetails,
+                expiryTimeUTC, TokenType.ACCESS);
     }
 
     boolean prefetchToken(String domainName, String roleName, List<String> roleNames,
             Integer minExpiryTime, Integer maxExpiryTime, String proxyForPrincipal,
-            String externalId, String idTokenServiceName, long expiryTimeUTC, TokenType tokenType) {
+            String externalId, String idTokenServiceName, String authorizationDetails,
+            long expiryTimeUTC, TokenType tokenType) {
         
         // if we're given a ssl context then we don't have domain/service
         // settings configured otherwise those are required
         
         if (sslContext == null) {
-            if (domain == null || domain.isEmpty() || service == null || service.isEmpty()) {
+            if (isEmpty(domain) || isEmpty(service)) {
                 if (LOG.isWarnEnabled()) {
                     LOG.warn("PrefetchToken: setup failure. Both domain({}) and service({}) are required",
                             domain, service);
@@ -1718,32 +1915,34 @@ public class ZTSClient implements Closeable {
                 return false;
             }
         }
-        
+
         PrefetchTokenScheduledItem item = new PrefetchTokenScheduledItem()
-            .tokenType(tokenType)
-            .fetchTime(System.currentTimeMillis() / 1000)
-            .domainName(domainName)
-            .roleName(roleName)
-            .roleNames(roleNames)
-            .proxyForPrincipal(proxyForPrincipal)
-            .externalId(externalId)
-            .minDuration(minExpiryTime)
-            .maxDuration(maxExpiryTime)
-            .expiresAtUTC(expiryTimeUTC)
-            .idTokenServiceName(idTokenServiceName)
-            .identityDomain(domain)
-            .identityName(service)
-            .tokenMinExpiryTime(ZTSClient.tokenMinExpiryTime)
-            .providedZTSUrl(this.ztsUrl)
-            .siaIdentityProvider(siaProvider)
-            .sslContext(sslContext)
-            .proxyUrl(proxyUrl);
+                .setTokenType(tokenType)
+                .setFetchTime(System.currentTimeMillis() / 1000)
+                .setDomainName(domainName)
+                .setRoleName(roleName)
+                .setRoleNames(roleNames)
+                .setProxyForPrincipal(proxyForPrincipal)
+                .setExternalId(externalId)
+                .setMinDuration(minExpiryTime)
+                .setMaxDuration(maxExpiryTime)
+                .setExpiresAtUTC(expiryTimeUTC)
+                .setIdTokenServiceName(idTokenServiceName)
+                .setAuthorizationDetails(authorizationDetails)
+                .setIdentityDomain(domain)
+                .setIdentityName(service)
+                .setTokenMinExpiryTime(ZTSClient.tokenMinExpiryTime)
+                .setProvidedZTSUrl(this.ztsUrl)
+                .setSiaIdentityProvider(siaProvider)
+                .setSslContext(sslContext)
+                .setProxyUrl(proxyUrl)
+                .setNotificationSender(notificationSender);
         
         // include our zts client only if it was overridden by
         // the caller (most likely for unit test mock)
         
         if (ztsClientOverride) {
-             item.ztsClient(this.ztsClient);
+             item.setZtsClient(this.ztsClient);
         }
 
         // we need to make sure we don't have duplicates in
@@ -1761,7 +1960,7 @@ public class ZTSClient implements Closeable {
     }
 
     String getAccessTokenCacheKey(String domainName, List<String> roleNames, String idTokenServiceName,
-            String proxyForPrincipal) {
+            String proxyForPrincipal, String authorizationDetails, String proxyPrincipalSpiffeUris) {
 
         // if we don't have a tenant domain specified but we have a ssl context
         // then we're going to use the hash code for our sslcontext as the
@@ -1772,11 +1971,12 @@ public class ZTSClient implements Closeable {
             tenantDomain = sslContext.toString();
         }
         return getAccessTokenCacheKey(tenantDomain, service, domainName, roleNames,
-                idTokenServiceName, proxyForPrincipal);
+                idTokenServiceName, proxyForPrincipal, authorizationDetails, proxyPrincipalSpiffeUris);
     }
 
-    String getAccessTokenCacheKey(String tenantDomain, String tenantService, String domainName,
-            List<String> roleNames, String idTokenServiceName, String proxyForPrincipal) {
+    static String getAccessTokenCacheKey(String tenantDomain, String tenantService, String domainName,
+            List<String> roleNames, String idTokenServiceName, String proxyForPrincipal,
+            String authorizationDetails, String proxyPrincipalSpiffeUris) {
 
         // before we generate a cache key we need to have a valid domain
 
@@ -1794,19 +1994,29 @@ public class ZTSClient implements Closeable {
         cacheKey.append(";d=");
         cacheKey.append(domainName);
 
-        if (roleNames != null && !roleNames.isEmpty()) {
+        if (!isEmpty(roleNames)) {
             cacheKey.append(";r=");
             cacheKey.append(ZTSClient.multipleRoleKey(roleNames));
         }
 
-        if (idTokenServiceName != null && !idTokenServiceName.isEmpty()) {
+        if (!isEmpty(idTokenServiceName)) {
             cacheKey.append(";o=");
             cacheKey.append(idTokenServiceName);
         }
 
-        if (proxyForPrincipal != null && !proxyForPrincipal.isEmpty()) {
+        if (!isEmpty(proxyForPrincipal)) {
             cacheKey.append(";u=");
             cacheKey.append(proxyForPrincipal);
+        }
+
+        if (!isEmpty(authorizationDetails)) {
+            cacheKey.append(";z=");
+            cacheKey.append(Base64.getUrlEncoder().withoutPadding().encodeToString(Crypto.sha256(authorizationDetails)));
+        }
+
+        if (!isEmpty(proxyPrincipalSpiffeUris)) {
+            cacheKey.append(";s=");
+            cacheKey.append(proxyPrincipalSpiffeUris);
         }
 
         return cacheKey.toString();
@@ -1876,7 +2086,10 @@ public class ZTSClient implements Closeable {
             return true;
         }
 
-        if (maxExpiryTime != null && expiryTime > maxExpiryTime) {
+        // it's possible the time on the client side is not in sync
+        // so we'll allow up to 5 minute offset
+
+        if (maxExpiryTime != null && expiryTime > maxExpiryTime + tokenMaxExpiryOffset) {
             return true;
         }
 
@@ -1970,8 +2183,12 @@ public class ZTSClient implements Closeable {
                         + " req-min-expiry: {} req-max-expiry: {} client-min-expiry: {} result: expired",
                         cacheKey, expiryTime, minExpiryTime, maxExpiryTime, tokenMinExpiryTime);
             }
-            
-            AWS_CREDS_CACHE.remove(cacheKey);
+
+            // if the token is completely expired then we'll remove it from the cache
+
+            if (expiryTime < 1) {
+                AWS_CREDS_CACHE.remove(cacheKey);
+            }
             return null;
         }
         
@@ -1986,12 +2203,28 @@ public class ZTSClient implements Closeable {
      */
     public RoleAccess getRoleAccess(String domainName, String principal) {
         updateServicePrincipal();
+
+        // Try to fetch from cache.
+        ZTSClientCache.DomainAndPrincipal cacheKey = null;
+        Cache<ZTSClientCache.DomainAndPrincipal, RoleAccess> cache = ztsClientCache.getRoleAccessCache();
+        if (cache != null) {
+            cacheKey = new ZTSClientCache.DomainAndPrincipal(domainName, principal);
+            RoleAccess cachedValue = cache.get(cacheKey);
+            if (cachedValue != null) {
+                return cachedValue;
+            }
+        }
+
         try {
-            return ztsClient.getRoleAccess(domainName, principal);
+            RoleAccess roleAccess = ztsClient.getRoleAccess(domainName, principal);
+            if (cache != null) {
+                cache.put(cacheKey, roleAccess);
+            }
+            return roleAccess;
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getMessage());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
     
@@ -2008,7 +2241,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2025,7 +2258,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
     
@@ -2041,7 +2274,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2063,7 +2296,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
     
@@ -2083,7 +2316,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2119,7 +2352,7 @@ public class ZTSClient implements Closeable {
         try {
             lambdaIdentity.setPrivateKey(Crypto.generateRSAPrivateKey(2048));
         } catch (CryptoException ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
 
         // we need to generate an csr with an instance register object
@@ -2143,7 +2376,7 @@ public class ZTSClient implements Closeable {
         
         // now let's generate our dsnName field based on our principal's details
 
-        GeneralName[] sanArray = new GeneralName[2];
+        GeneralName[] sanArray = new GeneralName[3];
         final String hostBuilder = info.getService() + '.' + info.getDomain().replace('.', '-') +
                 '.' + x509CsrDomain;
         sanArray[0] = new GeneralName(GeneralName.dNSName, new DERIA5String(hostBuilder));
@@ -2151,14 +2384,17 @@ public class ZTSClient implements Closeable {
         final String instanceHostBuilder = "lambda-" + account + '-' + info.getService() +
                 ".instanceid.athenz." + x509CsrDomain;
         sanArray[1] = new GeneralName(GeneralName.dNSName, new DERIA5String(instanceHostBuilder));
-        
+
+        final String spiffeUri = "spiffe://" + info.getDomain() + "/sa/" + info.getService();
+        sanArray[2] = new GeneralName(GeneralName.uniformResourceIdentifier, new DERIA5String(spiffeUri));
+
         // next generate the csr based on our private key and data
         
         try {
             info.setCsr(Crypto.generateX509CSR(lambdaIdentity.getPrivateKey(),
                     dnBuilder.toString(), sanArray));
         } catch (OperatorCreationException | IOException ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
         
         // finally obtain attestation data for lambda
@@ -2173,7 +2409,7 @@ public class ZTSClient implements Closeable {
         try {
             lambdaIdentity.setX509Certificate(Crypto.loadX509Certificate(identity.getX509Certificate()));
         } catch (CryptoException ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
 
         lambdaIdentity.setCaCertificates(identity.getX509CertificateSigner());
@@ -2350,7 +2586,7 @@ public class ZTSClient implements Closeable {
             }
 
             // start prefetch for this token if prefetch is enabled
-            
+
             if (enablePrefetch && prefetchAutoEnable) {
                 if (prefetchAwsCreds(domainName, roleName, externalId, minExpiryTime, maxExpiryTime)) {
                     awsCred = lookupAwsCredInCache(cacheKey, minExpiryTime, maxExpiryTime);
@@ -2370,14 +2606,37 @@ public class ZTSClient implements Closeable {
             awsCred = ztsClient.getAWSTemporaryCredentials(domainName, roleName,
                     maxExpiryTime, externalId);
         } catch (ResourceException ex) {
+
+            // if we have an entry in our cache then we'll return that
+            // instead of returning failure
+
+            if (cacheKey != null && !ignoreCache) {
+                awsCred = lookupAwsCredInCache(cacheKey, null, null);
+                if (awsCred != null) {
+                    return awsCred;
+                }
+            }
+
             throw new ZTSClientException(ex.getCode(), ex.getData());
+
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+
+            // if we have an entry in our cache then we'll return that
+            // instead of returning failure
+
+            if (cacheKey != null && !ignoreCache) {
+                awsCred = lookupAwsCredInCache(cacheKey, null, null);
+                if (awsCred != null) {
+                    return awsCred;
+                }
+            }
+
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
         
         // need to add the token to our cache. If our principal was
         // updated then we need to retrieve a new cache key
-        
+
         if (awsCred != null) {
             if (cacheKey == null) {
                 cacheKey = getRoleTokenCacheKey(domainName, roleName, null);
@@ -2407,7 +2666,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
     
@@ -2426,7 +2685,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
     
@@ -2447,7 +2706,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getMessage());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
     
@@ -2468,24 +2727,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getMessage());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
-        }
-    }
-    
-    /**
-     * Caller may post set of domain metric attributes for monitoring and logging.
-     * ZTSClientException will be thrown in case of failure
-     * @param domainName name of the domain
-     * @param req list of domain metrics with their values
-     */
-    public void postDomainMetrics(String domainName, DomainMetrics req) {
-        updateServicePrincipal();
-        try {
-            ztsClient.postDomainMetrics(domainName, req);
-        } catch (ResourceException ex) {
-            throw new ZTSClientException(ex.getCode(), ex.getData());
-        } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
     
@@ -2505,7 +2747,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
     
@@ -2528,7 +2770,7 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
     
@@ -2547,7 +2789,92 @@ public class ZTSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZTSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Retrieve list of CA Certificates in PEM format for the given bundle name
+     * @param bundleName name of the CA Certificate bundle name
+     * @return CA Certificate bundle including list of CA certificates on success. ZTSClientException will be thrown in case of failure
+     */
+    public CertificateAuthorityBundle getCertificateAuthorityBundle(String bundleName) {
+        updateServicePrincipal();
+        try {
+            return ztsClient.getCertificateAuthorityBundle(bundleName);
+        } catch (ResourceException ex) {
+            throw new ZTSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Retrieve list of workloads running on the given ip address
+     * @param ipAddress ip address of the workload
+     * @return list of workloads on success. ZTSClientException will be thrown in case of failure
+     */
+    public Workloads getWorkloadsByIP(String ipAddress) {
+        updateServicePrincipal();
+        try {
+            return ztsClient.getWorkloadsByIP(ipAddress);
+        } catch (ResourceException ex) {
+            throw new ZTSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Retrieve list of workloads running with given domain and service
+     * @param domain name of the domain
+     * @param service name of the service
+     * @return list of workloads on success. ZTSClientException will be thrown in case of failure
+     */
+    public Workloads getWorkloadsByService(String domain, String service) {
+        updateServicePrincipal();
+        try {
+            return ztsClient.getWorkloadsByService(domain, service);
+        } catch (ResourceException ex) {
+            throw new ZTSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Retrieve list of transport rules defined for given domain and service
+     * @param domain name of the domain
+     * @param service name of the service
+     * @return list of transport rules on success. ZTSClientException will be thrown in case of failure
+     */
+    public TransportRules getTransportRules(String domain, String service) {
+        updateServicePrincipal();
+        try {
+            return ztsClient.getTransportRules(domain, service);
+        } catch (ResourceException ex) {
+            throw new ZTSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Request an instance register token for the given service instance from the
+     * given provider. Not all providers may support such functionality.
+     * @param provider name of the provider
+     * @param domain name of the domain
+     * @param service name of the service
+     * @param instanceId unique id assigned to the instance by the provider
+     * @return instance register token. ZTSClientException will be thrown in case of failure
+     */
+    public InstanceRegisterToken getInstanceRegisterToken(String provider, String domain, String service, String instanceId) {
+        try {
+            return ztsClient.getInstanceRegisterToken(provider, domain, service, instanceId);
+        } catch (ResourceException ex) {
+            throw new ZTSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2568,133 +2895,151 @@ public class ZTSClient implements Closeable {
     static class PrefetchTokenScheduledItem {
 
         TokenType tokenType = TokenType.ACCESS;
-        PrefetchTokenScheduledItem tokenType(TokenType type) {
+        PrefetchTokenScheduledItem setTokenType(TokenType type) {
             tokenType = type;
             return this;
         }
 
         String providedZTSUrl;
-        PrefetchTokenScheduledItem providedZTSUrl(String u) {
+        PrefetchTokenScheduledItem setProvidedZTSUrl(String u) {
             providedZTSUrl = u;
             return this;
         }
         
         ServiceIdentityProvider siaProvider;
-        PrefetchTokenScheduledItem siaIdentityProvider(ServiceIdentityProvider s) {
+        PrefetchTokenScheduledItem setSiaIdentityProvider(ServiceIdentityProvider s) {
             siaProvider = s;
             return this;
         }
         
         ZTSRDLGeneratedClient ztsClient;
-        PrefetchTokenScheduledItem ztsClient(ZTSRDLGeneratedClient z) {
+        PrefetchTokenScheduledItem setZtsClient(ZTSRDLGeneratedClient z) {
             ztsClient = z;
             return this;
         }
         
         boolean isInvalid = false;
-        PrefetchTokenScheduledItem isInvalid(boolean invalid) {
+        PrefetchTokenScheduledItem setIsInvalid(boolean invalid) {
             isInvalid = invalid;
             return this;
         }
         
         String identityDomain;
-        PrefetchTokenScheduledItem identityDomain(String d) {
+        PrefetchTokenScheduledItem setIdentityDomain(String d) {
             identityDomain = d;
             return this;
         }
         
         String identityName;
-        PrefetchTokenScheduledItem identityName(String d) {
+        PrefetchTokenScheduledItem setIdentityName(String d) {
             identityName = d;
             return this;
         }
         
         String domainName;
-        PrefetchTokenScheduledItem domainName(String d) {
+        PrefetchTokenScheduledItem setDomainName(String d) {
             domainName = d;
             return this;
         }
 
         String cacheKey;
-        PrefetchTokenScheduledItem cacheKey(String key) {
+        PrefetchTokenScheduledItem setCacheKey(String key) {
             cacheKey = key;
             return this;
         }
 
         String roleName;
-        PrefetchTokenScheduledItem roleName(String s) {
+        PrefetchTokenScheduledItem setRoleName(String s) {
             roleName = s;
             return this;
         }
 
         List<String> roleNames;
-        PrefetchTokenScheduledItem roleNames(List<String> stringList) {
+        PrefetchTokenScheduledItem setRoleNames(List<String> stringList) {
             roleNames = stringList;
             return this;
         }
 
         String proxyForPrincipal;
-        PrefetchTokenScheduledItem proxyForPrincipal(String u) {
+        PrefetchTokenScheduledItem setProxyForPrincipal(String u) {
             proxyForPrincipal = u;
             return this;
         }
 
         String externalId;
-        PrefetchTokenScheduledItem externalId(String id) {
+        PrefetchTokenScheduledItem setExternalId(String id) {
             externalId = id;
             return this;
         }
 
+        String authorizationDetails;
+        PrefetchTokenScheduledItem setAuthorizationDetails(String details) {
+            authorizationDetails = details;
+            return this;
+        }
+
         String idTokenServiceName;
-        PrefetchTokenScheduledItem idTokenServiceName(String serviceName) {
+        PrefetchTokenScheduledItem setIdTokenServiceName(String serviceName) {
             idTokenServiceName = serviceName;
             return this;
         }
 
         Integer minDuration;
-        PrefetchTokenScheduledItem minDuration(Integer min) {
+        PrefetchTokenScheduledItem setMinDuration(Integer min) {
             minDuration = min;
             return this;
         }
         
         Integer maxDuration;
-        PrefetchTokenScheduledItem maxDuration(Integer max) {
+        PrefetchTokenScheduledItem setMaxDuration(Integer max) {
             maxDuration = max;
             return this;
         }
         
         long expiresAtUTC = 0;
-        PrefetchTokenScheduledItem expiresAtUTC(long e) {
+        PrefetchTokenScheduledItem setExpiresAtUTC(long e) {
             expiresAtUTC = e;
             return this;
         }
 
         long fetchTime = 0;
-        PrefetchTokenScheduledItem fetchTime(long time) {
+        PrefetchTokenScheduledItem setFetchTime(long time) {
             fetchTime = time;
             return this;
         }
 
+        ZTSClientNotificationSender notificationSender = null;
+        PrefetchTokenScheduledItem setNotificationSender(ZTSClientNotificationSender notificationSender) {
+            this.notificationSender = notificationSender;
+            return this;
+        }
+
         long lastFailTime = 0;
-        PrefetchTokenScheduledItem lastFailTime(long time) {
+        PrefetchTokenScheduledItem setLastFailTime(long time) {
             lastFailTime = time;
             return this;
         }
 
+        long lastNotificationTime = 0;
+        PrefetchTokenScheduledItem setLastNotificationTime(long time) {
+            lastNotificationTime = time;
+            return this;
+        }
+
         int tokenMinExpiryTime;
-        PrefetchTokenScheduledItem tokenMinExpiryTime(int t) {
+        PrefetchTokenScheduledItem setTokenMinExpiryTime(int t) {
             tokenMinExpiryTime = t;
             return this;
         }
 
         SSLContext sslContext;
-        PrefetchTokenScheduledItem sslContext(SSLContext ctx) {
+        PrefetchTokenScheduledItem setSslContext(SSLContext ctx) {
             sslContext = ctx;
             return this;
         }
         
         String proxyUrl;
-        PrefetchTokenScheduledItem proxyUrl(String url) {
+        PrefetchTokenScheduledItem setProxyUrl(String url) {
             proxyUrl = url;
             return this;
         }
@@ -2799,6 +3144,20 @@ public class ZTSClient implements Closeable {
                 return sslContext.equals(other.sslContext);
             }
         }
+
+        public boolean shouldSendNotification() {
+            if (notificationSender == null) {
+                return false;
+            }
+
+            // If we successfully received a token, revert lastNotificationTime to be ready for future failures
+            if (lastFailTime == 0) {
+                lastNotificationTime = 0;
+                return false;
+            }
+
+            return lastNotificationTime == 0;
+        }
     }
     
     public class AWSHostNameVerifier implements HostnameVerifier {
@@ -2896,7 +3255,15 @@ public class ZTSClient implements Closeable {
         svcLoaderCacheKeys.set(cacheKeySet);
         return cacheKeySet;
     }
-    
+
+    static boolean isEmpty(final String value) {
+        return (value == null || value.isEmpty());
+    }
+
+    static boolean isEmpty(final List<String> list) {
+        return (list == null || list.isEmpty());
+    }
+
     /**
      * returns a cache key for the given list of roles.
      * if the list of roles contains multiple entries
@@ -2924,9 +3291,12 @@ public class ZTSClient implements Closeable {
         
         // if we have multiple roles, then we have to
         // sort the values and then generate the key
-        
-        Collections.sort(roles);
-        return String.join(",", roles);
+        // since we might have been given unmodifiable
+        // list we need to make a copy so we can sort it
+
+        List<String> modList = new ArrayList<>(roles);
+        Collections.sort(modList);
+        return String.join(",", modList);
     }
     
     /**
@@ -2995,21 +3365,21 @@ public class ZTSClient implements Closeable {
             Long expiryTimeUTC, String proxyForPrincipal) {
         
         if (domainName == null || domainName.trim().isEmpty()) {
-            throw new ZTSClientException(ZTSClientException.BAD_REQUEST, "Domain Name cannot be empty");
+            throw new ZTSClientException(ResourceException.BAD_REQUEST, "Domain Name cannot be empty");
         }
 
         PrefetchTokenScheduledItem item = new PrefetchTokenScheduledItem()
-            .tokenType(TokenType.SVC_ROLE)
-            .cacheKey(cacheKey)
-            .domainName(domainName)
-            .roleName(roleName)
-            .proxyForPrincipal(proxyForPrincipal)
-            .minDuration(minExpiryTime)
-            .maxDuration(maxExpiryTime)
-            .expiresAtUTC(expiryTimeUTC)
-            .identityDomain(domain)
-            .identityName(service)
-            .tokenMinExpiryTime(ZTSClient.tokenMinExpiryTime);
+            .setTokenType(TokenType.SVC_ROLE)
+            .setCacheKey(cacheKey)
+            .setDomainName(domainName)
+            .setRoleName(roleName)
+            .setProxyForPrincipal(proxyForPrincipal)
+            .setMinDuration(minExpiryTime)
+            .setMaxDuration(maxExpiryTime)
+            .setExpiresAtUTC(expiryTimeUTC)
+            .setIdentityDomain(domain)
+            .setIdentityName(service)
+            .setTokenMinExpiryTime(ZTSClient.tokenMinExpiryTime);
 
         // we need to make sure we don't have duplicates in
         // our prefetch list so since we got a brand new
@@ -3032,7 +3402,7 @@ public class ZTSClient implements Closeable {
 
         synchronized (TIMER_LOCK) {
             if (FETCH_TIMER == null) {
-                FETCH_TIMER = new Timer();
+                FETCH_TIMER = new Timer(true);
                 // check the fetch items every prefetchInterval seconds.
                 FETCH_TIMER.schedule(new TokenPrefetchTask(), 0, prefetchInterval * 1000);
             }

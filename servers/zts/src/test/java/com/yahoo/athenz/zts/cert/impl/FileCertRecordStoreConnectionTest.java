@@ -1,6 +1,22 @@
+/*
+ * Copyright 2020 Verizon Media
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 package com.yahoo.athenz.zts.cert.impl;
 
 import java.io.File;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
 
@@ -9,8 +25,7 @@ import org.mockito.Mockito;
 import org.testng.annotations.Test;
 import static org.testng.Assert.*;
 
-import com.yahoo.athenz.zts.cert.X509CertRecord;
-import com.yahoo.athenz.zts.store.impl.ZMSFileChangeLogStore;
+import com.yahoo.athenz.common.server.cert.X509CertRecord;
 
 public class FileCertRecordStoreConnectionTest {
 
@@ -43,7 +58,7 @@ public class FileCertRecordStoreConnectionTest {
         
         X509CertRecord certRecordCheck = con.getX509CertRecord("ostk", "instance-id", "cn");
         assertNull(certRecordCheck);
-        
+
         // now write the entry
         
         X509CertRecord certRecord = new X509CertRecord();
@@ -219,5 +234,22 @@ public class FileCertRecordStoreConnectionTest {
 
         certRecordCheck = store.getX509CertRecord("ostk", "instance-id", "cn");
         assertNotNull(certRecordCheck);
+    }
+
+    @Test
+    public void testUpdateUnrefreshedCertificatesNotificationTimestamp() {
+        ZTSTestUtils.deleteDirectory(new File("/tmp/zts-cert-tests"));
+
+        FileCertRecordStore store = new FileCertRecordStore(new File("/tmp/zts-cert-tests"));
+        FileCertRecordStoreConnection con = (FileCertRecordStoreConnection) store.getConnection();
+        assertNotNull(con);
+        long timestamp = System.currentTimeMillis();
+        List<X509CertRecord> records = con.updateUnrefreshedCertificatesNotificationTimestamp(
+                "localhost",
+                timestamp,
+                "provider");
+
+        // For File store, unrefreshed certs unimplemented. Assert empty collection
+        assertEquals(records, new ArrayList<>());
     }
 }

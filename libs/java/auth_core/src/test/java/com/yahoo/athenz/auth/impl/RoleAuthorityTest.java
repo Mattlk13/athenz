@@ -30,8 +30,6 @@ import org.testng.annotations.Test;
 
 import com.yahoo.athenz.auth.KeyStore;
 import com.yahoo.athenz.auth.Principal;
-import com.yahoo.athenz.auth.impl.PrincipalAuthority;
-import com.yahoo.athenz.auth.impl.RoleAuthority;
 import com.yahoo.athenz.auth.token.RoleToken;
 import com.yahoo.athenz.auth.util.CryptoException;
 
@@ -54,10 +52,10 @@ public class RoleAuthorityTest {
     @BeforeTest
     private void loadKeys() throws IOException {
 
-        Path path = Paths.get("./src/test/resources/zts_private_k0.key");
+        Path path = Paths.get("./src/test/resources/unit_test_zts_private_k0.key");
         ztsPrivateKeyStringK0 = new String(Files.readAllBytes(path));
         
-        path = Paths.get("./src/test/resources/zts_private_k1.key");
+        path = Paths.get("./src/test/resources/unit_test_zts_private_k1.key");
         ztsPrivateKeyStringK1 = new String(Files.readAllBytes(path));
     }
     
@@ -175,6 +173,13 @@ public class RoleAuthorityTest {
         assertNotNull(principal);
         assertEquals(principal.getCredentials(),
                 rollToken.getSignedToken());
+    }
+
+    @Test
+    public void testGetID() {
+        RoleAuthority authority = new RoleAuthority();
+        authority.initialize();
+        assertEquals("Auth-ROLE", authority.getID());
     }
 
     @Test

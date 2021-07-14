@@ -3,14 +3,17 @@
 //
 
 package com.yahoo.athenz.zms;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import java.util.List;
+import java.util.Map;
 import com.yahoo.rdl.*;
 
 //
 // TopLevelDomain - Top Level Domain object. The required attributes include
 // the name of the domain and list of domain administrators.
 //
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class TopLevelDomain {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
@@ -42,6 +45,33 @@ public class TopLevelDomain {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public Integer tokenExpiryMins;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer serviceCertExpiryMins;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer roleCertExpiryMins;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String signAlgorithm;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer serviceExpiryDays;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer groupExpiryDays;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String userAuthorityFilter;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String azureSubscription;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Map<String, TagValueList> tags;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public String businessService;
     public String name;
     public List<String> adminUsers;
     @RdlOptional
@@ -118,6 +148,69 @@ public class TopLevelDomain {
     public Integer getTokenExpiryMins() {
         return tokenExpiryMins;
     }
+    public TopLevelDomain setServiceCertExpiryMins(Integer serviceCertExpiryMins) {
+        this.serviceCertExpiryMins = serviceCertExpiryMins;
+        return this;
+    }
+    public Integer getServiceCertExpiryMins() {
+        return serviceCertExpiryMins;
+    }
+    public TopLevelDomain setRoleCertExpiryMins(Integer roleCertExpiryMins) {
+        this.roleCertExpiryMins = roleCertExpiryMins;
+        return this;
+    }
+    public Integer getRoleCertExpiryMins() {
+        return roleCertExpiryMins;
+    }
+    public TopLevelDomain setSignAlgorithm(String signAlgorithm) {
+        this.signAlgorithm = signAlgorithm;
+        return this;
+    }
+    public String getSignAlgorithm() {
+        return signAlgorithm;
+    }
+    public TopLevelDomain setServiceExpiryDays(Integer serviceExpiryDays) {
+        this.serviceExpiryDays = serviceExpiryDays;
+        return this;
+    }
+    public Integer getServiceExpiryDays() {
+        return serviceExpiryDays;
+    }
+    public TopLevelDomain setGroupExpiryDays(Integer groupExpiryDays) {
+        this.groupExpiryDays = groupExpiryDays;
+        return this;
+    }
+    public Integer getGroupExpiryDays() {
+        return groupExpiryDays;
+    }
+    public TopLevelDomain setUserAuthorityFilter(String userAuthorityFilter) {
+        this.userAuthorityFilter = userAuthorityFilter;
+        return this;
+    }
+    public String getUserAuthorityFilter() {
+        return userAuthorityFilter;
+    }
+    public TopLevelDomain setAzureSubscription(String azureSubscription) {
+        this.azureSubscription = azureSubscription;
+        return this;
+    }
+    public String getAzureSubscription() {
+        return azureSubscription;
+    }
+    public TopLevelDomain setTags(Map<String, TagValueList> tags) {
+        this.tags = tags;
+        return this;
+    }
+    public Map<String, TagValueList> getTags() {
+        return tags;
+    }
+    public TopLevelDomain setBusinessService(String businessService) {
+        this.businessService = businessService;
+        return this;
+    }
+    public String getBusinessService() {
+        return businessService;
+    }
     public TopLevelDomain setName(String name) {
         this.name = name;
         return this;
@@ -175,6 +268,33 @@ public class TopLevelDomain {
                 return false;
             }
             if (tokenExpiryMins == null ? a.tokenExpiryMins != null : !tokenExpiryMins.equals(a.tokenExpiryMins)) {
+                return false;
+            }
+            if (serviceCertExpiryMins == null ? a.serviceCertExpiryMins != null : !serviceCertExpiryMins.equals(a.serviceCertExpiryMins)) {
+                return false;
+            }
+            if (roleCertExpiryMins == null ? a.roleCertExpiryMins != null : !roleCertExpiryMins.equals(a.roleCertExpiryMins)) {
+                return false;
+            }
+            if (signAlgorithm == null ? a.signAlgorithm != null : !signAlgorithm.equals(a.signAlgorithm)) {
+                return false;
+            }
+            if (serviceExpiryDays == null ? a.serviceExpiryDays != null : !serviceExpiryDays.equals(a.serviceExpiryDays)) {
+                return false;
+            }
+            if (groupExpiryDays == null ? a.groupExpiryDays != null : !groupExpiryDays.equals(a.groupExpiryDays)) {
+                return false;
+            }
+            if (userAuthorityFilter == null ? a.userAuthorityFilter != null : !userAuthorityFilter.equals(a.userAuthorityFilter)) {
+                return false;
+            }
+            if (azureSubscription == null ? a.azureSubscription != null : !azureSubscription.equals(a.azureSubscription)) {
+                return false;
+            }
+            if (tags == null ? a.tags != null : !tags.equals(a.tags)) {
+                return false;
+            }
+            if (businessService == null ? a.businessService != null : !businessService.equals(a.businessService)) {
                 return false;
             }
             if (name == null ? a.name != null : !name.equals(a.name)) {

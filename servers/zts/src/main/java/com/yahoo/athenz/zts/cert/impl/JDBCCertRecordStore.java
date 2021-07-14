@@ -19,15 +19,16 @@ import java.security.cert.X509Certificate;
 import java.sql.SQLException;
 
 import com.yahoo.athenz.auth.Principal;
-import com.yahoo.athenz.zts.cert.X509CertUtils;
+import com.yahoo.athenz.common.server.cert.CertRecordStore;
+import com.yahoo.athenz.common.server.cert.CertRecordStoreConnection;
+import com.yahoo.athenz.common.server.db.RolesProvider;
+import com.yahoo.athenz.common.server.notification.NotificationManager;
+import com.yahoo.athenz.common.utils.X509CertUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import com.yahoo.athenz.common.server.db.PoolableDataSource;
 import com.yahoo.athenz.zts.ResourceException;
-import com.yahoo.athenz.zts.cert.CertRecordStore;
-import com.yahoo.athenz.zts.cert.CertRecordStoreConnection;
-
 
 public class JDBCCertRecordStore implements CertRecordStore {
 
@@ -67,5 +68,11 @@ public class JDBCCertRecordStore implements CertRecordStore {
     public void log(final Principal principal, final String ip, final String provider,
                     final String instanceId, final X509Certificate x509Cert) {
         X509CertUtils.logCert(CERTLOGGER, principal, ip, provider, instanceId, x509Cert);
+    }
+
+    @Override
+    public boolean enableNotifications(NotificationManager notificationManager, RolesProvider rolesProvider, final String serverName) {
+        LOGGER.warn("Notifications not supported");
+        return false;
     }
 }

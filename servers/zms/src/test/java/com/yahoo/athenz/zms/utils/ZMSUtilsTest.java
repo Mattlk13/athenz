@@ -17,20 +17,20 @@ package com.yahoo.athenz.zms.utils;
 
 import static org.testng.Assert.*;
 
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
+import com.yahoo.athenz.auth.Authority;
 import com.yahoo.athenz.auth.Principal;
 import com.yahoo.athenz.auth.impl.SimplePrincipal;
+import com.yahoo.athenz.common.metrics.Metric;
 import com.yahoo.athenz.common.server.log.AuditLogMsgBuilder;
 import com.yahoo.athenz.common.server.log.AuditLogger;
 import com.yahoo.athenz.common.server.log.AuditLoggerFactory;
 import com.yahoo.athenz.common.server.log.impl.DefaultAuditLoggerFactory;
 import com.yahoo.athenz.zms.*;
 import org.mockito.Mockito;
-import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 import javax.servlet.http.HttpServletRequestWrapper;
@@ -45,225 +45,47 @@ public class ZMSUtilsTest {
         assertEquals("domain1:role.role1", ZMSUtils.removeDomainPrefix("domain1:role.role1", "domain1", "policy."));
         assertEquals("policy1", ZMSUtils.removeDomainPrefix("domain1:policy.policy1", "domain1", "policy."));
     }
-    
+
     @Test
     public void testGetTenantResourceGroupRolePrefix() {
-        
+
         assertEquals("storage.tenant.sports.api.",
                 ZMSUtils.getTenantResourceGroupRolePrefix("storage", "sports.api", null));
+        assertEquals("storage.tenant.sports.api.res_group.",
+                ZMSUtils.getTenantResourceGroupRolePrefix("storage", "sports.api", ""));
         assertEquals("storage.tenant.sports.api.res_group.Group1.",
                 ZMSUtils.getTenantResourceGroupRolePrefix("storage", "sports.api", "Group1"));
     }
-    
+
     @Test
     public void testGetTrustedResourceGroupRolePrefix() {
         assertEquals("coretech:role.storage.tenant.sports.api.",
                 ZMSUtils.getTrustedResourceGroupRolePrefix("coretech", "storage", "sports.api", null));
+        assertEquals("coretech:role.storage.tenant.sports.api.",
+                ZMSUtils.getTrustedResourceGroupRolePrefix("coretech", "storage", "sports.api", ""));
         assertEquals("coretech:role.storage.tenant.sports.api.res_group.group1.",
                 ZMSUtils.getTrustedResourceGroupRolePrefix("coretech", "storage", "sports.api", "group1"));
     }
-    
+
     @Test
     public void testGetProviderResourceGroupRolePrefix() {
         assertEquals("sports.hosted.res_group.hockey.",
                 ZMSUtils.getProviderResourceGroupRolePrefix("sports", "hosted", "hockey"));
         assertEquals("sports.hosted.",
                 ZMSUtils.getProviderResourceGroupRolePrefix("sports", "hosted", null));
-    }
-    
-    @Test
-    public void testAssumeRoleResourceMatchActionNoMatch() {
-        Assertion assertion = new Assertion()
-                .setAction("test")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain1:role.role1")
-                .setResource("domain1:*");
-        assertFalse(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-        
-        assertion = new Assertion()
-                .setAction("assume_role1")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain1:role.role1")
-                .setResource("domain1:*");
-        assertFalse(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-        
-        assertion = new Assertion()
-                .setAction("assume_rol")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain1:role.role1")
-                .setResource("domain1:*");
-        assertFalse(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-    }
-    
-    @Test
-    public void testAssumeRoleResourceMatchRoleNoMatch() {
-        Assertion assertion = new Assertion()
-                .setAction("assume_role")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain1:role.role1")
-                .setResource("domain1:role.role2");
-        assertFalse(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-        
-        assertion = new Assertion()
-                .setAction("assume_role")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain1:role.role1")
-                .setResource("domain2:role.role1");
-        assertFalse(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-        
-        assertion = new Assertion()
-                .setAction("assume_role")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain1:role.role1")
-                .setResource("domain1:role.reader*");
-        assertFalse(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-        
-        assertion = new Assertion()
-                .setAction("assume_role")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain1:role.role1")
-                .setResource("*:role.role2");
-        assertFalse(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-    }
-    
-    @Test
-    public void testAssumeRoleResourceMatch() {
-        Assertion assertion = new Assertion()
-                .setAction("assume_role")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain2:role.role1")
-                .setResource("domain1:role.role1");
-        assertTrue(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-        
-        assertion = new Assertion()
-                .setAction("assume_role")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain2:role.role1")
-                .setResource("domain1:role.*");
-        assertTrue(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-        
-        assertion = new Assertion()
-                .setAction("assume_role")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain2:role.role1")
-                .setResource("domain1:*");
-        assertTrue(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-        
-        assertion = new Assertion()
-                .setAction("assume_role")
-                .setEffect(AssertionEffect.ALLOW)
-                .setRole("domain2:role.role1")
-                .setResource("*:role.role1");
-        assertTrue(ZMSUtils.assumeRoleResourceMatch("domain1:role.role1", assertion));
-    }
-    
-    @DataProvider(name = "roles")
-    public static Object[][] getRoles() {
-        String domainName = "test_domain";
-
-        Role role1 = new Role();
-        String memberName = "member";
-        RoleMember roleMember = new RoleMember().setMemberName(memberName);
-        
-        Role role2 = new Role();
-        role2.setMembers(Collections.singletonList(memberName));
-        role2.setRoleMembers(Collections.singletonList(roleMember));
-        
-        Role role3 = new Role();
-        role3.setRoleMembers(Collections.singletonList(roleMember));
-        
-        Role role4 = new Role();
-        role4.setRoleMembers(Collections.singletonList(roleMember));
-        role4.setTrust("trust");
-        
-        Role role5 = new Role();
-        role5.setMembers(Collections.singletonList(memberName));
-        role5.setTrust("trust");
-        
-        Role role6 = new Role();
-        role6.setTrust("trust");
-        
-        return new Object[][] {
-            {domainName, role1, false}, 
-            {domainName, role2, true}, 
-            {domainName, role3, false}, 
-            {domainName, role4, true},
-            {domainName, role5, true}, 
-            {"trust", role6, true}, 
-            {"test_domain", role6, false}, 
-        };
-    }
-
-    @Test(dataProvider = "roles")
-    public void testValidateRoleMembers(String domainName, Role role, boolean expectedFailure) {
-        try {
-            ZMSUtils.validateRoleMembers(role, null, domainName);
-            if (expectedFailure) {
-                fail();
-            }
-        } catch (ResourceException e) {
-            if (expectedFailure) {
-                assertEquals(e.getCode(), 400);
-            } else {
-                fail("should not have failed with ResourceException");
-            }
-        }
-    }
-    
-    @DataProvider(name = "members")
-    public static Object[][] getMembers() {
-        return new Object[][] {
-            {Collections.singletonList("member1"), null, 1},
-            {Collections.singletonList("member1"), Collections.singletonList("member1"), 0},
-            {Collections.singletonList("member1"), Collections.singletonList("member2"), 1},
-            {Collections.singletonList("member1"), Arrays.asList("member2", "member1"), 0},
-            {Arrays.asList("member1", "member2"), Arrays.asList("member2", "member1"), 0},
-            {Arrays.asList("member1", "member2"), Collections.singletonList("member3"), 2}
-        };
-    }
-    
-    @Test(dataProvider = "members")
-    public void testRemoveMembers(List<String> orginalRoleMembersList,
-            List<String> removeRoleMembersList, int expectedSize) {
-        
-        List<RoleMember> orginalRoleMembers = ZMSUtils.convertMembersToRoleMembers(orginalRoleMembersList);
-        List<RoleMember> removeRoleMembers = ZMSUtils.convertMembersToRoleMembers(removeRoleMembersList);
-        
-        ZMSUtils.removeMembers(orginalRoleMembers, removeRoleMembers);
-        
-        //remove case
-        for (RoleMember orgMember: orginalRoleMembers) {
-            for (RoleMember removeMember: removeRoleMembers) {
-                if (orgMember.getMemberName().equalsIgnoreCase(removeMember.getMemberName())) {
-                    fail("Should have removed " + removeMember);
-                }
-            }
-        }
-        
-        assertEquals(orginalRoleMembers.size(), expectedSize);
-    }
-    
-    @Test
-    public void testRemoveMembersInvalidInput() {
-        List<RoleMember> list = Collections.singletonList(new RoleMember().setMemberName("member1"));
-        ZMSUtils.removeMembers(list, null);
-        assertEquals(list.size(), 1);
-        assertEquals(list.get(0).getMemberName(), "member1");
-        
-        ZMSUtils.removeMembers(null, list);
-        assertEquals(list.size(), 1);
-        assertEquals(list.get(0).getMemberName(), "member1");
+        assertEquals("sports.hosted.",
+                ZMSUtils.getProviderResourceGroupRolePrefix("sports", "hosted", ""));
     }
 
     @Test
     public void testParseBoolean() {
-        assertEquals(true, ZMSUtils.parseBoolean(null, true));
-        assertEquals(false, ZMSUtils.parseBoolean(null, false));
-        assertEquals(true, ZMSUtils.parseBoolean("", true));
-        assertEquals(false, ZMSUtils.parseBoolean("", false));
-        assertEquals(true, ZMSUtils.parseBoolean("true", false));
-        assertEquals(false, ZMSUtils.parseBoolean("false", true));
-        assertEquals(false, ZMSUtils.parseBoolean("unknown", false));
+        assertTrue(ZMSUtils.parseBoolean(null, true));
+        assertFalse(ZMSUtils.parseBoolean(null, false));
+        assertTrue(ZMSUtils.parseBoolean("", true));
+        assertFalse(ZMSUtils.parseBoolean("", false));
+        assertTrue(ZMSUtils.parseBoolean("true", false));
+        assertFalse(ZMSUtils.parseBoolean("false", true));
+        assertFalse(ZMSUtils.parseBoolean("unknown", false));
     }
 
     @Test
@@ -311,20 +133,257 @@ public class ZMSUtilsTest {
     }
 
     @Test
-    public void testConvertRoleMembersToMembers() {
-        RoleMember member = new RoleMember().setMemberName("user.joe").setActive(true);
-        RoleMember member1 = new RoleMember().setMemberName("user.moe").setActive(false);
-        RoleMember member2 = new RoleMember().setMemberName("user.jane").setActive(null);
+    public void testExtractRoleName() {
 
-        List<RoleMember> members = new ArrayList<>();
-        members.add(member);
-        members.add(member1);
-        members.add(member2);
+        assertEquals("role1", ZMSUtils.extractRoleName("my-domain1", "my-domain1:role.role1"));
+        assertEquals("role1.role2", ZMSUtils.extractRoleName("my-domain1", "my-domain1:role.role1.role2"));
 
-        List<String> stringMembers = ZMSUtils.convertRoleMembersToMembers(members);
-        assertNotNull(stringMembers);
-        assertEquals(stringMembers.size(), 2);
-        assertTrue(stringMembers.contains("user.joe"));
-        assertTrue(stringMembers.contains("user.jane"));
+        // invalid roles names
+        assertNull(ZMSUtils.extractRoleName("my-domain1", "my-domain1:role1"));
+        assertNull(ZMSUtils.extractRoleName("my-domain1", "my-domain2:role.role1"));
+        assertNull(ZMSUtils.extractRoleName("my-domain1", "my-domain11:role.role1"));
+        assertNull(ZMSUtils.extractRoleName("my-domain1", ":role.role1"));
+        assertNull(ZMSUtils.extractRoleName("my-domain1", "role1"));
+        assertNull(ZMSUtils.extractRoleName("my-domain1", "role1.role2"));
+    }
+
+    @Test
+    public void testExtractEntityName() {
+
+        assertEquals("entity1", ZMSUtils.extractEntityName("my-domain1", "my-domain1:entity.entity1"));
+        assertEquals("entity1.entity2", ZMSUtils.extractEntityName("my-domain1", "my-domain1:entity.entity1.entity2"));
+
+        // invalid entity names
+        assertNull(ZMSUtils.extractEntityName("my-domain1", "my-domain1:entity1"));
+        assertNull(ZMSUtils.extractEntityName("my-domain1", "my-domain2:entity.entity1"));
+        assertNull(ZMSUtils.extractEntityName("my-domain1", "my-domain11:entity.entity1"));
+        assertNull(ZMSUtils.extractEntityName("my-domain1", ":entity.entity1"));
+        assertNull(ZMSUtils.extractEntityName("my-domain1", "entity1"));
+        assertNull(ZMSUtils.extractEntityName("my-domain1", "entity1.entity2"));
+    }
+
+    @Test
+    public void testExtractServiceName() {
+
+        assertEquals("service1", ZMSUtils.extractServiceName("my-domain1", "my-domain1.service1"));
+        assertEquals("service1", ZMSUtils.extractServiceName("my-domain1.domain2", "my-domain1.domain2.service1"));
+
+        // invalid service names
+        assertNull(ZMSUtils.extractServiceName("my-domain1", "my-domain1:service1"));
+        assertNull(ZMSUtils.extractServiceName("my-domain1", "my-domain2.service1"));
+        assertNull(ZMSUtils.extractServiceName("my-domain1", "my-domain11:service.service1"));
+        assertNull(ZMSUtils.extractServiceName("my-domain1", ".service1"));
+        assertNull(ZMSUtils.extractServiceName("my-domain1", "service1"));
+        assertNull(ZMSUtils.extractServiceName("my-domain1", "service1.service2"));
+    }
+
+    @Test
+    public void testExtractPolicyName() {
+
+        assertEquals("policy1", ZMSUtils.extractPolicyName("my-domain1", "my-domain1:policy.policy1"));
+        assertEquals("policy1.policy2", ZMSUtils.extractPolicyName("my-domain1", "my-domain1:policy.policy1.policy2"));
+
+        // invalid policies names
+        assertNull(ZMSUtils.extractPolicyName("my-domain1", "my-domain1:policy1"));
+        assertNull(ZMSUtils.extractPolicyName("my-domain1", "my-domain2:policy.policy1"));
+        assertNull(ZMSUtils.extractPolicyName("my-domain1", "my-domain11:policy.policy1"));
+        assertNull(ZMSUtils.extractPolicyName("my-domain1", ":policy.policy1"));
+        assertNull(ZMSUtils.extractPolicyName("my-domain1", "policy1"));
+        assertNull(ZMSUtils.extractPolicyName("my-domain1", "policy1.policy2"));
+    }
+
+    @Test
+    public void testIsUserAuthorityFilterValid() {
+
+        Authority mockAuthority = Mockito.mock(Authority.class);
+        Mockito.when(mockAuthority.isAttributeSet("user.john", "contractor")).thenReturn(true);
+        Mockito.when(mockAuthority.isAttributeSet("user.john", "employee")).thenReturn(false);
+        Mockito.when(mockAuthority.isAttributeSet("user.john", "local")).thenReturn(true);
+
+        // non-users are always false
+        assertFalse(ZMSUtils.isUserAuthorityFilterValid(mockAuthority, "filterList", "athenz.test"));
+
+        // single filter value
+        assertTrue(ZMSUtils.isUserAuthorityFilterValid(mockAuthority, "contractor", "user.john"));
+        assertFalse(ZMSUtils.isUserAuthorityFilterValid(mockAuthority, "employee", "user.john"));
+
+        // multiple values
+        assertTrue(ZMSUtils.isUserAuthorityFilterValid(mockAuthority, "contractor,local", "user.john"));
+        assertTrue(ZMSUtils.isUserAuthorityFilterValid(mockAuthority, "local,contractor", "user.john"));
+        assertFalse(ZMSUtils.isUserAuthorityFilterValid(mockAuthority, "local,contractor,employee", "user.john"));
+        assertFalse(ZMSUtils.isUserAuthorityFilterValid(mockAuthority, "local,employee,contractor", "user.john"));
+        assertFalse(ZMSUtils.isUserAuthorityFilterValid(mockAuthority, "employee,contractor", "user.john"));
+    }
+
+    @Test
+    public void testCombineUserAuthorityFilters() {
+
+        assertNull(ZMSUtils.combineUserAuthorityFilters(null, null));
+        assertNull(ZMSUtils.combineUserAuthorityFilters(null, ""));
+        assertNull(ZMSUtils.combineUserAuthorityFilters("", null));
+        assertNull(ZMSUtils.combineUserAuthorityFilters("", ""));
+
+        assertEquals("role", ZMSUtils.combineUserAuthorityFilters("role", null));
+        assertEquals("role", ZMSUtils.combineUserAuthorityFilters("role", ""));
+
+        assertEquals("domain", ZMSUtils.combineUserAuthorityFilters(null, "domain"));
+        assertEquals("domain", ZMSUtils.combineUserAuthorityFilters("", "domain"));
+
+        assertEquals("role,domain", ZMSUtils.combineUserAuthorityFilters("role", "domain"));
+        assertEquals("same,same", ZMSUtils.combineUserAuthorityFilters("same", "same"));
+    }
+
+    @Test
+    public void testLowerDomainInResource() {
+        assertEquals(ZMSUtils.lowerDomainInResource("DOMAIN:ResourcE1"), "domain:ResourcE1");
+        assertEquals(ZMSUtils.lowerDomainInResource("domain:ResOurcE1"), "domain:ResOurcE1");
+        assertEquals(ZMSUtils.lowerDomainInResource("domain:resource1"), "domain:resource1");
+        assertEquals(ZMSUtils.lowerDomainInResource("DOMAIN:ResourcE2(ResourcE3)"), "domain:ResourcE2(ResourcE3)");
+        assertEquals(ZMSUtils.lowerDomainInResource("DOMAIN:ResourcE1/ResourcE2"), "domain:ResourcE1/ResourcE2");
+        assertEquals(ZMSUtils.lowerDomainInResource("DOMAIN:resource4[*]/data1"), "domain:resource4[*]/data1");
+        assertEquals(ZMSUtils.lowerDomainInResource("justResource"), "justResource");
+        assertEquals(ZMSUtils.lowerDomainInResource("WrongDelimiter.NoOp"), "WrongDelimiter.NoOp");
+        assertEquals(ZMSUtils.lowerDomainInResource("DOMAIN:Many:Delimiters:THIS:TIME"), "domain:Many:Delimiters:THIS:TIME");
+        assertEquals(ZMSUtils.lowerDomainInResource(""), "");
+        assertNull(ZMSUtils.lowerDomainInResource(null));
+    }
+
+    @Test
+    public void testUserAuthorityAttrPresent() {
+
+        // empty role filter cases
+
+        assertFalse(ZMSUtils.userAuthorityAttrMissing(null, "test1"));
+        assertFalse(ZMSUtils.userAuthorityAttrMissing("", "test1"));
+
+        // if role filter is not empty but group is - then failure
+
+        assertTrue(ZMSUtils.userAuthorityAttrMissing("test1", null));
+        assertTrue(ZMSUtils.userAuthorityAttrMissing("test1", ""));
+
+        // values match
+
+        assertFalse(ZMSUtils.userAuthorityAttrMissing("test1", "test1"));
+        assertFalse(ZMSUtils.userAuthorityAttrMissing("test1,test2", "test1,test2"));
+
+        // array value match
+
+        assertFalse(ZMSUtils.userAuthorityAttrMissing("test2,test3,test1", "test1,test3,test2"));
+
+        // subset values match
+
+        assertFalse(ZMSUtils.userAuthorityAttrMissing("test2,test3", "test1,test3,test2"));
+        assertFalse(ZMSUtils.userAuthorityAttrMissing("test3", "test1,test3,test2"));
+
+        // mismatch values
+
+        assertTrue(ZMSUtils.userAuthorityAttrMissing("test1", "test2"));
+        assertTrue(ZMSUtils.userAuthorityAttrMissing("test2,test3,test1", "test4,test3,test2"));
+    }
+
+    @Test
+    public void testCreatePrincipalForName() {
+
+        String userDomain = "user";
+        String userDomainAlias = null;
+
+        Principal principal = ZMSUtils.createPrincipalForName("joe", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "user.joe");
+
+        principal = ZMSUtils.createPrincipalForName("joe-smith", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "user.joe-smith");
+
+        principal = ZMSUtils.createPrincipalForName("user.joe", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "user.joe");
+
+        principal = ZMSUtils.createPrincipalForName("user.joe.storage", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "user.joe.storage");
+
+        principal = ZMSUtils.createPrincipalForName("alias.joe", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "alias.joe");
+
+        principal = ZMSUtils.createPrincipalForName("alias.joe.storage", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "alias.joe.storage");
+
+        userDomainAlias = "alias";
+
+        principal = ZMSUtils.createPrincipalForName("joe", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "user.joe");
+
+        principal = ZMSUtils.createPrincipalForName("joe-smith", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "user.joe-smith");
+
+        principal = ZMSUtils.createPrincipalForName("user.joe", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "user.joe");
+
+        principal = ZMSUtils.createPrincipalForName("user.joe.storage", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "user.joe.storage");
+
+        principal = ZMSUtils.createPrincipalForName("alias.joe", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "user.joe");
+
+        principal = ZMSUtils.createPrincipalForName("alias.joe.storage", userDomain, userDomainAlias);
+        assertEquals(principal.getFullName(), "alias.joe.storage");
+    }
+
+    @Test
+    public void testEmitMonmetricError() {
+
+        Metric savedMetric = ZMSImpl.metric;
+        assertFalse(ZMSUtils.emitMonmetricError(-1, "unittest"));
+        assertFalse(ZMSUtils.emitMonmetricError(400, null));
+        assertFalse(ZMSUtils.emitMonmetricError(400, ""));
+        ZMSImpl.metric = null;
+        assertFalse(ZMSUtils.emitMonmetricError(400, "unittest"));
+        ZMSImpl.metric = savedMetric;
+    }
+
+    @Test
+    public void testMetaValueChanged() {
+        assertTrue(ZMSUtils.metaValueChanged("account-1", "account-2"));
+        assertFalse(ZMSUtils.metaValueChanged("account-1", "account-1"));
+
+        assertTrue(ZMSUtils.metaValueChanged(null, "account-1"));
+        assertFalse(ZMSUtils.metaValueChanged(null, null));
+        assertFalse(ZMSUtils.metaValueChanged("account-1", null));
+
+        assertTrue(ZMSUtils.metaValueChanged(10, 15));
+        assertFalse(ZMSUtils.metaValueChanged(10, 10));
+
+        assertTrue(ZMSUtils.metaValueChanged(null, 10));
+        assertFalse(ZMSUtils.metaValueChanged(10, null));
+    }
+
+    @Test
+    public void testConfiguredExpiryMillis() {
+
+        assertEquals(ZMSUtils.configuredDueDateMillis(null, null), 0);
+        assertEquals(ZMSUtils.configuredDueDateMillis(null, -3), 0);
+        assertEquals(ZMSUtils.configuredDueDateMillis(null, 0), 0);
+        assertEquals(ZMSUtils.configuredDueDateMillis(-3, null), 0);
+        assertEquals(ZMSUtils.configuredDueDateMillis(0, null), 0);
+        assertEquals(ZMSUtils.configuredDueDateMillis(-3, -3), 0);
+        assertEquals(ZMSUtils.configuredDueDateMillis(0, 0), 0);
+
+        long extMillis = TimeUnit.MILLISECONDS.convert(10, TimeUnit.DAYS);
+        long millis = ZMSUtils.configuredDueDateMillis(null, 10);
+        assertTrue(ZMSTestUtils.validateDueDate(millis, extMillis));
+        millis = ZMSUtils.configuredDueDateMillis(null, 10);
+        assertTrue(ZMSTestUtils.validateDueDate(millis, extMillis));
+        millis = ZMSUtils.configuredDueDateMillis(-1, 10);
+        assertTrue(ZMSTestUtils.validateDueDate(millis, extMillis));
+        millis = ZMSUtils.configuredDueDateMillis(0, 10);
+        assertTrue(ZMSTestUtils.validateDueDate(millis, extMillis));
+        millis = ZMSUtils.configuredDueDateMillis(5, 10);
+        assertTrue(ZMSTestUtils.validateDueDate(millis, extMillis));
+        millis = ZMSUtils.configuredDueDateMillis(20, 10);
+        assertTrue(ZMSTestUtils.validateDueDate(millis, extMillis));
+
+        millis = ZMSUtils.configuredDueDateMillis(10, null);
+        assertTrue(ZMSTestUtils.validateDueDate(millis, extMillis));
+        millis = ZMSUtils.configuredDueDateMillis(10, -1);
+        assertTrue(ZMSTestUtils.validateDueDate(millis, extMillis));
+        millis = ZMSUtils.configuredDueDateMillis(10, 0);
+        assertTrue(ZMSTestUtils.validateDueDate(millis, extMillis));
     }
 }

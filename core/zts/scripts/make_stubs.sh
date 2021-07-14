@@ -5,7 +5,7 @@
 # however, we're not going to run this utility during our automated builds since
 # builds must be done based on files already checked-in into git
 
-if [ ! -z "${TRAVIS_PULL_REQUEST}" ] || [ ! -z "${TRAVIS_TAG}" ]; then
+if [ ! -z "${SCREWDRIVER}" ] || [ ! -z "${TRAVIS_PULL_REQUEST}" ] || [ ! -z "${TRAVIS_TAG}" ]; then
     echo >&2 "------------------------------------------------------------------------";
     echo >&2 "SOURCE NOTICE";
     echo >&2 "------------------------------------------------------------------------";
@@ -33,7 +33,7 @@ command -v rdl >/dev/null 2>&1 || {
 RDL_ZTS_FILE=src/main/rdl/ZTS.rdl
 
 echo "Generating model classes..."
-rdl -s generate -x getsetters=true -o src/main/java java-model $RDL_ZTS_FILE
+rdl -s generate -o src/main/java athenz-java-model $RDL_ZTS_FILE
 
 # Copyright 2016 Yahoo Inc.
 # Licensed under the terms of the Apache version 2.0 license. See LICENSE file for terms.

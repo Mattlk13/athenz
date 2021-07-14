@@ -16,7 +16,12 @@
 package com.yahoo.athenz.instance.provider;
 
 import com.yahoo.athenz.auth.KeyStore;
+import com.yahoo.athenz.common.server.dns.HostnameResolver;
+import com.yahoo.athenz.zts.InstanceRegisterToken;
+import io.jsonwebtoken.SignatureAlgorithm;
+
 import javax.net.ssl.SSLContext;
+import java.security.PrivateKey;
 
 public interface InstanceProvider {
 
@@ -40,19 +45,23 @@ public interface InstanceProvider {
 
     /**
      * Instance specific attribute names. The san entries
-     * are the values exptracted from the X.509 CSR submitted
+     * are the values extracted from the X.509 CSR submitted
      * by the client. Check the Copper Argos developer guide
      * for description of each attribute
      */
-    String ZTS_INSTANCE_SAN_DNS        = "sanDNS";
-    String ZTS_INSTANCE_SAN_IP         = "sanIP";
-    String ZTS_INSTANCE_SAN_URI        = "sanURI";
-    String ZTS_INSTANCE_CLIENT_IP      = "clientIP";
-    String ZTS_INSTANCE_CLOUD_ACCOUNT  = "cloudAccount";
-    String ZTS_INSTANCE_ID             = "instanceId";
-    String ZTS_INSTANCE_CSR_PUBLIC_KEY = "csrPublicKey";
-    String ZTS_INSTANCE_HOSTNAME       = "hostname";
-    String ZTS_REQUEST_PRINCIPAL       = "principal";
+    String ZTS_INSTANCE_SAN_DNS            = "sanDNS";
+    String ZTS_INSTANCE_SAN_IP             = "sanIP";
+    String ZTS_INSTANCE_SAN_URI            = "sanURI";
+    String ZTS_INSTANCE_CLIENT_IP          = "clientIP";
+    String ZTS_INSTANCE_CLOUD_ACCOUNT      = "cloudAccount";
+    String ZTS_INSTANCE_ID                 = "instanceId";
+    String ZTS_INSTANCE_CSR_PUBLIC_KEY     = "csrPublicKey";
+    String ZTS_INSTANCE_HOSTNAME           = "hostname";
+    String ZTS_REQUEST_PRINCIPAL           = "principal";
+    String ZTS_INSTANCE_PRIVATE_IP         = "instancePrivateIp";
+    String ZTS_INSTANCE_AWS_ACCOUNT        = "awsAccount";
+    String ZTS_INSTANCE_AZURE_SUBSCRIPTION = "azureSubscription";
+    String ZTS_INSTANCE_CERT_HOSTNAME      = "certHostname";
 
     enum Scheme {
         HTTP,
@@ -63,6 +72,7 @@ public interface InstanceProvider {
     /**
      * Get Provider scheme. Currently supported schemes are HTTP
      * or CLASS. By default we'll return UNKNOWN.
+     * @return the scheme for the provider
      */
     default Scheme getProviderScheme() {
         return Scheme.UNKNOWN;
@@ -78,7 +88,24 @@ public interface InstanceProvider {
      * attestation data.
      */
     void initialize(String provider, String endpoint, SSLContext sslContext, KeyStore keyStore);
-    
+
+    /**
+     * Set private key used by the provider to sign tokens
+     * This typically is only called for the server's own ZTS provider
+     * @param key private key object
+     * @param keyId id/version of the private key
+     * @param keyAlg key algorithm
+     */
+    default void setPrivateKey(PrivateKey key, String keyId, SignatureAlgorithm keyAlg) {
+    }
+
+    /**
+     * Set hostnameResolver for all provider level name lookups
+     * @param hostnameResolver the resolver object
+     */
+    default void setHostnameResolver(HostnameResolver hostnameResolver) {
+    }
+
     /**
      * Contact the Instance provider and confirm that the requested
      * instance details are valid in order for ZTS to issue a
@@ -100,7 +127,22 @@ public interface InstanceProvider {
      * @throws ResourceException in case of any errors
      */
     InstanceConfirmation refreshInstance(InstanceConfirmation confirmation);
-    
+
+    /**
+     * Request the Instance provider to issue an instance register token
+     * for the given service. ZTS has already verified that the caller
+     * is authorized to manage this service.
+     * @param details register instance details (including domain and
+     * service names).
+     * @return InstanceRegisterToken object if the provider supports this
+     * feature and the request is successful. The return object will
+     * include the token/attestation data.
+     * @throws ResourceException in case of any errors
+     */
+    default InstanceRegisterToken getInstanceRegisterToken(InstanceConfirmation details) {
+        throw new ResourceException(ResourceException.NOT_IMPLEMENTED, "Not Implemented");
+    }
+
     /**
      * Close the client and, if necessary, release any allocated resources
      */

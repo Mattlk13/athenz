@@ -34,7 +34,6 @@ import org.testng.annotations.Test;
 import com.yahoo.athenz.auth.KeyStore;
 import com.yahoo.athenz.auth.Principal;
 import com.yahoo.athenz.auth.Authority.CredSource;
-import com.yahoo.athenz.auth.impl.PrincipalAuthority;
 import com.yahoo.athenz.auth.impl.PrincipalAuthority.IpCheckMode;
 import com.yahoo.athenz.auth.token.PrincipalToken;
 import com.yahoo.athenz.auth.util.CryptoException;
@@ -57,10 +56,10 @@ public class PrincipalAuthorityTest {
     @BeforeTest
     private void loadKeys() throws IOException {
 
-        Path path = Paths.get("./src/test/resources/fantasy_private_k0.key");
+        Path path = Paths.get("./src/test/resources/unit_test_fantasy_private_k0.key");
         servicePrivateKeyStringK0 = new String(Files.readAllBytes(path));
 
-        path = Paths.get("./src/test/resources/fantasy_private_k1.key");
+        path = Paths.get("./src/test/resources/unit_test_fantasy_private_k1.key");
         servicePrivateKeyStringK1 = new String(Files.readAllBytes(path));
     }
     
@@ -216,7 +215,42 @@ public class PrincipalAuthorityTest {
         assertNotNull(principal);
         assertEquals(principal.getAuthorizedService(), "sports.fantasy");
     }
-    
+
+    @Test
+    public void testGetID() {
+        PrincipalAuthority authority = new PrincipalAuthority();
+        assertEquals("Auth-NTOKEN", authority.getID());
+    }
+
+    @Test
+    public void testPrincipalAuthorityWithAuthorizedServiceInvalid() throws IOException, CryptoException {
+        PrincipalAuthority serviceAuthority = new PrincipalAuthority();
+        KeyStore keyStore = new KeyStoreMock();
+        serviceAuthority.setKeyStore(keyStore);
+
+        // Create and sign token with key version 0
+
+        List<String> authorizedServices = new ArrayList<>();
+        authorizedServices.add("sports.fantasy");
+        authorizedServices.add("sports.hockey");
+
+        long issueTime = System.currentTimeMillis() / 1000;
+        PrincipalToken userTokenToSign = new PrincipalToken.Builder(usrVersion, usrDomain, usrName)
+                .salt(salt).ip("127.0.0.2").issueTime(issueTime).expirationWindow(expirationTime)
+                .authorizedServices(authorizedServices).build();
+
+        userTokenToSign.sign(servicePrivateKeyStringK0);
+
+        // we're going to pass a different IP so we get the authorized service checks
+        // but it should fail since there is no service signature
+
+        StringBuilder errMsg = new StringBuilder();
+        Principal principal = serviceAuthority.authenticate(userTokenToSign.getSignedToken(),
+                "127.0.0.3", "POST", errMsg);
+
+        assertNull(principal);
+    }
+
     @Test
     public void testValidateAuthorizedServiceSingle() throws IOException {
         
@@ -506,7 +540,7 @@ public class PrincipalAuthorityTest {
     }
 
     @Test
-    public void testAuthenticateIlligal() {
+    public void testAuthenticateIllegal() {
         PrincipalAuthority serviceAuthority = new PrincipalAuthority();
 
         Principal principal = serviceAuthority.authenticate("aaaa", null, "GET", null);
@@ -589,7 +623,7 @@ public class PrincipalAuthorityTest {
         KeyStore keyStore = Mockito.mock(KeyStore.class);
         serviceAuthority.setKeyStore(keyStore);
 
-        String t = "v=S1;d=domain;n=hoge;bs=aaaa;s=signatur";
+        String t = "v=S1;d=domain;n=hoge;bs=aaaa;s=signature";
 
         Principal check = serviceAuthority.authenticate(t, "10", "10", null);
         assertNull(check);

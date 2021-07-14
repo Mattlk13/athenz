@@ -18,10 +18,10 @@ package com.yahoo.athenz.zts.cert.impl;
 import java.io.File;
 
 import com.yahoo.athenz.auth.PrivateKeyStore;
+import com.yahoo.athenz.common.server.cert.CertRecordStore;
+import com.yahoo.athenz.common.server.cert.CertRecordStoreFactory;
 import com.yahoo.athenz.zts.ZTSConsts;
 import com.yahoo.athenz.zts.ZTSImpl;
-import com.yahoo.athenz.zts.cert.CertRecordStore;
-import com.yahoo.athenz.zts.cert.CertRecordStoreFactory;
 
 public class FileCertRecordStoreFactory implements CertRecordStoreFactory {
 

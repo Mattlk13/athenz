@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AthenZ/athenz/clients/go/zms"
 	"github.com/ardielle/ardielle-go/rdl"
-	"github.com/yahoo/athenz/clients/go/zms"
 )
 
 func shortname(dn string, sn string) string {
@@ -21,32 +21,32 @@ func shortname(dn string, sn string) string {
 	return shortName
 }
 
-func (cli Zms) serviceNames(dn string) ([]string, error) {
+func (cli Zms) ListServices(dn string) (*string, error) {
 	services := make([]string, 0)
 	lst, err := cli.Zms.GetServiceIdentityList(zms.DomainName(dn), nil, "")
 	if err != nil {
 		return nil, err
 	}
-	for _, name := range lst.Names {
-		services = append(services, string(name))
-	}
-	return services, nil
-}
 
-func (cli Zms) ListServices(dn string) (*string, error) {
-	var buf bytes.Buffer
-	services, err := cli.serviceNames(dn)
-	if err != nil {
-		return nil, err
+	oldYamlConverter := func(res interface{}) (*string, error) {
+		var buf bytes.Buffer
+		for _, name := range lst.Names {
+			services = append(services, string(name))
+		}
+		if err != nil {
+			return nil, err
+		}
+		if len(services) == 0 {
+			buf.WriteString("services: []\n")
+		} else {
+			buf.WriteString("services:\n")
+			cli.dumpObjectList(&buf, services, dn, "service")
+		}
+		s := buf.String()
+		return &s, nil
 	}
-	if len(services) == 0 {
-		buf.WriteString("services: []\n")
-	} else {
-		buf.WriteString("services:\n")
-		cli.dumpObjectList(&buf, services, dn, "service")
-	}
-	s := buf.String()
-	return &s, nil
+
+	return cli.dumpByFormat(lst, oldYamlConverter)
 }
 
 func (cli Zms) ShowService(dn string, sn string) (*string, error) {
@@ -54,11 +54,16 @@ func (cli Zms) ShowService(dn string, sn string) (*string, error) {
 	if err != nil {
 		return nil, err
 	}
-	var buf bytes.Buffer
-	buf.WriteString("service:\n")
-	cli.dumpService(&buf, *service, indent_level1_dash, indent_level1_dash_lvl)
-	s := buf.String()
-	return &s, nil
+
+	oldYamlConverter := func(res interface{}) (*string, error) {
+		var buf bytes.Buffer
+		buf.WriteString("service:\n")
+		cli.dumpService(&buf, *service, indentLevel1Dash, indentLevel1DashLvl)
+		s := buf.String()
+		return &s, nil
+	}
+
+	return cli.dumpByFormat(service, oldYamlConverter)
 }
 
 func (cli Zms) AddService(dn string, sn string, keyID string, pubKey *string) (*string, error) {
@@ -140,7 +145,7 @@ func (cli Zms) AddProviderService(dn string, sn string, keyID string, pubKey *st
 	var role zms.Role
 	_, err = cli.Zms.GetRole(zms.DomainName(dn), zms.EntityName(rn), nil, nil, nil)
 	if err == nil {
-		return nil, fmt.Errorf("Provider Service created but Self Serve Role already exists: %v", fullResourceName)
+		return nil, fmt.Errorf("provider service created but self serve role already exists: %v", fullResourceName)
 	}
 	switch v := err.(type) {
 	case rdl.ResourceError:
@@ -162,7 +167,7 @@ func (cli Zms) AddProviderService(dn string, sn string, keyID string, pubKey *st
 	fullResourceName = dn + ":policy." + pn
 	_, err = cli.Zms.GetPolicy(zms.DomainName(dn), zms.EntityName(pn))
 	if err == nil {
-		return nil, fmt.Errorf("Provider Service created but Self Serve Policy already exists: %v", fullResourceName)
+		return nil, fmt.Errorf("provider service created but self serve policy already exists: %v", fullResourceName)
 	}
 	switch v := err.(type) {
 	case rdl.ResourceError:
@@ -242,20 +247,20 @@ func (cli Zms) AddServiceWithKeys(dn string, sn string, publicKeys []*zms.Public
 
 func (cli Zms) SetServiceEndpoint(dn string, sn string, endpoint string) (*string, error) {
 	shortName := shortname(dn, sn)
-	service, err := cli.Zms.GetServiceIdentity(zms.DomainName(dn), zms.SimpleName(shortName))
+	meta := zms.ServiceIdentitySystemMeta{
+		ProviderEndpoint: endpoint,
+	}
+	err := cli.Zms.PutServiceIdentitySystemMeta(zms.DomainName(dn), zms.SimpleName(shortName), "providerendpoint", cli.AuditRef, &meta)
 	if err != nil {
 		return nil, err
 	}
-	service.ProviderEndpoint = endpoint
-	err = cli.Zms.PutServiceIdentity(zms.DomainName(dn), zms.SimpleName(shortName), cli.AuditRef, service)
-	if err != nil {
-		return nil, err
+	s := "[domain " + dn + " service " + sn + " service-endpoint successfully updated]\n"
+	message := SuccessMessage{
+		Status:  200,
+		Message: s,
 	}
-	if cli.Bulkmode {
-		s := ""
-		return &s, nil
-	}
-	return cli.ShowService(dn, shortName)
+
+	return cli.dumpByFormat(message, cli.buildYAMLOutput)
 }
 
 func (cli Zms) SetServiceExe(dn string, sn string, exe string, user string, group string) (*string, error) {
@@ -342,17 +347,22 @@ func (cli Zms) AddServicePublicKey(dn string, sn string, keyID string, pubKey *s
 }
 
 func (cli Zms) ShowServicePublicKey(dn string, sn string, keyID string) (*string, error) {
-	var buf bytes.Buffer
 	shortName := shortname(dn, sn)
 	pkey, err := cli.Zms.GetPublicKeyEntry(zms.DomainName(dn), zms.SimpleName(shortName), keyID)
 	if err != nil {
 		return nil, err
 	}
-	buf.WriteString("public-key:\n")
-	buf.WriteString(indent_level1 + "keyID: " + pkey.Id + "\n")
-	buf.WriteString(indent_level1 + "value: " + pkey.Key + "\n")
-	s := buf.String()
-	return &s, nil
+
+	oldYamlConverter := func(res interface{}) (*string, error) {
+		var buf bytes.Buffer
+		buf.WriteString("public-key:\n")
+		buf.WriteString(indentLevel1 + "keyID: " + pkey.Id + "\n")
+		buf.WriteString(indentLevel1 + "value: " + pkey.Key + "\n")
+		s := buf.String()
+		return &s, nil
+	}
+
+	return cli.dumpByFormat(pkey, oldYamlConverter)
 }
 
 func (cli Zms) DeleteServicePublicKey(dn string, sn string, keyID string) (*string, error) {
@@ -374,5 +384,10 @@ func (cli Zms) DeleteService(dn string, sn string) (*string, error) {
 		return nil, err
 	}
 	s := "[Deleted service identity: " + dn + "." + sn + "]"
-	return &s, nil
+	message := SuccessMessage{
+		Status:  200,
+		Message: s,
+	}
+
+	return cli.dumpByFormat(message, cli.buildYAMLOutput)
 }

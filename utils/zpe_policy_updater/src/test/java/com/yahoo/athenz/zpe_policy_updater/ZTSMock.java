@@ -25,11 +25,11 @@ import java.util.List;
 import java.util.Map;
 
 import com.yahoo.rdl.Timestamp;
+import com.yahoo.athenz.auth.AuthorityConsts;
 import com.yahoo.athenz.auth.util.Crypto;
 import com.yahoo.athenz.common.utils.SignUtils;
 import com.yahoo.athenz.zts.Assertion;
 import com.yahoo.athenz.zts.AssertionEffect;
-import com.yahoo.athenz.zts.DomainMetrics;
 import com.yahoo.athenz.zts.DomainSignedPolicyData;
 import com.yahoo.athenz.zts.Policy;
 import com.yahoo.athenz.zts.PolicyData;
@@ -53,13 +53,13 @@ public class ZTSMock extends ZTSRDLGeneratedClient {
     }
 
     private void loadKeys() throws IOException {
-        Path path = Paths.get("./src/test/resources/zts_private_k0.pem");
+        Path path = Paths.get("./src/test/resources/unit_test_zts_private_k0.pem");
         ztsPrivateKeyK0 = Crypto.loadPrivateKey(new String(Files.readAllBytes(path)));
 
-        path = Paths.get("./src/test/resources/zts_private_k1.pem");
+        path = Paths.get("./src/test/resources/unit_test_zts_private_k1.pem");
         ztsPrivateKeyK1 = Crypto.loadPrivateKey(new String(Files.readAllBytes(path)));
 
-        path = Paths.get("./src/test/resources/zms_private_k0.pem");
+        path = Paths.get("./src/test/resources/unit_test_zms_private_k0.pem");
         zmsPrivateKeyK0 = Crypto.loadPrivateKey(new String(Files.readAllBytes(path)));
     }
 
@@ -102,7 +102,7 @@ public class ZTSMock extends ZTSRDLGeneratedClient {
         assertion.setEffect(AssertionEffect.ALLOW);
         assertion.setResource("*");
 
-        String roleName = domainName + ":role." + "admin";
+        String roleName = domainName + AuthorityConsts.ROLE_SEP + "admin";
         assertion.setRole(roleName);
 
         List<Assertion> assertList = new ArrayList<Assertion>();
@@ -113,7 +113,7 @@ public class ZTSMock extends ZTSRDLGeneratedClient {
         assertion.setEffect(AssertionEffect.DENY);
         assertion.setResource("*");
 
-        roleName = domainName + ":role." + "non-admin";
+        roleName = domainName + AuthorityConsts.ROLE_SEP + "non-admin";
         assertion.setRole(roleName);
         assertList.add(assertion);
 
@@ -181,10 +181,5 @@ public class ZTSMock extends ZTSRDLGeneratedClient {
         } else {
             return keyEntry;
         }
-    }
-
-    @Override
-    public DomainMetrics postDomainMetrics(String arg0, DomainMetrics arg1) {
-        return null;
     }
 }

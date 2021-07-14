@@ -61,6 +61,7 @@ public class ZMSTLSClient {
         try {
             KeyRefresher keyRefresher = Utils.generateKeyRefresher(trustStorePath, trustStorePassword,
                     certPath, keyPath);
+            keyRefresher.startup();
             SSLContext sslContext = Utils.buildSSLContext(keyRefresher.getKeyManagerProxy(),
                     keyRefresher.getTrustManagerProxy());
             
@@ -74,6 +75,17 @@ public class ZMSTLSClient {
                                 System.out.println("Member: " + member.getMemberName());
                                 for (MemberRole role : member.getMemberRoles()) {
                                     System.out.println("  Role: " + role.getRoleName());
+                                }
+                            }
+                            break;
+                        case "getpendingdomainrolememberslist":
+                            DomainRoleMembership pendMembers = zmsClient.getPendingDomainRoleMembersList(principal);
+                            for (DomainRoleMembers members : pendMembers.getDomainRoleMembersList()) {
+                                for (DomainRoleMember member : members.getMembers()) {
+                                    System.out.println("Member: " + member.getMemberName());
+                                    for (MemberRole role : member.getMemberRoles()) {
+                                        System.out.println("  Role: " + role.getRoleName());
+                                    }
                                 }
                             }
                             break;

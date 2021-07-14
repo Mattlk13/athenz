@@ -7,7 +7,7 @@ import (
 	"bufio"
 	"strings"
 
-	"github.com/yahoo/athenz/clients/go/zms"
+	"github.com/AthenZ/athenz/clients/go/zms"
 )
 
 func split(data []byte, atEOF bool) (advance int, token []byte, err error) {
@@ -18,17 +18,17 @@ func split(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	advance, token, err = bufio.ScanWords(data, atEOF)
 	if err == nil && token != nil {
 		if token[0] == '"' {
-			var advance_fwd int
-			var token_fwd []byte
+			var advanceFwd int
+			var tokenFwd []byte
 			for {
-				advance_fwd, token_fwd, err = bufio.ScanWords(data[advance:], atEOF)
-				if err != nil || token_fwd == nil {
+				advanceFwd, tokenFwd, err = bufio.ScanWords(data[advance:], atEOF)
+				if err != nil || tokenFwd == nil {
 					return
 				}
-				advance += advance_fwd
+				advance += advanceFwd
 				token = append(token, 32)
-				token = append(token, token_fwd...)
-				if token_fwd[len(token_fwd)-1] == '"' {
+				token = append(token, tokenFwd...)
+				if tokenFwd[len(tokenFwd)-1] == '"' {
 					token = token[1 : len(token)-1]
 					break
 				}
@@ -76,7 +76,8 @@ func indexOfString(s []string, match string) int {
 }
 
 func (cli Zms) validatedUser(user string) string {
-	if !strings.Contains(user, ".") {
+	//special case to support adding * as a member
+	if !strings.Contains(user, ".") && user != "*" {
 		return cli.UserDomain + "." + user
 	}
 	return user
@@ -85,11 +86,7 @@ func (cli Zms) validatedUser(user string) string {
 func (cli Zms) validatedUsers(users []string, forceSelf bool) []string {
 	validatedUsers := make([]string, 0)
 	for _, v := range users {
-		if !strings.Contains(v, ".") {
-			validatedUsers = append(validatedUsers, cli.UserDomain+"."+v)
-		} else {
-			validatedUsers = append(validatedUsers, v)
-		}
+		validatedUsers = append(validatedUsers, cli.validatedUser(v))
 	}
 	if forceSelf && indexOfString(validatedUsers, cli.Identity) < 0 {
 		validatedUsers = append(validatedUsers, cli.Identity)
@@ -121,18 +118,34 @@ func (cli Zms) validateRoleMembers(users []*zms.RoleMember) {
 	}
 }
 
+func (cli Zms) validateGroupMembers(users []*zms.GroupMember) {
+	for _, v := range users {
+		v.MemberName = zms.GroupMemberName(cli.validatedUser(string(v.MemberName)))
+	}
+}
+
 func (cli Zms) convertRoleMembers(users []string) []*zms.RoleMember {
 	roleMembers := make([]*zms.RoleMember, 0)
 	for _, v := range users {
 		roleMember := zms.NewRoleMember()
-		if !strings.Contains(v, ".") {
-			roleMember.MemberName = zms.MemberName(cli.UserDomain + "." + v)
-		} else {
-			roleMember.MemberName = zms.MemberName(v)
-		}
+		roleMember.MemberName = zms.MemberName(cli.validatedUser(v))
 		roleMembers = append(roleMembers, roleMember)
 	}
 	return roleMembers
+}
+
+func (cli Zms) convertGroupMembers(users []string) []*zms.GroupMember {
+	groupMembers := make([]*zms.GroupMember, 0)
+	for _, v := range users {
+		groupMember := zms.NewGroupMember()
+		if !strings.Contains(v, ".") {
+			groupMember.MemberName = zms.GroupMemberName(cli.UserDomain + "." + v)
+		} else {
+			groupMember.MemberName = zms.GroupMemberName(v)
+		}
+		groupMembers = append(groupMembers, groupMember)
+	}
+	return groupMembers
 }
 
 func (cli Zms) RemoveAll(fullList []string, removeList []string) []string {

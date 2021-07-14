@@ -16,6 +16,7 @@
 package com.yahoo.athenz.auth;
 
 import java.security.cert.X509Certificate;
+import java.util.*;
 
 import javax.servlet.http.HttpServletRequest;
 
@@ -38,6 +39,16 @@ public interface Authority {
      * Initialize the authority
      */
     void initialize();
+
+    /**
+     * @return the string to be included as the identifier for the
+     *  authority which will be logged in the server access log file
+     *  as the last field so we know what authority was responsible
+     *  for authenticating the principal.
+     */
+    default String getID() {
+        return "Auth-ID";
+    }
 
     /**
      * @return credentials source - headers or certificate with headers being default
@@ -128,5 +139,62 @@ public interface Authority {
      */
     default Principal authenticate(HttpServletRequest request, StringBuilder errMsg) {
         return null;
+    }
+
+    /**
+     * Return the requested boolean attribute state from the user authority
+     * @param username user's name or id
+     * @param attribute boolean attribute name
+     * @return true if the given attribute is enabled for the user
+     */
+    default boolean isAttributeSet(final String username, final String attribute) {
+        return false;
+    }
+
+    /**
+     * Set of valid boolean attributes supported by the authority
+     * @return Set of attribute names, empty set if none are supported
+     */
+
+    default Set<String> booleanAttributesSupported() {
+        return Collections.emptySet();
+    }
+
+    /**
+     * Return the requested date attribute state from the user authority
+     * @param username user's name or id
+     * @param attribute date attribute name
+     * @return configured date or null if one is not configured
+     */
+    default Date getDateAttribute(final String username, final String attribute) {
+        return null;
+    }
+
+    /**
+     * Set of valid date attributes supported by the authority
+     * @return Set of attribute names, empty set if none are supported
+     */
+
+    default Set<String> dateAttributesSupported() {
+        return Collections.emptySet();
+    }
+
+    /**
+     * Return user's registered email address
+     * @param username user's name or id
+     * @return user's registered email or null if not available
+     */
+    default String getUserEmail(final String username) {
+        return null;
+    }
+
+    /**
+     * Retrieves a list of principals based on the state parameter from configured Principal Authority and
+     * uses that data to modify role and group memberships
+     * @param principalStates EnumSet containing expected state(s) of principals
+     * @return List of Principal or an empty collection if none
+     */
+    default List<Principal> getPrincipals(EnumSet<Principal.State> principalStates) {
+        return Collections.emptyList();
     }
 }

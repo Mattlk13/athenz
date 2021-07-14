@@ -23,7 +23,7 @@ import com.yahoo.athenz.common.server.db.PoolableDataSource;
 import com.yahoo.athenz.zms.ZMSConsts;
 import com.yahoo.athenz.zms.store.ObjectStore;
 import com.yahoo.athenz.zms.store.ObjectStoreFactory;
-import com.yahoo.athenz.zms.store.jdbc.JDBCObjectStore;
+import com.yahoo.athenz.zms.store.impl.jdbc.JDBCObjectStore;
 
 public class JDBCObjectStoreFactory implements ObjectStoreFactory {
 
@@ -44,6 +44,9 @@ public class JDBCObjectStoreFactory implements ObjectStoreFactory {
                 System.getProperty(ZMSConsts.ZMS_PROP_JDBC_VERIFY_SERVER_CERT, "false"));
         readWriteProperties.setProperty(ZMSConsts.DB_PROP_USE_SSL,
                 System.getProperty(ZMSConsts.ZMS_PROP_JDBC_USE_SSL, "false"));
+        readWriteProperties.setProperty(ZMSConsts.DB_PROP_TLS_PROTOCOLS,
+                System.getProperty(ZMSConsts.ZMS_PROP_JDBC_TLS_VERSIONS, "TLSv1.2,TLSv1.3"));
+        readWriteProperties.setProperty(ZMSConsts.DB_PROP_CONN_TIME_ZONE, "SERVER");
 
         PoolableDataSource readWriteSrc = DataSourceFactory.create(jdbcStore, readWriteProperties);
         
@@ -53,7 +56,7 @@ public class JDBCObjectStoreFactory implements ObjectStoreFactory {
         
         PoolableDataSource readOnlySrc = null;
         String jdbcReadOnlyStore = System.getProperty(ZMSConsts.ZMS_PROP_JDBC_RO_STORE);
-        if (jdbcReadOnlyStore != null && jdbcReadOnlyStore.startsWith("jdbc:")) {
+        if (jdbcReadOnlyStore != null && jdbcReadOnlyStore.startsWith("jdbc")) {
             final String jdbcReadOnlyUser = System.getProperty(ZMSConsts.ZMS_PROP_JDBC_RO_USER, jdbcUser);
             final String readOnlyPassword = System.getProperty(ZMSConsts.ZMS_PROP_JDBC_RO_PASSWORD, password);
             final String jdbcReadOnlyPassword = keyStore.getApplicationSecret(jdbcAppName, readOnlyPassword);
@@ -65,6 +68,10 @@ public class JDBCObjectStoreFactory implements ObjectStoreFactory {
                     System.getProperty(ZMSConsts.ZMS_PROP_JDBC_VERIFY_SERVER_CERT, "false"));
             readOnlyProperties.setProperty(ZMSConsts.DB_PROP_USE_SSL,
                     System.getProperty(ZMSConsts.ZMS_PROP_JDBC_USE_SSL, "false"));
+            readOnlyProperties.setProperty(ZMSConsts.DB_PROP_TLS_PROTOCOLS,
+                    System.getProperty(ZMSConsts.ZMS_PROP_JDBC_TLS_VERSIONS, "TLSv1.2,TLSv1.3"));
+            readOnlyProperties.setProperty(ZMSConsts.DB_PROP_CONN_TIME_ZONE, "SERVER");
+
             readOnlySrc = DataSourceFactory.create(jdbcReadOnlyStore, readOnlyProperties);
         }
         

@@ -3,6 +3,8 @@
 //
 
 package com.yahoo.athenz.zms;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import java.util.List;
 import com.yahoo.rdl.*;
 
@@ -10,12 +12,16 @@ import com.yahoo.rdl.*;
 // ProviderResourceGroupRoles - A representation of provider roles to be
 // provisioned.
 //
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class ProviderResourceGroupRoles {
     public String domain;
     public String service;
     public String tenant;
     public List<TenantRoleAction> roles;
     public String resourceGroup;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Boolean createAdminRole;
 
     public ProviderResourceGroupRoles setDomain(String domain) {
         this.domain = domain;
@@ -52,6 +58,13 @@ public class ProviderResourceGroupRoles {
     public String getResourceGroup() {
         return resourceGroup;
     }
+    public ProviderResourceGroupRoles setCreateAdminRole(Boolean createAdminRole) {
+        this.createAdminRole = createAdminRole;
+        return this;
+    }
+    public Boolean getCreateAdminRole() {
+        return createAdminRole;
+    }
 
     @Override
     public boolean equals(Object another) {
@@ -75,7 +88,20 @@ public class ProviderResourceGroupRoles {
             if (resourceGroup == null ? a.resourceGroup != null : !resourceGroup.equals(a.resourceGroup)) {
                 return false;
             }
+            if (createAdminRole == null ? a.createAdminRole != null : !createAdminRole.equals(a.createAdminRole)) {
+                return false;
+            }
         }
         return true;
+    }
+
+    //
+    // sets up the instance according to its default field values, if any
+    //
+    public ProviderResourceGroupRoles init() {
+        if (createAdminRole == null) {
+            createAdminRole = true;
+        }
+        return this;
     }
 }

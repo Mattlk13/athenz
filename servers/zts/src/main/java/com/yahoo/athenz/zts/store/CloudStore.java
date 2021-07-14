@@ -1,21 +1,21 @@
 /*
- * Copyright 2016 Yahoo Inc.
+ *  Copyright 2020 Verizon Media
  *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ *  Licensed under the Apache License, Version 2.0 (the "License");
+ *  you may not use this file except in compliance with the License.
+ *  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *      http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS,
+ *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ *  See the License for the specific language governing permissions and
+ *  limitations under the License.
  */
+
 package com.yahoo.athenz.zts.store;
 
-import java.security.PublicKey;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -27,8 +27,10 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.ConcurrentHashMap;
 
 import com.amazonaws.AmazonServiceException;
+import com.yahoo.athenz.common.server.util.ConfigProperties;
 import org.eclipse.jetty.client.HttpClient;
 import org.eclipse.jetty.client.api.ContentResponse;
+import org.eclipse.jetty.util.StringUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -42,18 +44,16 @@ import com.amazonaws.services.securitytoken.AWSSecurityTokenService;
 import com.amazonaws.services.securitytoken.model.AssumeRoleRequest;
 import com.amazonaws.services.securitytoken.model.AssumeRoleResult;
 import com.amazonaws.services.securitytoken.model.Credentials;
-import com.yahoo.athenz.auth.util.Crypto;
 import com.yahoo.athenz.zts.AWSTemporaryCredentials;
-import com.yahoo.athenz.zts.OSTKInstanceInformation;
 import com.yahoo.athenz.zts.ResourceException;
 import com.yahoo.athenz.zts.ZTSConsts;
-import com.yahoo.athenz.zts.utils.ZTSUtils;
 import com.yahoo.rdl.JSON;
 import com.yahoo.rdl.Struct;
 import com.yahoo.rdl.Timestamp;
 
-public class CloudStore {
+import static com.yahoo.athenz.common.ServerCommonConsts.ZTS_PROP_AWS_REGION_NAME;
 
+public class CloudStore {
     private static final Logger LOGGER = LoggerFactory.getLogger(CloudStore.class);
     private static final String AWS_ROLE_SESSION_NAME = "athenz-zts-service";
 
@@ -63,7 +63,8 @@ public class CloudStore {
     int cacheTimeout;
     int invalidCacheTimeout;
     BasicSessionCredentials credentials;
-    private Map<String, String> cloudAccountCache;
+    final private Map<String, String> awsAccountCache;
+    final private Map<String, String> azureSubscriptionCache;
     ConcurrentHashMap<String, AWSTemporaryCredentials> awsCredsCache;
     ConcurrentHashMap<String, Long> awsInvalidCredsCache;
     private HttpClient httpClient;
@@ -74,9 +75,13 @@ public class CloudStore {
 
         // initialize our account and cred cache
 
-        cloudAccountCache = new HashMap<>();
+        awsAccountCache = new HashMap<>();
         awsCredsCache = new ConcurrentHashMap<>();
         awsInvalidCredsCache = new ConcurrentHashMap<>();
+
+        // initialize azure cache
+
+        azureSubscriptionCache = new ConcurrentHashMap<>();
 
         // Instantiate and start our HttpClient
 
@@ -85,7 +90,7 @@ public class CloudStore {
 
         // check to see if we are given region name
 
-        awsRegion = System.getProperty(ZTSConsts.ZTS_PROP_AWS_REGION_NAME);
+        awsRegion = System.getProperty(ZTS_PROP_AWS_REGION_NAME);
 
         // get the default cache timeout in seconds
 
@@ -166,7 +171,7 @@ public class CloudStore {
 
         // Start our thread to get/update aws temporary credentials
 
-        int credsUpdateTime = ZTSUtils.retrieveConfigSetting(
+        int credsUpdateTime = ConfigProperties.retrieveConfigSetting(
                 ZTSConsts.ZTS_PROP_AWS_CREDS_UPDATE_TIMEOUT, 900);
 
         scheduledThreadPool = Executors.newScheduledThreadPool(1);
@@ -323,7 +328,7 @@ public class CloudStore {
         // verify that we have a valid awsRole already retrieved
 
         if (awsRole == null || awsRole.isEmpty()) {
-            LOGGER.error("CloudStore: awsRole is not avaialble to fetch role credentials");
+            LOGGER.error("CloudStore: awsRole is not available to fetch role credentials");
             return false;
         }
 
@@ -373,8 +378,7 @@ public class CloudStore {
         return data;
     }
 
-    AssumeRoleRequest getAssumeRoleRequest(String account, String roleName, String principal,
-            Integer durationSeconds, String externalId) {
+    AssumeRoleRequest getAssumeRoleRequest(String account, String roleName, Integer durationSeconds, String externalId) {
 
         // assume the target role to get the credentials for the client
         // aws format is arn:aws:iam::<account-id>:role/<role-name>
@@ -406,7 +410,7 @@ public class CloudStore {
     }
 
     String getCacheKey(final String account, final String roleName, final String principal,
-            Integer durationSeconds, final String externalId) {
+                       Integer durationSeconds, final String externalId) {
 
         // if our cache is disabled there is no need to generate
         // a cache key since all other operations are no-ops
@@ -450,7 +454,7 @@ public class CloudStore {
         // iterate through all entries in the map and remove any
         // entries that have been expired already
 
-        long checkTime = System.currentTimeMillis() - invalidCacheTimeout * 1000;
+        long checkTime = System.currentTimeMillis() - invalidCacheTimeout * 1000L;
         return awsInvalidCredsCache.entrySet().removeIf(entry -> entry.getValue() <= checkTime);
     }
 
@@ -522,7 +526,7 @@ public class CloudStore {
     }
 
     public AWSTemporaryCredentials assumeAWSRole(String account, String roleName, String principal,
-            Integer durationSeconds, String externalId) {
+                                                 Integer durationSeconds, String externalId, StringBuilder errorMessage) {
 
         if (!awsEnabled) {
             throw new ResourceException(ResourceException.INTERNAL_SERVER_ERROR,
@@ -543,13 +547,12 @@ public class CloudStore {
         // and eventually become rate limited
 
         if (isFailedTempCredsRequest(cacheKey)) {
-            LOGGER.error("CloudStore: assumeAWSRole - failed cached request for account {} with role: {}",
-                    account, roleName);
+            errorMessage.append("Cached invalid request. Retry operation after ").append(invalidCacheTimeout)
+                    .append(" seconds.");
             return null;
         }
 
-        AssumeRoleRequest req = getAssumeRoleRequest(account, roleName, principal,
-                durationSeconds, externalId);
+        AssumeRoleRequest req = getAssumeRoleRequest(account, roleName, durationSeconds, externalId);
 
         try {
             AWSSecurityTokenService client = getTokenServiceClient();
@@ -574,6 +577,7 @@ public class CloudStore {
                 putInvalidCacheCreds(cacheKey);
             }
 
+            errorMessage.append(ex.getErrorMessage());
             return null;
 
         } catch (Exception ex) {
@@ -581,6 +585,7 @@ public class CloudStore {
             LOGGER.error("CloudStore: assumeAWSRole - unable to assume role: {}, error: {}",
                     req.getRoleArn(), ex.getMessage());
 
+            errorMessage.append(ex.getMessage());
             return null;
         }
 
@@ -588,43 +593,41 @@ public class CloudStore {
         return tempCreds;
     }
 
-    public String getCloudAccount(String domainName) {
-        return cloudAccountCache.get(domainName);
+    public String getAwsAccount(String domainName) {
+        return awsAccountCache.get(domainName);
     }
 
-    void updateAccount(String domainName, String account) {
+    public String getAzureSubscription(String domainName) {
+        return azureSubscriptionCache.get(domainName);
+    }
+
+    void updateAwsAccount(final String domainName, final String awsAccount) {
 
         /* if we have a value specified for the domain, then we're just
          * going to insert it into our map and update the record. If
          * the new value is not present and we had a value stored before
          * then let's remove it */
 
-        if (account != null && !account.isEmpty()) {
-            cloudAccountCache.put(domainName, account);
-        } else if (cloudAccountCache.get(domainName) != null) {
-            cloudAccountCache.remove(domainName);
+        if (!StringUtil.isEmpty(awsAccount)) {
+            awsAccountCache.put(domainName, awsAccount);
+        } else if (awsAccountCache.get(domainName) != null) {
+            awsAccountCache.remove(domainName);
         }
     }
 
-    ///CLOVER:OFF
-    public boolean verifyInstanceDocument(OSTKInstanceInformation info, String publicKey) {
+    void updateAzureSubscription(final String domainName, final String azureSubscription) {
 
-        // for now we're only validating the document signature
+        /* if we have a value specified for the domain, then we're just
+         * going to insert it into our map and update the record. If
+         * the new value is not present and we had a value stored before
+         * then let's remove it */
 
-        boolean verified = false;
-        try {
-            final PublicKey pub = Crypto.loadPublicKey(publicKey);
-            verified = Crypto.verify(info.getDocument(), pub, info.getSignature());
-            if (!verified) {
-                LOGGER.error("verifyInstanceDocument: OSTK document signature did not match");
-            }
-        } catch (Exception ex) {
-            LOGGER.error("verifyInstanceDocument: Unable to verify signature: {}",
-                    ex.getMessage());
+        if (!StringUtil.isEmpty(azureSubscription)) {
+            azureSubscriptionCache.put(domainName, azureSubscription);
+        } else if (awsAccountCache.get(domainName) != null) {
+            azureSubscriptionCache.remove(domainName);
         }
-        return verified;
     }
-    ///CLOVER:ON
 
     class AWSCredentialsUpdater implements Runnable {
 

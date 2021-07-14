@@ -43,31 +43,38 @@ public class CertificateAuthorityTest {
         authority.initialize();
         assertNull(authority.getHeader());
     }
-    
+
     @Test
     public void testGetCredSource() {
         CertificateAuthority authority = new CertificateAuthority();
         authority.initialize();
         assertEquals(CredSource.CERTIFICATE, authority.getCredSource());
     }
-    
+
+    @Test
+    public void testGetID() {
+        CertificateAuthority authority = new CertificateAuthority();
+        authority.initialize();
+        assertEquals("Auth-X509", authority.getID());
+    }
+
     @Test
     public void testHeaderAuthenticate() {
-        
+
         CertificateAuthority authority = new CertificateAuthority();
         authority.initialize();
         assertNull(authority.authenticate("v=U1;d=domain;n=service;s=sig", null, "GET", null));
     }
-    
+
     @Test
     public void testAuthenticateCertificate() throws Exception {
         CertificateAuthority authority = new CertificateAuthority();
         authority.initialize();
-        
+
         try (InputStream inStream = new FileInputStream("src/test/resources/valid_cn_x509.cert")) {
             CertificateFactory cf = CertificateFactory.getInstance("X.509");
             X509Certificate cert = (X509Certificate) cf.generateCertificate(inStream);
-            
+
             X509Certificate[] certs = new X509Certificate[1];
             certs[0] = cert;
             Principal principal = authority.authenticate(certs, null);
@@ -75,6 +82,29 @@ public class CertificateAuthorityTest {
             assertEquals("athenz", principal.getDomain());
             assertEquals("syncer", principal.getName());
             assertNull(principal.getRoles());
+            assertFalse(principal.getMtlsRestricted());
+        }
+    }
+
+    @Test
+    public void testAuthenticateCertificateRestrictedMtls() throws Exception {
+        System.setProperty("athenz.crypto.restricted_ou", "Testing Domain");
+        CertificateAuthority authority = new CertificateAuthority();
+        authority.initialize();
+
+        try (InputStream inStream = new FileInputStream("src/test/resources/valid_email_x509.cert")) {
+            CertificateFactory cf = CertificateFactory.getInstance("X.509");
+            X509Certificate cert = (X509Certificate) cf.generateCertificate(inStream);
+
+            X509Certificate[] certs = new X509Certificate[1];
+            certs[0] = cert;
+            Principal principal = authority.authenticate(certs, null);
+            assertNotNull(principal);
+            assertEquals("athens", principal.getDomain());
+            assertEquals("zts", principal.getName());
+            assertTrue(principal.getMtlsRestricted());
+        } finally {
+            System.clearProperty("athenz.crypto.restricted_ou");
         }
     }
 
@@ -94,18 +124,19 @@ public class CertificateAuthorityTest {
             assertEquals("athens", principal.getDomain());
             assertEquals("zts", principal.getName());
             assertEquals("sports:role.readers", principal.getRoles().get(0));
+            assertFalse(principal.getMtlsRestricted());
         }
     }
-    
+
     @Test
     public void testAuthenciateInvalidArray() {
-        
+
         CertificateAuthority authority = new CertificateAuthority();
         authority.initialize();
         StringBuilder errMsg = new StringBuilder(512);
         Principal principal = authority.authenticate((X509Certificate[]) null, errMsg);
         assertNull(principal);
-        
+
         X509Certificate[] certs = new X509Certificate[1];
         certs[0] = null;
         principal = authority.authenticate(certs, errMsg);
@@ -248,73 +279,6 @@ public class CertificateAuthorityTest {
             Principal principal = authority.authenticate(certs, errMsg);
             assertNull(principal);
             assertTrue(errMsg.toString().contains("Principal is not a valid service identity"));
-        }
-    }
-
-    @Test
-    public void testAuthenticateCertificateRoleURIs() throws Exception {
-
-        CertificateAuthority authority = new CertificateAuthority();
-        authority.initialize();
-
-        try (InputStream inStream = new FileInputStream("src/test/resources/role_cert_multiple_uri.cert")) {
-            CertificateFactory cf = CertificateFactory.getInstance("X.509");
-            X509Certificate cert = (X509Certificate) cf.generateCertificate(inStream);
-
-            X509Certificate[] certs = new X509Certificate[1];
-            certs[0] = cert;
-
-            StringBuilder errMsg = new StringBuilder();
-            Principal principal = authority.authenticate(certs, errMsg);
-            assertNotNull(principal);
-            List<String> roles = principal.getRoles();
-            assertEquals(2, roles.size());
-            assertTrue(roles.contains("coretech:role.readers"));
-            assertTrue(roles.contains("coretech:role.writers"));
-        }
-    }
-
-    @Test
-    public void testAuthenticateCertificateRoleURIsExcluded() throws Exception {
-
-        System.setProperty("athenz.auth.certificate.exclude_role_certificates", "true");
-
-        CertificateAuthority authority = new CertificateAuthority();
-        authority.initialize();
-
-        try (InputStream inStream = new FileInputStream("src/test/resources/role_cert_multiple_uri.cert")) {
-            CertificateFactory cf = CertificateFactory.getInstance("X.509");
-            X509Certificate cert = (X509Certificate) cf.generateCertificate(inStream);
-
-            X509Certificate[] certs = new X509Certificate[1];
-            certs[0] = cert;
-
-            StringBuilder errMsg = new StringBuilder();
-            Principal principal = authority.authenticate(certs, errMsg);
-            assertNull(principal);
-            assertTrue(errMsg.toString().contains("Role Certificates not allowed"));
-        }
-
-        System.clearProperty("athenz.auth.certificate.exclude_role_certificates");
-    }
-
-    @Test
-    public void testAuthenticateCertificateInvalidRoleURI() throws Exception {
-
-        CertificateAuthority authority = new CertificateAuthority();
-        authority.initialize();
-
-        try (InputStream inStream = new FileInputStream("src/test/resources/role_cert_invalid_uri.cert")) {
-            CertificateFactory cf = CertificateFactory.getInstance("X.509");
-            X509Certificate cert = (X509Certificate) cf.generateCertificate(inStream);
-
-            X509Certificate[] certs = new X509Certificate[1];
-            certs[0] = cert;
-
-            StringBuilder errMsg = new StringBuilder();
-            Principal principal = authority.authenticate(certs, errMsg);
-            assertNull(principal);
-            assertTrue(errMsg.toString().contains("invalid uri SAN entry"));
         }
     }
 }

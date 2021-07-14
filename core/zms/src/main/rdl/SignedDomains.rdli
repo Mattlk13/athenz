@@ -7,20 +7,6 @@ include "ServiceIdentity.tdl";
 include "Entity.tdl";
 include "Domain.tdl";
 
-//Tuple of domain-name and modification time-stamps. This object is returned
-//when the caller has requested list of domains modified since a specific timestamp.
-type DomainModified Struct {
-    DomainName name; //name of the domain
-    Int64 modified; //last modified timestamp of the domain
-    String account (optional); //associated cloud (i.e. aws) account id
-    Int32 ypmId (optional); //associated product id
-}
-
-//A list of {domain, modified-timestamp} tuples.
-type DomainModifiedList Struct {
-    Array<DomainModified> nameModList; //list of modified domains
-}
-
 //We need to include the name of the domain in this struct since
 //this data will be passed back to ZPU through ZTS so we need to
 //sign not only the list of policies but also the corresponding
@@ -45,6 +31,7 @@ type DomainData DomainMeta {
     SignedPolicies policies; //list of policies in the domain signed with ZMS private key
     Array<ServiceIdentity> services; //list of services in the domain
     Array<Entity> entities; //list of entities in the domain
+    Array<Group> groups; //list of groups in the domain
     Timestamp modified; //last modification timestamp
 }
 
@@ -67,10 +54,12 @@ type SignedDomains Struct {
 //timestamp as the value of the ETag header. The client will need to use this
 //value during its next call to request the changes since the previous request.
 // When metaonly set to true, dont add roles, policies or services, dont sign
-resource SignedDomains GET "/sys/modified_domains?domain={domain}&metaonly={metaOnly}&metaattr={metaAttr}" {
+resource SignedDomains GET "/sys/modified_domains?domain={domain}&metaonly={metaOnly}&metaattr={metaAttr}&master={master}&conditions={conditions}" {
     DomainName domain (optional); //filter the domain list only to the specified name
     String metaOnly (optional); // valid values are "true" or "false"
     SimpleName metaAttr (optional); // domain meta attribute to filter/return, valid values "account", "ypmId", or "all"
+    Bool master (optional); // for system principals only - request data from master data store and not read replicas if any are configured
+    Bool conditions (optional); // for specific purpose only. If this flag is passed, assertion id and assertion conditions will be included in the response assertions if available
     String matchingTag (header="If-None-Match"); //Retrieved from the previous request, this timestamp specifies to the server to return any domains modified since this time
     String tag (header="ETag", out); //The current latest modification timestamp is returned in this header
     authenticate;
@@ -79,6 +68,26 @@ resource SignedDomains GET "/sys/modified_domains?domain={domain}&metaonly={meta
         ResourceError NOT_FOUND;
         ResourceError FORBIDDEN;
         ResourceError UNAUTHORIZED; 
+        ResourceError TOO_MANY_REQUESTS;
+    }
+}
+
+//SignedDomain using flattened JWS JSON Serialization syntax.
+//https://tools.ietf.org/html/rfc7515#section-7.2.2
+type JWSDomain Struct {
+    String payload;
+    String protected;
+    Map<String, String> header;
+    String signature;
+}
+
+resource JWSDomain GET "/domain/{name}/signed" {
+    DomainName name; //name of the domain to be retrieved
+    authenticate;
+    expected OK;
+    exceptions {
+        ResourceError NOT_FOUND;
+        ResourceError UNAUTHORIZED;
         ResourceError TOO_MANY_REQUESTS;
     }
 }

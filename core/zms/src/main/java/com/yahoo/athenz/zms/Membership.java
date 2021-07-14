@@ -3,12 +3,14 @@
 //
 
 package com.yahoo.athenz.zms;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.yahoo.rdl.*;
 
 //
 // Membership - The representation for a role membership.
 //
+@JsonIgnoreProperties(ignoreUnknown = true)
 public class Membership {
     public String memberName;
     @RdlOptional
@@ -22,6 +24,9 @@ public class Membership {
     public Timestamp expiration;
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Timestamp reviewReminder;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public Boolean active;
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
@@ -29,6 +34,12 @@ public class Membership {
     @RdlOptional
     @JsonInclude(JsonInclude.Include.NON_EMPTY)
     public String auditRef;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public String requestPrincipal;
+    @RdlOptional
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    public Integer systemDisabled;
 
     public Membership setMemberName(String memberName) {
         this.memberName = memberName;
@@ -58,6 +69,13 @@ public class Membership {
     public Timestamp getExpiration() {
         return expiration;
     }
+    public Membership setReviewReminder(Timestamp reviewReminder) {
+        this.reviewReminder = reviewReminder;
+        return this;
+    }
+    public Timestamp getReviewReminder() {
+        return reviewReminder;
+    }
     public Membership setActive(Boolean active) {
         this.active = active;
         return this;
@@ -79,6 +97,20 @@ public class Membership {
     public String getAuditRef() {
         return auditRef;
     }
+    public Membership setRequestPrincipal(String requestPrincipal) {
+        this.requestPrincipal = requestPrincipal;
+        return this;
+    }
+    public String getRequestPrincipal() {
+        return requestPrincipal;
+    }
+    public Membership setSystemDisabled(Integer systemDisabled) {
+        this.systemDisabled = systemDisabled;
+        return this;
+    }
+    public Integer getSystemDisabled() {
+        return systemDisabled;
+    }
 
     @Override
     public boolean equals(Object another) {
@@ -99,6 +131,9 @@ public class Membership {
             if (expiration == null ? a.expiration != null : !expiration.equals(a.expiration)) {
                 return false;
             }
+            if (reviewReminder == null ? a.reviewReminder != null : !reviewReminder.equals(a.reviewReminder)) {
+                return false;
+            }
             if (active == null ? a.active != null : !active.equals(a.active)) {
                 return false;
             }
@@ -106,6 +141,12 @@ public class Membership {
                 return false;
             }
             if (auditRef == null ? a.auditRef != null : !auditRef.equals(a.auditRef)) {
+                return false;
+            }
+            if (requestPrincipal == null ? a.requestPrincipal != null : !requestPrincipal.equals(a.requestPrincipal)) {
+                return false;
+            }
+            if (systemDisabled == null ? a.systemDisabled != null : !systemDisabled.equals(a.systemDisabled)) {
                 return false;
             }
         }

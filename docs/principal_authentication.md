@@ -25,7 +25,7 @@ The job of the Authority is authenticate a specific request and, if valid,
 generate and return an object representing the authenticated Principal.
 The Authority interface is defined in the following file:
 
-[Authority](https://github.com/yahoo/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/Authority.java)
+[Authority](https://github.com/AthenZ/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/Authority.java)
 
 The system administrator can configure a list of authorities for
 supporting principal authentication. During startup, the server will
@@ -36,7 +36,7 @@ interface as well and provide an implementation of the `setKeyStore()` method.
 The server implements the `KeyStore` interface and will automatically call
 the `setKeyStore()` method to pass its implementation to the authority.
 
-[AuthorityKeyStore](https://github.com/yahoo/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/AuthorityKeyStore.java)
+[AuthorityKeyStore](https://github.com/AthenZ/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/AuthorityKeyStore.java)
 
 When processing a request the server goes through the list of authorities in their
 configured order and processes until it receives a successful principal
@@ -106,8 +106,8 @@ to the `/etc/shadow` file. There are two options available:
   group.
 
 User Authority is typically not allowed to carry out any authorized
-operation. It is required that the user first must obtain an NToken
-for his/her identity and use that NToken to carry out the authorized
+operation. It is required that the user first must obtain an X509 certificate
+for his/her identity and use that certificate to carry out the authorized
 request.
 
 ### Principal Authority
@@ -147,7 +147,7 @@ proper initialization of this authority:
 
 For full details check out the implementation of the Kerberos Authority:
 
-[Kerberos Authority](https://github.com/yahoo/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/impl/KerberosAuthority.java)
+[Kerberos Authority](https://github.com/AthenZ/athenz/blob/master/libs/java/auth_core/src/main/java/com/yahoo/athenz/auth/impl/KerberosAuthority.java)
 
 ### Certificate Authority
 -------------------------
@@ -166,17 +166,6 @@ Certificate Subject DN: c=US;o=Some Athenz Company;cn=sports.fantasy
 
 The authenticated principal in this case is service `fantasy` in domain
 `sports`.
-
-### Role Authority
-------------------
-
-Class: com.yahoo.athenz.auth.impl.RoleAuthority
-
-This authority is used only if the system administrator wants to
-support RoleTokens as a method for centralized authorization
-checks. It allows a client that retrieved its Role Token from
-ZTS Server to submit to ZMS Server for centralized authorization
-check.
 
 ### LDAP Authority
 ------------------

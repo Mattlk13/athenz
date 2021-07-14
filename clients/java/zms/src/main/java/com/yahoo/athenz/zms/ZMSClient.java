@@ -24,6 +24,7 @@ import java.text.SimpleDateFormat;
 import java.util.Date;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.SSLContext;
 import javax.ws.rs.client.Client;
@@ -31,13 +32,14 @@ import javax.ws.rs.client.ClientBuilder;
 
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import org.glassfish.jersey.client.ClientConfig;
-import org.glassfish.jersey.client.ClientProperties;
-import org.glassfish.jersey.jackson.internal.jackson.jaxrs.json.JacksonJaxbJsonProvider;
-import org.glassfish.jersey.jackson.internal.jackson.jaxrs.json.JacksonJsonProvider;
+import com.fasterxml.jackson.jaxrs.json.JacksonJaxbJsonProvider;
+import com.fasterxml.jackson.jaxrs.json.JacksonJsonProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.glassfish.jersey.apache.connector.ApacheConnectorProvider;
 
 import com.yahoo.athenz.auth.Authority;
+import com.yahoo.athenz.auth.AuthorityConsts;
 import com.yahoo.athenz.auth.Principal;
 import com.yahoo.athenz.auth.PrivateKeyStore;
 import com.yahoo.athenz.auth.impl.PrincipalAuthority;
@@ -87,7 +89,7 @@ public class ZMSClient implements Closeable {
     private static final Logger LOGGER = LoggerFactory.getLogger(ZMSClient.class);
     private static final Authority PRINCIPAL_AUTHORITY = new PrincipalAuthority();
 
-    private static PrivateKeyStore PRIVATE_KEY_STORE = loadServicePrivateKey();
+    private static final PrivateKeyStore PRIVATE_KEY_STORE = loadServicePrivateKey();
 
     static PrivateKeyStore loadServicePrivateKey() {
         String pkeyFactoryClass = System.getProperty(ZMS_CLIENT_PROP_PRIVATE_KEY_STORE_FACTORY_CLASS,
@@ -327,6 +329,10 @@ public class ZMSClient implements Closeable {
         return url;
     }
 
+    ClientBuilder getClientBuilder() {
+        return ClientBuilder.newBuilder();
+    }
+
     /**
      * Initialize the client for class constructors
      *
@@ -367,18 +373,26 @@ public class ZMSClient implements Closeable {
             sslContext = createSSLContext();
         }
 
-        ClientBuilder builder = ClientBuilder.newBuilder();
+        ClientBuilder builder = getClientBuilder();
         if (sslContext != null) {
             builder = builder.sslContext(sslContext);
         }
 
-        final JacksonJsonProvider jacksonJsonProvider = new JacksonJaxbJsonProvider().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+        final JacksonJsonProvider jacksonJsonProvider = new JacksonJaxbJsonProvider()
+                .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
         ClientConfig clientConfig = new ClientConfig(jacksonJsonProvider);
+        clientConfig.connectorProvider(new ApacheConnectorProvider());
 
-        Client rsClient = builder.property(ClientProperties.CONNECT_TIMEOUT, connectTimeout)
-                .property(ClientProperties.READ_TIMEOUT, readTimeout)
+        // JerseyClientBuilder::withConfig() replaces the existing config with the new client
+        // config. Hence the client config should be added to the builder before the timeouts.
+        // Otherwise the timeout settings would be overridden.
+        Client rsClient =
+            builder
                 .withConfig(clientConfig)
+                .connectTimeout(connectTimeout, TimeUnit.MILLISECONDS)
+                .readTimeout(readTimeout, TimeUnit.MILLISECONDS)
                 .build();
+
         client = new ZMSRDLGeneratedClient(zmsUrl, rsClient);
     }
 
@@ -458,7 +472,7 @@ public class ZMSClient implements Closeable {
      * @return full role name
      */
     public String generateRoleName(String domain, String role) {
-        return domain + ":role." + role;
+        return domain + AuthorityConsts.ROLE_SEP + role;
     }
 
     /**
@@ -470,7 +484,7 @@ public class ZMSClient implements Closeable {
      * @return full policy name
      */
     public String generatePolicyName(String domain, String policy) {
-        return domain + ":policy." + policy;
+        return domain + AuthorityConsts.POLICY_SEP + policy;
     }
 
     /**
@@ -487,6 +501,19 @@ public class ZMSClient implements Closeable {
     }
 
     /**
+     * Generate an entity name as expected by ZMS Server can be used to
+     * set the entity object's name field
+     * (e.g. entity.setName(name))
+     *
+     * @param domain  name of the domain
+     * @param entity name of the service
+     * @return full entity name
+     */
+    public String generateEntityName(String domain, String entity) {
+        return domain + AuthorityConsts.ENTITY_SEP + entity;
+    }
+
+    /**
      * Retrieve the specified domain object
      *
      * @param domain name of the domain to be retrieved
@@ -500,7 +527,29 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Retrieve the specified singed domain object. The domain
+     * object includes all roles, policies, services and
+     * domain attributes. The domain data is base64url encoded
+     * in the payload field based on JWS RFC 7515
+     * https://tools.ietf.org/html/rfc7515#section-7.2.2
+     *
+     * @param domain name of the domain to be retrieved
+     * @return JWSDomain object
+     * @throws ZMSClientException in case of failure
+     */
+    public JWSDomain getJWSDomain(String domain) {
+        updatePrincipal();
+        try {
+            return client.getJWSDomain(domain);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -511,7 +560,7 @@ public class ZMSClient implements Closeable {
      * @throws ZMSClientException in case of failure
      */
     public DomainList getDomainList() {
-        return getDomainList(null, null, null, null, null, null, null);
+        return getDomainList(null, null);
     }
 
     /**
@@ -522,7 +571,7 @@ public class ZMSClient implements Closeable {
      * @param skip          exclude all the domains including the specified one from the return set
      * @param prefix        return domains starting with this value
      * @param depth         maximum depth of the domain (0 - top level domains only)
-     * @param account       return domain that has the specified account name. If account name
+     * @param awsAccount    return domain that has the specified aws account name. If account name
      *                      is specified all other optional attributes are ignored since there must be
      *                      only one domain matching the specified account name.
      * @param productId     return domain that has the specified product id. If product id
@@ -533,7 +582,94 @@ public class ZMSClient implements Closeable {
      * @throws ZMSClientException in case of failure
      */
     public DomainList getDomainList(Integer limit, String skip, String prefix, Integer depth,
-                                    String account, Integer productId, Date modifiedSince) {
+                                    String awsAccount, Integer productId, Date modifiedSince) {
+        return getDomainList(limit, skip, prefix, depth, awsAccount, productId, null, modifiedSince, null, null, null);
+    }
+
+    /**
+     * Retrieve the list of domains provisioned on the ZMS Server
+     * filters based on the specified arguments
+     *
+     * @param limit         number of domain objects to return
+     * @param skip          exclude all the domains including the specified one from the return set
+     * @param prefix        return domains starting with this value
+     * @param depth         maximum depth of the domain (0 - top level domains only)
+     * @param awsAccount    return domain that has the specified aws account name. If account name
+     *                      is specified all other optional attributes are ignored since there must be
+     *                      only one domain matching the specified account name.
+     * @param productId     return domain that has the specified product id. If product id
+     *                      is specified all other optional attributes are ignored since there must be
+     *                      only one domain matching the specified product id.
+     * @param azureSubscription return domain that has the specified azure subscription id. If subscription
+     *                      id is specified all other optional attributes are ignored since there must be
+     *                      only one domain matching the specified subscription id.
+     * @param modifiedSince return domains only modified since this date
+     * @return list of domain names
+     * @throws ZMSClientException in case of failure
+     */
+    public DomainList getDomainList(Integer limit, String skip, String prefix, Integer depth,
+                                    String awsAccount, Integer productId, String azureSubscription, Date modifiedSince) {
+        return getDomainList(limit, skip, prefix, depth, awsAccount, productId, azureSubscription,
+                modifiedSince, null, null, null);
+    }
+
+    /**
+     * Retrieve the list of domains provisioned on the ZMS Server
+     * filters based on the specified arguments
+     *
+     * @param limit         number of domain objects to return
+     * @param skip          exclude all the domains including the specified one from the return set
+     * @param prefix        return domains starting with this value
+     * @param depth         maximum depth of the domain (0 - top level domains only)
+     * @param awsAccount    return domain that has the specified aws account name. If account name
+     *                      is specified all other optional attributes are ignored since there must be
+     *                      only one domain matching the specified account name.
+     * @param productId     return domain that has the specified product id. If product id
+     *                      is specified all other optional attributes are ignored since there must be
+     *                      only one domain matching the specified product id.
+     * @param azureSubscription return domain that has the specified azure subscription id. If subscription
+     *                      id is specified all other optional attributes are ignored since there must be
+     *                      only one domain matching the specified subscription id.
+     * @param modifiedSince return domains only modified since this date
+     * @param tagKey        query all domains with given tag name
+     * @param tagValue      query all domains with given tag key and value
+     * @return list of domain names
+     * @throws ZMSClientException in case of failure
+     */
+    public DomainList getDomainList(Integer limit, String skip, String prefix, Integer depth,
+                                    String awsAccount, Integer productId, String azureSubscription,
+                                    Date modifiedSince, String tagKey, String tagValue) {
+        return getDomainList(limit, skip, prefix, depth, awsAccount, productId, azureSubscription,
+                modifiedSince, tagKey, tagValue, null);
+
+    }
+    /**
+     * Retrieve the list of domains provisioned on the ZMS Server
+     * filters based on the specified arguments
+     *
+     * @param limit         number of domain objects to return
+     * @param skip          exclude all the domains including the specified one from the return set
+     * @param prefix        return domains starting with this value
+     * @param depth         maximum depth of the domain (0 - top level domains only)
+     * @param awsAccount    return domain that has the specified aws account name. If account name
+     *                      is specified all other optional attributes are ignored since there must be
+     *                      only one domain matching the specified account name.
+     * @param productId     return domain that has the specified product id. If product id
+     *                      is specified all other optional attributes are ignored since there must be
+     *                      only one domain matching the specified product id.
+     * @param azureSubscription return domain that has the specified azure subscription id. If subscription
+     *                      id is specified all other optional attributes are ignored since there must be
+     *                      only one domain matching the specified subscription id.
+     * @param modifiedSince return domains only modified since this date
+     * @param tagKey        query all domains with given tag name
+     * @param tagValue      query all domains with given tag key and value
+     * @param businessService returns domains that have the specified business service.
+     * @return list of domain names
+     * @throws ZMSClientException in case of failure
+     */
+    public DomainList getDomainList(Integer limit, String skip, String prefix, Integer depth,
+                                    String awsAccount, Integer productId, String azureSubscription,
+                                    Date modifiedSince, String tagKey, String tagValue, String businessService) {
         updatePrincipal();
         String modSinceStr = null;
         if (modifiedSince != null) {
@@ -541,11 +677,12 @@ public class ZMSClient implements Closeable {
             modSinceStr = df.format(modifiedSince);
         }
         try {
-            return client.getDomainList(limit, skip, prefix, depth, account, productId, null, null, modSinceStr);
+            return client.getDomainList(limit, skip, prefix, depth, awsAccount, productId, null, null,
+                    azureSubscription, tagKey, tagValue, businessService, modSinceStr);
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -561,11 +698,12 @@ public class ZMSClient implements Closeable {
     public DomainList getDomainList(String roleMember, String roleName) {
         updatePrincipal();
         try {
-            return client.getDomainList(null, null, null, null, null, null, roleMember, roleName, null);
+            return client.getDomainList(null, null, null, null, null, null, roleMember, roleName,
+                    null, null, null, null, null);
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -586,7 +724,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -609,7 +747,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -629,7 +767,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -647,7 +785,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -666,7 +804,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -683,7 +821,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -701,7 +839,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -720,7 +858,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -738,7 +876,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -759,7 +897,29 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Retrieve the list of roles defined for the specified domain. The roles
+     * will contain their attributes and, if specified, the list of members.
+     *
+     * @param domainName name of the domain
+     * @param members    include all members for group roles as well
+     * @param tagKey     query all roles with given tag name
+     * @param tagValue   query all roles with given tag key and value
+     * @return list of roles
+     * @throws ZMSClientException in case of failure
+     */
+    public Roles getRoles(String domainName, Boolean members, String tagKey, String tagValue) {
+        updatePrincipal();
+        try {
+            return client.getRoles(domainName, members, tagKey, tagValue);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -773,14 +933,7 @@ public class ZMSClient implements Closeable {
      * @throws ZMSClientException in case of failure
      */
     public Roles getRoles(String domainName, Boolean members) {
-        updatePrincipal();
-        try {
-            return client.getRoles(domainName, members);
-        } catch (ResourceException ex) {
-            throw new ZMSClientException(ex.getCode(), ex.getData());
-        } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
-        }
+        return getRoles(domainName, members, null, null);
     }
 
     /**
@@ -846,7 +999,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -868,7 +1021,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -887,7 +1040,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -923,7 +1076,24 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Get all domain members with overdue review dates
+     *
+     * @param domainName name of the domain
+     * @return Domain members with overdue review dates
+     */
+    public DomainRoleMembers getOverdueReview(String domainName) {
+        updatePrincipal();
+        try {
+            return client.getOverdueReview(domainName);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -937,7 +1107,7 @@ public class ZMSClient implements Closeable {
      * @throws ZMSClientException in case of failure
      */
     public void putMembership(String domainName, String roleName, String memberName, String auditRef) {
-        putMembership(domainName, roleName, memberName, null, auditRef);
+        putMembershipWithReview(domainName, roleName, memberName, null, null, auditRef);
     }
 
     /**
@@ -952,8 +1122,24 @@ public class ZMSClient implements Closeable {
      */
     public void putMembership(String domainName, String roleName, String memberName,
                               Timestamp expiration, String auditRef) {
+        putMembershipWithReview(domainName, roleName, memberName, expiration, null, auditRef);
+    }
+
+    /**
+     * Add a member in the specified role with optional expiration and optional review
+     *
+     * @param domainName name of the domain
+     * @param roleName   name of the role
+     * @param memberName name of the member to be added
+     * @param expiration timestamp when this membership will expire (optional)
+     * @param review timestamp when this membership will require review (optional)
+     * @param auditRef   string containing audit specification or ticket number
+     * @throws ZMSClientException in case of failure
+     */
+    public void putMembershipWithReview(String domainName, String roleName, String memberName,
+                              Timestamp expiration, Timestamp review, String auditRef) {
         Membership mbr = new Membership().setRoleName(roleName)
-                .setMemberName(memberName).setExpiration(expiration)
+                .setMemberName(memberName).setExpiration(expiration).setReviewReminder(review)
                 .setIsMember(true);
         updatePrincipal();
         try {
@@ -961,7 +1147,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -981,7 +1167,45 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Remove the specified pending member from the role
+     *
+     * @param domainName name of the domain
+     * @param roleName   name of the role
+     * @param memberName name of the pending member to be removed
+     * @param auditRef   string containing audit specification or ticket number
+     * @throws ZMSClientException in case of failure
+     */
+    public void deletePendingMembership(String domainName, String roleName, String memberName, String auditRef) {
+        updatePrincipal();
+        try {
+            client.deletePendingMembership(domainName, roleName, memberName, auditRef);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Get list of users defined in the system
+     *
+     * @param domainName optional name of the user domain and/or alias domain
+     * @return list of user names
+     * @throws ZMSClientException in case of failure
+     */
+    public UserList getUserList(String domainName) {
+        updatePrincipal();
+        try {
+            return client.getUserList(domainName);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -992,14 +1216,7 @@ public class ZMSClient implements Closeable {
      * @throws ZMSClientException in case of failure
      */
     public UserList getUserList() {
-        updatePrincipal();
-        try {
-            return client.getUserList();
-        } catch (ResourceException ex) {
-            throw new ZMSClientException(ex.getCode(), ex.getData());
-        } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
-        }
+        return getUserList(null);
     }
 
     /**
@@ -1019,7 +1236,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1039,7 +1256,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1057,7 +1274,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1078,7 +1295,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1098,7 +1315,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1119,7 +1336,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1139,7 +1356,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1158,7 +1375,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1180,7 +1397,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1199,7 +1416,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1222,7 +1439,29 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Set the service system meta parameters
+     *
+     * @param domainName  name of the domain
+     * @param serviceName name of the service
+     * @param attribute   service meta attribute being modified in this request
+     * @param auditRef    string containing audit specification or ticket number
+     * @param meta        meta parameters to be set on the service
+     * @throws ZMSClientException in case of failure
+     */
+    public void putServiceIdentitySystemMeta(String domainName, String serviceName,
+                                             String attribute, String auditRef, ServiceIdentitySystemMeta meta) {
+        updatePrincipal();
+        try {
+            client.putServiceIdentitySystemMeta(domainName, serviceName, attribute, auditRef, meta);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1241,7 +1480,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1260,7 +1499,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1281,7 +1520,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1313,7 +1552,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1333,7 +1572,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1355,7 +1594,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1376,7 +1615,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1396,7 +1635,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1415,7 +1654,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1434,7 +1673,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1452,7 +1691,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1473,7 +1712,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1493,7 +1732,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1514,7 +1753,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1534,7 +1773,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1558,7 +1797,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1581,7 +1820,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1604,7 +1843,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1641,7 +1880,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1664,7 +1903,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1691,7 +1930,7 @@ public class ZMSClient implements Closeable {
      */
     public SignedDomains getSignedDomains(String domainName, String metaOnly, String matchingTag,
                                           Map<String, List<String>> responseHeaders) {
-        return getSignedDomains(domainName, metaOnly, null, matchingTag, responseHeaders);
+        return getSignedDomains(domainName, metaOnly, null, true, matchingTag, responseHeaders);
     }
 
     /**
@@ -1723,13 +1962,103 @@ public class ZMSClient implements Closeable {
      */
     public SignedDomains getSignedDomains(String domainName, String metaOnly, String metaAttr,
                                           String matchingTag, Map<String, List<String>> responseHeaders) {
+        return getSignedDomains(domainName, metaOnly, metaAttr, true, matchingTag, responseHeaders);
+    }
+
+    /**
+     * Retrieve the list of all domain data from the ZMS Server that
+     * is signed with ZMS's private key. It will pass an optional matchingTag
+     * so that ZMS can skip returning domains if no changes have taken
+     * place since that tag was issued.
+     *
+     * @param domainName      name of the domain. if specified, the server will
+     *                        only return this domain in the result set
+     * @param metaOnly        (can be null) must have value of true or false (default).
+     *                        if set to true, zms server will only return meta information
+     *                        about each domain (description, last modified timestamp, etc) and
+     *                        no role/policy/service details will be returned.
+     * @param metaAttr        (can be null) if metaOnly option is set to true, this
+     *                        parameter can filter the results based on the presence of the
+     *                        requested attribute. Allowed values are: account, ypmid, and all.
+     *                        account - only return domains that have the account value set
+     *                        ypmid - only return domains that have the ypmid value set
+     *                        all - return all domains (no filtering).
+     * @param masterCopy      system principals can request the request to be processed
+     *                        from the master data source instead of read replicas in case
+     *                        there are any configured
+     * @param matchingTag     (can be null) contains modified timestamp received
+     *                        with last request. If null, then return all domains.
+     * @param responseHeaders contains the "tag" returned for modification
+     *                        time of the domains, map key = "tag", List should
+     *                        contain a single value timestamp String to be used
+     *                        with subsequent call as matchingTag to this API
+     * @return list of domains signed by ZMS Server
+     * @throws ZMSClientException in case of failure
+     */
+    public SignedDomains getSignedDomains(String domainName, String metaOnly, String metaAttr,
+                                          boolean masterCopy, String matchingTag, Map<String, List<String>> responseHeaders) {
+        return getSignedDomains(domainName, metaOnly, metaAttr, masterCopy, false, matchingTag, responseHeaders);
+    }
+
+    /**
+     * Retrieve the list of all domain data from the ZMS Server that
+     * is signed with ZMS's private key. It will pass an optional matchingTag
+     * so that ZMS can skip returning domains if no changes have taken
+     * place since that tag was issued.
+     *
+     * @param domainName      name of the domain. if specified, the server will
+     *                        only return this domain in the result set
+     * @param metaOnly        (can be null) must have value of true or false (default).
+     *                        if set to true, zms server will only return meta information
+     *                        about each domain (description, last modified timestamp, etc) and
+     *                        no role/policy/service details will be returned.
+     * @param metaAttr        (can be null) if metaOnly option is set to true, this
+     *                        parameter can filter the results based on the presence of the
+     *                        requested attribute. Allowed values are: account, ypmid, and all.
+     *                        account - only return domains that have the account value set
+     *                        ypmid - only return domains that have the ypmid value set
+     *                        all - return all domains (no filtering).
+     * @param masterCopy      system principals can request the request to be processed
+     *                        from the master data source instead of read replicas in case
+     *                        there are any configured
+     * @param conditions      an optional parameter to request assertion conditions to be
+     *                        included in the response assertions in case
+     *                        there are any configured
+     * @param matchingTag     (can be null) contains modified timestamp received
+     *                        with last request. If null, then return all domains.
+     * @param responseHeaders contains the "tag" returned for modification
+     *                        time of the domains, map key = "tag", List should
+     *                        contain a single value timestamp String to be used
+     *                        with subsequent call as matchingTag to this API
+     * @return list of domains signed by ZMS Server
+     * @throws ZMSClientException in case of failure
+     */
+    public SignedDomains getSignedDomains(String domainName, String metaOnly, String metaAttr,
+                                          boolean masterCopy, boolean conditions, String matchingTag, Map<String, List<String>> responseHeaders) {
         updatePrincipal();
         try {
-            return client.getSignedDomains(domainName, metaOnly, metaAttr, matchingTag, responseHeaders);
+            return client.getSignedDomains(domainName, metaOnly, metaAttr, masterCopy, conditions, matchingTag, responseHeaders);
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Retrieve all valid values for the given attribute and user
+     * @param attributeName   name of attribute
+     * @param userName        restrict to values associated with the given user
+     * @return all valid values for the given attribute and user
+     */
+    public DomainMetaStoreValidValuesList getDomainMetaStoreValidValuesList(String attributeName, String userName) {
+        updatePrincipal();
+        try {
+            return client.getDomainMetaStoreValidValuesList(attributeName, userName);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1766,7 +2095,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1802,7 +2131,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1844,7 +2173,7 @@ public class ZMSClient implements Closeable {
         try {
             token = new PrincipalToken(serviceToken);
         } catch (IllegalArgumentException ex) {
-            throw new ZMSClientException(ZMSClientException.UNAUTHORIZED,
+            throw new ZMSClientException(ResourceException.UNAUTHORIZED,
                     "Invalid service token provided: " + ex.getMessage());
         }
 
@@ -1860,22 +2189,22 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
 
         if (validatedPrincipal == null) {
-            throw new ZMSClientException(ZMSClientException.UNAUTHORIZED, "Invalid service token provided");
+            throw new ZMSClientException(ResourceException.UNAUTHORIZED, "Invalid service token provided");
         }
 
         // before returning let's validate that domain, name and
-        // credentials match to what was passed to 
+        // credentials match to what was passed to
 
         if (!servicePrincipal.getDomain().equalsIgnoreCase(validatedPrincipal.getDomain())) {
-            throw new ZMSClientException(ZMSClientException.UNAUTHORIZED, "Validated principal domain name mismatch");
+            throw new ZMSClientException(ResourceException.UNAUTHORIZED, "Validated principal domain name mismatch");
         }
 
         if (!servicePrincipal.getName().equalsIgnoreCase(validatedPrincipal.getService())) {
-            throw new ZMSClientException(ZMSClientException.UNAUTHORIZED, "Validated principal service name mismatch");
+            throw new ZMSClientException(ResourceException.UNAUTHORIZED, "Validated principal service name mismatch");
         }
 
         return servicePrincipal;
@@ -1905,7 +2234,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1931,7 +2260,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1954,7 +2283,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1972,7 +2301,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -1992,7 +2321,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2009,7 +2338,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2028,7 +2357,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2048,7 +2377,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2067,7 +2396,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2085,7 +2414,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2108,7 +2437,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2126,7 +2455,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2145,7 +2474,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2163,7 +2492,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2182,7 +2511,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2201,10 +2530,26 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
+    /**
+     * Fetch all the roles across domains by either calling or specified principal
+     * @param principal - Requested principal. If null will return roles for the user making the call
+     * @param domainName - Requested domain. If null will return roles from all domains
+     * @return Member with roles in all requested domains
+     */
+    public DomainRoleMember getPrincipalRoles(String principal, String domainName) {
+        updatePrincipal();
+        try {
+            return client.getPrincipalRoles(principal, domainName);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
     /**
      * Set the role system meta parameters
      *
@@ -2221,7 +2566,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2240,7 +2585,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2265,7 +2610,7 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
 
@@ -2284,7 +2629,413 @@ public class ZMSClient implements Closeable {
         } catch (ResourceException ex) {
             throw new ZMSClientException(ex.getCode(), ex.getData());
         } catch (Exception ex) {
-            throw new ZMSClientException(ZMSClientException.BAD_REQUEST, ex.getMessage());
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
         }
     }
+
+    /**
+     * Review role membership to extend and/or delete role members
+     *
+     * @param domainName  name of the domain
+     * @param roleName    name of the role
+     * @param auditRef    string containing audit specification or ticket number
+     * @param role        Role object containing updated and/or deleted members
+     * @throws ZMSClientException in case of failure
+     */
+    public void putRoleReview(String domainName, String roleName, String auditRef, Role role) {
+        updatePrincipal();
+        try {
+            client.putRoleReview(domainName, roleName, auditRef, role);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Delete the specified group from domain
+     *
+     * @param domainName name of the domain
+     * @param groupName  name of the group
+     * @param auditRef   string containing audit specification or ticket number
+     * @throws ZMSClientException in case of failure
+     */
+    public void deleteGroup(String domainName, String groupName, String auditRef) {
+        updatePrincipal();
+        try {
+            client.deleteGroup(domainName, groupName, auditRef);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Remove the specified member from the group
+     *
+     * @param domainName name of the domain
+     * @param groupName  name of the group
+     * @param memberName name of the member to be removed
+     * @param auditRef   string containing audit specification or ticket number
+     * @throws ZMSClientException in case of failure
+     */
+    public void deleteGroupMembership(String domainName, String groupName, String memberName, String auditRef) {
+        updatePrincipal();
+        try {
+            client.deleteGroupMembership(domainName, groupName, memberName, auditRef);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Remove the specified pending member from the group
+     *
+     * @param domainName name of the domain
+     * @param groupName  name of the group
+     * @param memberName name of the pending member to be removed
+     * @param auditRef   string containing audit specification or ticket number
+     * @throws ZMSClientException in case of failure
+     */
+    public void deletePendingGroupMembership(String domainName, String groupName, String memberName, String auditRef) {
+        updatePrincipal();
+        try {
+            client.deletePendingGroupMembership(domainName, groupName, memberName, auditRef);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Generate a group name as expected by ZMS Server can be used to
+     * set the group object's name field (e.g. group.setName(name))
+     *
+     * @param domain name of the domain
+     * @param group name of the group
+     * @return full group name
+     */
+    public String generateGroupName(String domain, String group) {
+        return domain + ":group." + group;
+    }
+
+    /**
+     * Get membership details for the specified member in the given group
+     * in a specified domain with an optional expiration
+     *
+     * @param domainName name of the domain
+     * @param groupName  name of the group
+     * @param memberName name of the member
+     * @param expiration member expiration
+     * @return GroupMembership object
+     * @throws ZMSClientException in case of failure
+     */
+    public GroupMembership getGroupMembership(String domainName, String groupName, String memberName, String expiration) {
+        updatePrincipal();
+        try {
+            return client.getGroupMembership(domainName, groupName, memberName, expiration);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Fetch all the groups across domains by either calling or specified principal
+     * @param principal - Requested principal. If null will return groups for the user making the call
+     * @param domainName - Requested domain. If null will return groups from all domains
+     * @return Member with groups in all requested domains
+     */
+    public DomainGroupMember getPrincipalGroups(String principal, String domainName) {
+        updatePrincipal();
+        try {
+            return client.getPrincipalGroups(principal, domainName);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Set the group system meta parameters
+     *
+     * @param domainName domain name containing the group to be modified
+     * @param groupName  group name to be modified
+     * @param attribute  group meta attribute being modified in this request
+     * @param auditRef   string containing audit specification or ticket number
+     * @param meta       meta parameters to be set on the group
+     */
+    public void putGroupSystemMeta(String domainName, String groupName, String attribute, String auditRef, GroupSystemMeta meta) {
+        updatePrincipal();
+        try {
+            client.putGroupSystemMeta(domainName, groupName, attribute, auditRef, meta);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Set the group meta parameters
+     *
+     * @param domainName domain name containing the group to be modified
+     * @param groupName  group name to be modified
+     * @param auditRef   string containing audit specification or ticket number
+     * @param meta       meta parameters to be set on the group
+     */
+    public void putGroupMeta(String domainName, String groupName, String auditRef, GroupMeta meta) {
+        updatePrincipal();
+        try {
+            client.putGroupMeta(domainName, groupName, auditRef, meta);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Approve or reject addition of a member in the specified group
+     *
+     * @param domainName name of the domain
+     * @param groupName  name of the group
+     * @param memberName name of the member to be added
+     * @param approval   flag indicating whether this membership is approved or rejected
+     * @param auditRef   string containing audit specification or ticket number
+     * @throws ZMSClientException in case of failure
+     */
+    public void putGroupMembershipDecision(String domainName, String groupName, String memberName, boolean approval, String auditRef) {
+
+        GroupMembership mbr = new GroupMembership().setGroupName(groupName)
+                .setMemberName(memberName).setApproved(approval);
+        updatePrincipal();
+        try {
+            client.putGroupMembershipDecision(domainName, groupName, memberName, auditRef, mbr);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Return all the list of pending requests for the given principal. If the principal
+     * is null, the server will return the list for the authenticated principal
+     * making the call
+     * @param principal name of the approver principal (optional)
+     * @return DomainGroupMembership object listing all pending users
+     * @throws ZMSClientException in case of failure
+     */
+    public DomainGroupMembership getPendingDomainGroupMembersList(String principal) {
+        updatePrincipal();
+        try {
+            return client.getPendingDomainGroupMembersList(principal);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Review group membership to extend and/or delete group members
+     *
+     * @param domainName  name of the domain
+     * @param groupName   name of the group
+     * @param auditRef    string containing audit specification or ticket number
+     * @param group       Group object containing updated and/or deleted members
+     * @throws ZMSClientException in case of failure
+     */
+    public void putGroupReview(String domainName, String groupName, String auditRef, Group group) {
+        updatePrincipal();
+        try {
+            client.putGroupReview(domainName, groupName, auditRef, group);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Retrieve the specified group
+     *
+     * @param domainName name of the domain
+     * @param groupName  name of the group
+     * @param auditLog   include audit log for the group changes in the response
+     * @param pending    if this flag is set, then all members for that group will be retrieved
+     *                   including pending members
+     * @return group object
+     * @throws ZMSClientException in case of failure
+     */
+    public Group getGroup(String domainName, String groupName, boolean auditLog, boolean pending) {
+        updatePrincipal();
+        try {
+            return client.getGroup(domainName, groupName, auditLog, pending);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Create/Update a new group in the specified domain. If updating a group
+     * the provided object must contain all attributes as it will replace
+     * the full group object configured on the server (not just some of the attributes).
+     *
+     * @param domainName name of the domain
+     * @param groupName  name of the group
+     * @param auditRef   string containing audit specification or ticket number
+     * @param group      group object to be added to the domain
+     * @throws ZMSClientException in case of failure
+     */
+    public void putGroup(String domainName, String groupName, String auditRef, Group group) {
+        updatePrincipal();
+        try {
+            client.putGroup(domainName, groupName, auditRef, group);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Retrieve the list of groups defined for the specified domain. The groups
+     * will contain their attributes and, if specified, the list of members.
+     *
+     * @param domainName name of the domain
+     * @param members    include all members for group groups as well
+     * @return list of groups
+     * @throws ZMSClientException in case of failure
+     */
+    public Groups getGroups(String domainName, Boolean members) {
+        updatePrincipal();
+        try {
+            return client.getGroups(domainName, members);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Add a member in the specified group
+     *
+     * @param domainName name of the domain
+     * @param groupName  name of the group
+     * @param memberName name of the member to be added
+     * @param auditRef   string containing audit specification or ticket number
+     * @throws ZMSClientException in case of failure
+     */
+    public void putGroupMembership(String domainName, String groupName, String memberName, String auditRef) {
+        GroupMembership mbr = new GroupMembership().setGroupName(groupName)
+                .setMemberName(memberName).setIsMember(true);
+        updatePrincipal();
+        try {
+            client.putGroupMembership(domainName, groupName, memberName, auditRef, mbr);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Store multiple logical assertion conditions. It contains a list of AssertionCondition objects
+     * Each AssertionCondition object forms a single logical condition where multiple key, operator, value will be ANDed.
+     *
+     * @param domainName name of the domain
+     * @param policyName name of the policy
+     * @param assertionId id of the assertion associated with the conditions
+     * @param auditRef string containing audit specification or ticket number
+     * @param assertionConditions object containing conditions associated with the given assertion id
+     * @return AssertionConditions object
+     * @throws ZMSClientException in case of failure
+     */
+    public AssertionConditions putAssertionConditions(String domainName, String policyName, Long assertionId, String auditRef, AssertionConditions assertionConditions) {
+        updatePrincipal();
+        try {
+            return client.putAssertionConditions(domainName, policyName, assertionId, auditRef, assertionConditions);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Store a single logical assertion condition.
+     * AssertionCondition object forms a single logical condition where multiple key, operator, value will be ANDed.
+     *
+     * @param domainName name of the domain
+     * @param policyName name of the policy
+     * @param assertionId id of the assertion associated with the condition
+     * @param auditRef string containing audit specification or ticket number
+     * @param assertionCondition object containing a single logical condition associated with the given assertion id
+     * @return AssertionConditions object
+     * @throws ZMSClientException in case of failure
+     */
+    public AssertionCondition putAssertionCondition(String domainName, String policyName, Long assertionId, String auditRef, AssertionCondition assertionCondition) {
+        updatePrincipal();
+        try {
+            return client.putAssertionCondition(domainName, policyName, assertionId, auditRef, assertionCondition);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Delete all assertion conditions associated with the given assertion id.
+     *
+     * @param domainName name of the domain
+     * @param policyName name of the policy
+     * @param assertionId id of the assertion associated with the conditions
+     * @param auditRef string containing audit specification or ticket number
+     * @throws ZMSClientException in case of failure
+     */
+    public void deleteAssertionConditions(String domainName, String policyName, Long assertionId, String auditRef) {
+        updatePrincipal();
+        try {
+            client.deleteAssertionConditions(domainName, policyName, assertionId, auditRef);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
+    /**
+     * Delete a single assertion condition associated with the given assertion id.
+     *
+     * @param domainName name of the domain
+     * @param policyName name of the policy
+     * @param assertionId id of the assertion associated with the conditions
+     * @param conditionId id of the condition to be deleted
+     * @param auditRef string containing audit specification or ticket number
+     * @throws ZMSClientException in case of failure
+     */
+    public void deleteAssertionCondition(String domainName, String policyName, Long assertionId, int conditionId, String auditRef) {
+        updatePrincipal();
+        try {
+            client.deleteAssertionCondition(domainName, policyName, assertionId, conditionId, auditRef);
+        } catch (ResourceException ex) {
+            throw new ZMSClientException(ex.getCode(), ex.getData());
+        } catch (Exception ex) {
+            throw new ZMSClientException(ResourceException.BAD_REQUEST, ex.getMessage());
+        }
+    }
+
 }

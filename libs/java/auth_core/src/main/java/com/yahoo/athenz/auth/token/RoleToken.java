@@ -182,14 +182,14 @@ public class RoleToken extends Token {
         unsignedToken = strBuilder.toString();
         
         if (LOG.isDebugEnabled()) {
-            LOG.debug("RoleToken created: " + unsignedToken);
+            LOG.debug("RoleToken created: {}", unsignedToken);
         }
     }
 
     public RoleToken(String signedToken) {
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Constructing RoleToken with input string: " + signedToken);
+            LOG.debug("Constructing RoleToken with input string: {}", signedToken);
         }
         
         if (signedToken == null || signedToken.isEmpty()) {
@@ -221,10 +221,12 @@ public class RoleToken extends Token {
         int idx = signedToken.indexOf(";s=");
         if (idx != -1) {
             unsignedToken = signedToken.substring(0, idx);
+            signature = signedToken.substring(idx + 3);
         }
 
+        final String parseToken = unsignedToken != null ? unsignedToken : signedToken;
         String roleNames = null;
-        for (String item : signedToken.split(";")) {
+        for (String item : parseToken.split(";")) {
             String [] kv = item.split("=");
             if (kv.length == 2) {
                 switch (kv[0]) {
@@ -256,9 +258,6 @@ public class RoleToken extends Token {
                     break;
                 case "r":
                     roleNames = kv[1];
-                    break;
-                case "s":
-                    signature = kv[1];
                     break;
                 case "t":
                     timestamp = Long.parseLong(kv[1]);
@@ -292,20 +291,11 @@ public class RoleToken extends Token {
         this.signedToken = signedToken;
 
         if (LOG.isDebugEnabled()) {
-            LOG.debug("Values extracted from token " +
-                    " version:" + version +
-                    " domain:" + domain +
-                    " roles:" + roleNames +
-                    " principal:" + principal +
-                    " host:" + host +
-                    " salt:" + salt +
-                    " timestamp:" + timestamp +
-                    " expiryTime:" + expiryTime +
-                    " domainCompleteRoleSet" + domainCompleteRoleSet +
-                    " keyId:" + keyId +
-                    " ip:" + ip +
-                    " proxyUser: " + proxyUser +
-                    " signature:" + signature);
+            LOG.debug("Values extracted from token version:{} domain:{} roles:{} principal:{}" +
+                    " host:{} salt:{} timestamp:{} expiryTime:{} domainCompleteRoleSet:{}" +
+                    " keyId:{} ip:{} proxyUser:{} signature:{}", version, domain, roleNames,
+                    principal, host, salt, timestamp, expiryTime, domainCompleteRoleSet, keyId,
+                    ip, proxyUser, signature);
         }
     }
     

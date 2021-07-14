@@ -17,7 +17,7 @@ export GOPATH=$(PWD)
 # we're not going to generate our code during our automated builds since
 # builds must be done based on files already checked-in into git
 
-CICD := $(or ${TRAVIS_PULL_REQUEST},${TRAVIS_TAG})
+CICD := $(or ${SCREWDRIVER},${TRAVIS_PULL_REQUEST},${TRAVIS_TAG})
 
 ifdef CICD
 
@@ -53,7 +53,7 @@ src/$(RDL_LIB):
 	go get github.com/ardielle/ardielle-tools/...
 
 model.go: $(RDL_FILE)
-	$(GOPATH)/bin/rdl -ps generate -t -o $@ go-model $(RDL_FILE)
+	$(GOPATH)/bin/rdl -ps generate -t -o $@ athenz-go-model $(RDL_FILE)
 
 client.go: $(RDL_FILE)
 	$(GOPATH)/bin/rdl -ps generate -t -o $@ athenz-go-client $(RDL_FILE)
